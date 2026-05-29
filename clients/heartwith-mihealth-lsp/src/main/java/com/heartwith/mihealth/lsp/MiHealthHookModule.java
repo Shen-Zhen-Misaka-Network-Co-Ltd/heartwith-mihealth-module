@@ -127,6 +127,14 @@ public final class MiHealthHookModule extends XposedModule {
             return thread;
         }
     });
+    private static final ExecutorService UPLOAD_WORKER = Executors.newSingleThreadExecutor(new ThreadFactory() {
+        @Override
+        public Thread newThread(Runnable runnable) {
+            Thread thread = new Thread(runnable, "heartwith-upload");
+            thread.setDaemon(true);
+            return thread;
+        }
+    });
 
     private final AtomicBoolean installed = new AtomicBoolean(false);
     private final AtomicBoolean npatchHooksInstalled = new AtomicBoolean(false);
@@ -137,7 +145,7 @@ public final class MiHealthHookModule extends XposedModule {
     private final AtomicBoolean sportModeReceiverRegistered = new AtomicBoolean(false);
     private final AtomicBoolean syncUiHooksInstalled = new AtomicBoolean(false);
     private final AtomicBoolean cleartextPolicyHookInstalled = new AtomicBoolean(false);
-    private final HeartwithUploader uploader = new HeartwithUploader(WORKER);
+    private final HeartwithUploader uploader = new HeartwithUploader(UPLOAD_WORKER);
     private final List<Object> launchModels = new ArrayList<>();
     private volatile Context appContext;
     private volatile Object hrCallback;
@@ -2802,11 +2810,16 @@ public final class MiHealthHookModule extends XposedModule {
                     }
                 }
                 if (uploadHeartRate) {
-                    try {
-                        uploader.onHeartRate(context, hr, source);
-                    } catch (Throwable throwable) {
-                        diagLine("uploader crashed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
-                    }
+                    UPLOAD_WORKER.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                uploader.onHeartRate(context, hr, source);
+                            } catch (Throwable throwable) {
+                                diagLine("uploader crashed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+                            }
+                        }
+                    });
                 }
             }
         });

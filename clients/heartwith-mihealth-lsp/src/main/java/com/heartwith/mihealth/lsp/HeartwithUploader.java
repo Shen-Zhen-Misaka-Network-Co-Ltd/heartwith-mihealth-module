@@ -34,6 +34,8 @@ final class HeartwithUploader {
     private static final long MAX_BATCH_WINDOW_MS = 8_000L;
     private static final long OFFLINE_CACHE_MS = 300_000L;
     private static final long RETRY_BACKOFF_MS = 15_000L;
+    private static final int CONNECT_TIMEOUT_MS = 1_500;
+    private static final int READ_TIMEOUT_MS = 3_000;
     private static final int CHANGE_FLUSH_BPM = 3;
     private static final Pattern COLLECTOR_ID = Pattern.compile("\"collector_id\"\\s*:\\s*\"([^\"]+)\"");
     private static final Pattern COLLECTOR_TOKEN = Pattern.compile("\"collector_token\"\\s*:\\s*\"([^\"]+)\"");
@@ -475,8 +477,8 @@ final class HeartwithUploader {
         int port = url.getPort() > 0 ? url.getPort() : 80;
         String path = url.getFile() == null || url.getFile().isEmpty() ? "/" : url.getFile();
         Socket socket = new Socket();
-        socket.connect(new InetSocketAddress(host, port), 2_500);
-        socket.setSoTimeout(5_000);
+        socket.connect(new InetSocketAddress(host, port), CONNECT_TIMEOUT_MS);
+        socket.setSoTimeout(READ_TIMEOUT_MS);
         try {
             OutputStream output = socket.getOutputStream();
             StringBuilder headers = new StringBuilder();
@@ -515,8 +517,8 @@ final class HeartwithUploader {
 
     private HttpURLConnection open(String url, String method, String contentType) throws Exception {
         HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
-        connection.setConnectTimeout(2_500);
-        connection.setReadTimeout(5_000);
+        connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
+        connection.setReadTimeout(READ_TIMEOUT_MS);
         connection.setRequestMethod(method);
         connection.setRequestProperty("Content-Type", contentType);
         connection.setRequestProperty("Accept", "application/json");
