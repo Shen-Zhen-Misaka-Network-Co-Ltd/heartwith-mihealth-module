@@ -18,5 +18,8 @@ public final class StatusReceiver extends BroadcastReceiver {
             return;
         }
         HeartwithStatus.writeLocal(context, bpm, source, seenMs);
+        if (BuildConfig.DEBUG) {
+            DebugCaptureOverlay.update(context, bpm, source, seenMs);
+        }
     }
 }

@@ -37,11 +37,17 @@ public final class SettingsProvider extends ContentProvider {
         HeartwithSettings settings = HeartwithSettings.readLocal(getContext());
         MatrixCursor cursor = new MatrixCursor(new String[]{
                 HeartwithSettings.KEY_ENABLED,
+                HeartwithSettings.KEY_HOOK_ENABLED,
+                HeartwithSettings.KEY_SYNC_ENABLED,
+                HeartwithSettings.KEY_SYNC_INTERVAL_HOURS,
                 HeartwithSettings.KEY_SERVER_URL,
                 HeartwithSettings.KEY_DISPLAY_NAME,
         });
         cursor.addRow(new Object[]{
                 settings.enabled ? 1 : 0,
+                settings.hookEnabled ? 1 : 0,
+                settings.syncEnabled ? 1 : 0,
+                settings.syncIntervalHours,
                 settings.serverUrl,
                 settings.displayName,
         });

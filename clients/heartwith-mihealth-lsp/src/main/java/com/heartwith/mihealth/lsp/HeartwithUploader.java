@@ -23,6 +23,8 @@ final class HeartwithUploader {
     private static final String TAG = "HeartwithMiHealth";
     private static final String RUNTIME_PREFS = "heartwith_mihealth_runtime";
     private static final String KEY_CACHED_ENABLED = "cached_enabled";
+    private static final String KEY_CACHED_SYNC_ENABLED = "cached_sync_enabled";
+    private static final String KEY_CACHED_SYNC_INTERVAL_HOURS = "cached_sync_interval_hours";
     private static final String KEY_CACHED_SERVER_URL = "cached_server_url";
     private static final String KEY_CACHED_DISPLAY_NAME = "cached_display_name";
     private static final String KEY_CACHED_DEVICE_MODEL = "cached_device_model";
@@ -38,7 +40,7 @@ final class HeartwithUploader {
 
     private final Executor worker;
     private final ArrayDeque<Sample> samples = new ArrayDeque<>();
-    private HeartwithSettings settings = new HeartwithSettings(true, HeartwithSettings.DEFAULT_SERVER_URL, "Android");
+    private HeartwithSettings settings = new HeartwithSettings(false, HeartwithSettings.DEFAULT_SERVER_URL, "Android");
     private String deviceModel = DEFAULT_DEVICE_MODEL;
     private Session session;
     private long lastSettingsReadMs;
@@ -73,6 +75,10 @@ final class HeartwithUploader {
         runtimeCacheLoaded = true;
         persistRuntimeCache(context, next);
         logSettings(reason);
+    }
+
+    synchronized HeartwithSettings currentSettings() {
+        return settings;
     }
 
     synchronized boolean setDeviceModel(Context context, String model) {
@@ -199,10 +205,16 @@ final class HeartwithUploader {
         try {
             cursor = context.getContentResolver().query(SettingsProvider.URI, null, null, null, null);
             if (cursor != null && cursor.moveToFirst()) {
-                boolean enabled = cursor.getInt(cursor.getColumnIndexOrThrow(HeartwithSettings.KEY_ENABLED)) != 0;
+                boolean enabled = getBooleanColumn(cursor, HeartwithSettings.KEY_HOOK_ENABLED,
+                        getBooleanColumn(cursor, HeartwithSettings.KEY_ENABLED, false));
+                boolean syncEnabled = getBooleanColumn(cursor, HeartwithSettings.KEY_SYNC_ENABLED, false);
+                int syncIntervalHours = getIntColumn(
+                        cursor,
+                        HeartwithSettings.KEY_SYNC_INTERVAL_HOURS,
+                        HeartwithSettings.DEFAULT_SYNC_INTERVAL_HOURS);
                 String serverUrl = cursor.getString(cursor.getColumnIndexOrThrow(HeartwithSettings.KEY_SERVER_URL));
                 String displayName = cursor.getString(cursor.getColumnIndexOrThrow(HeartwithSettings.KEY_DISPLAY_NAME));
-                HeartwithSettings next = new HeartwithSettings(enabled, serverUrl, displayName);
+                HeartwithSettings next = new HeartwithSettings(enabled, serverUrl, displayName, syncEnabled, syncIntervalHours);
                 if (!next.serverUrl.equals(settings.serverUrl) || !next.displayName.equals(settings.displayName)) {
                     session = null;
                     seq = 1;
@@ -235,10 +247,12 @@ final class HeartwithUploader {
             if (serverUrl == null || serverUrl.trim().isEmpty()) {
                 return;
             }
-            boolean enabled = prefs.getBoolean(KEY_CACHED_ENABLED, true);
+            boolean enabled = prefs.getBoolean(KEY_CACHED_ENABLED, false);
+            boolean syncEnabled = prefs.getBoolean(KEY_CACHED_SYNC_ENABLED, false);
+            int syncIntervalHours = prefs.getInt(KEY_CACHED_SYNC_INTERVAL_HOURS, HeartwithSettings.DEFAULT_SYNC_INTERVAL_HOURS);
             String displayName = prefs.getString(KEY_CACHED_DISPLAY_NAME, "Android");
             deviceModel = sanitizeDeviceModel(prefs.getString(KEY_CACHED_DEVICE_MODEL, DEFAULT_DEVICE_MODEL));
-            settings = new HeartwithSettings(enabled, serverUrl, displayName);
+            settings = new HeartwithSettings(enabled, serverUrl, displayName, syncEnabled, syncIntervalHours);
             settingsLoaded = true;
             logSettings("settings cache loaded");
         } catch (Throwable ignored) {
@@ -263,6 +277,8 @@ final class HeartwithUploader {
             context.getSharedPreferences(RUNTIME_PREFS, Context.MODE_PRIVATE)
                     .edit()
                     .putBoolean(KEY_CACHED_ENABLED, next.enabled)
+                    .putBoolean(KEY_CACHED_SYNC_ENABLED, next.syncEnabled)
+                    .putInt(KEY_CACHED_SYNC_INTERVAL_HOURS, next.syncIntervalHours)
                     .putString(KEY_CACHED_SERVER_URL, next.serverUrl)
                     .putString(KEY_CACHED_DISPLAY_NAME, next.displayName)
                     .apply();
@@ -331,9 +347,23 @@ final class HeartwithUploader {
         lastSettingsLogElapsedMs = elapsed;
         Log.i(TAG, prefix + ": loaded=" + settingsLoaded
                 + ", enabled=" + settings.enabled
+                + ", sync=" + settings.syncEnabled
+                + ", syncIntervalHours=" + settings.syncIntervalHours
                 + ", server=" + settings.serverUrl
                 + ", display=" + settings.displayName
                 + ", device=" + deviceModel);
+    }
+
+    private boolean getBooleanColumn(Cursor cursor, String name, boolean fallback) {
+        int index = cursor.getColumnIndex(name);
+        return index >= 0 ? cursor.getInt(index) != 0 : fallback;
+    }
+
+    private int getIntColumn(Cursor cursor, String name, int fallback) {
+        int index = cursor.getColumnIndex(name);
+        return index >= 0
+                ? HeartwithSettings.clampSyncIntervalHours(cursor.getInt(index))
+                : fallback;
     }
 
     private void logUploadSuccess(int sampleCount) {

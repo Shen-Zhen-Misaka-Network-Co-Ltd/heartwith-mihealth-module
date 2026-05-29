@@ -2,7 +2,9 @@ package com.heartwith.mihealth.lsp;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlarmManager;
 import android.app.Application;
+import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -16,6 +18,9 @@ import android.os.Bundle;
 import android.security.NetworkSecurityPolicy;
 import android.os.SystemClock;
 import android.util.Log;
+import android.view.View;
+import android.widget.TextView;
+import android.widget.Toast;
 
 import java.io.FileInputStream;
 import java.lang.ref.WeakReference;
@@ -46,7 +51,10 @@ public final class MiHealthHookModule extends XposedModule {
     private static final String RUNTIME_PREFS = "heartwith_mihealth_runtime";
     private static final String KEY_CACHED_SERVER_URL = "cached_server_url";
     private static final String ACTION_SPORT_MODE_CHANGED = "com.heartwith.mihealth.lsp.SPORT_MODE_CHANGED";
+    private static final String ACTION_HEART_RATE_WATCHDOG = "com.heartwith.mihealth.lsp.HEART_RATE_WATCHDOG";
     private static final String EXTRA_SPORT_MODE_UNTIL_MS = "sport_mode_until_ms";
+    private static final String EXTRA_SYNC_GENERATION = "sync_generation";
+    private static final String EXTRA_HEART_RATE_WATCHDOG_GENERATION = "heart_rate_watchdog_generation";
     private static final String KEY_ACTIVE_SOURCE = "active_source";
     private static final String KEY_ACTIVE_SOURCE_SEEN_MS = "active_source_seen_ms";
     private static final String KEY_LAST_HR_SEEN_MS = "last_hr_seen_ms";
@@ -60,9 +68,15 @@ public final class MiHealthHookModule extends XposedModule {
     private static final long DEVICE_MODEL_REFRESH_MS = 30_000L;
     private static final long DEVICE_MODEL_UNRESOLVED_RETRY_MS = 180_000L;
     private static final long HEART_RATE_WATCHDOG_MS = 12_000L;
+    private static final long HEART_RATE_ALARM_WATCHDOG_MS =
+            (BuildConfig.DEBUG ? 2L : 5L) * 60L * 1000L;
+    private static final long HEART_RATE_ALARM_RESCHEDULE_MIN_MS =
+            (BuildConfig.DEBUG ? 1L : 2L) * 60L * 1000L;
     private static final long SPORT_MODE_GRACE_MS = 10_000L;
     private static final long STATUS_UPDATE_MIN_INTERVAL_MS = 10_000L;
     private static final long STATUS_VIEWER_CHECK_MIN_INTERVAL_MS = 1_000L;
+    private static final long SYNC_MIN_TRIGGER_GAP_MS = 10L * 60L * 1000L;
+    private static final long SYNC_MANUAL_MIN_TRIGGER_GAP_MS = 5_000L;
     private static final int STATUS_UPDATE_CHANGE_BPM = 3;
     private static final boolean VERBOSE_LOGS = BuildConfig.DEBUG;
     private static final String NPATCH_ORIGIN_ASSET = "assets/npatch/origin.apk";
@@ -121,6 +135,7 @@ public final class MiHealthHookModule extends XposedModule {
     private final AtomicBoolean starting = new AtomicBoolean(false);
     private final AtomicBoolean configReceiverRegistered = new AtomicBoolean(false);
     private final AtomicBoolean sportModeReceiverRegistered = new AtomicBoolean(false);
+    private final AtomicBoolean syncUiHooksInstalled = new AtomicBoolean(false);
     private final AtomicBoolean cleartextPolicyHookInstalled = new AtomicBoolean(false);
     private final HeartwithUploader uploader = new HeartwithUploader(WORKER);
     private final List<Object> launchModels = new ArrayList<>();
@@ -165,6 +180,17 @@ public final class MiHealthHookModule extends XposedModule {
     private volatile boolean npatchRouteDiagLogged;
     private volatile boolean npatchArouterIndexesInstalled;
     private volatile boolean cleartextPolicyAllowLogged;
+    private volatile boolean heartRateHookEnabled;
+    private volatile boolean periodicSyncEnabled;
+    private volatile int periodicSyncIntervalHours = HeartwithSettings.DEFAULT_SYNC_INTERVAL_HOURS;
+    private volatile int syncScheduleGeneration;
+    private volatile int heartRateWatchdogGeneration;
+    private volatile long lastHeartRateWatchdogAlarmElapsedMs;
+    private volatile long lastSyncTriggerElapsedMs;
+    private volatile long lastSyncSuccessElapsedMs;
+    private volatile long lastRuntimeSettingsRefreshElapsedMs;
+    private volatile WeakReference<View> syncButtonView = new WeakReference<>(null);
+    private volatile WeakReference<View.OnClickListener> syncButtonListener = new WeakReference<>(null);
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
@@ -196,6 +222,7 @@ public final class MiHealthHookModule extends XposedModule {
             hookHeartRateSinks(classLoader);
             hookHeartRateStopControls(classLoader);
         } else if (isMainProcess()) {
+            hookSyncUiSignals(classLoader);
             hookPassiveSportHeartRateSinks(classLoader);
         }
         logLine("hooks installed process=" + processName);
@@ -375,10 +402,8 @@ public final class MiHealthHookModule extends XposedModule {
                 }
                 maybeInstallNpatchCompatibility(classLoader, chain.getThisObject());
                 registerSportModeReceiver(appContext);
-                if (isWorkerProcess()) {
-                    registerConfigReceiver(appContext);
-                    warmUpUploaderConfig(appContext);
-                }
+                registerConfigReceiver(appContext);
+                warmUpUploaderConfig(appContext);
                 restoreActiveSource(appContext);
                 scheduleStartAfterAttach(classLoader);
             }
@@ -471,9 +496,305 @@ public final class MiHealthHookModule extends XposedModule {
         hookHuamiCallback(classLoader, "com.xiaomi.fitness.sport_eco_manager.state.data.HuamiDataReceive");
     }
 
+    private void hookSyncUiSignals(ClassLoader classLoader) {
+        if (!syncUiHooksInstalled.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            final Method setOnClickListener = View.class.getDeclaredMethod("setOnClickListener", View.OnClickListener.class);
+            setOnClickListener.setAccessible(true);
+            hook(setOnClickListener).intercept(new XposedInterface.Hooker() {
+                @Override
+                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    Object view = chain.getThisObject();
+                    Object listener = chain.getArg(0);
+                    if (view instanceof View && listener instanceof View.OnClickListener) {
+                        maybeCaptureSyncButton((View) view, (View.OnClickListener) listener, "setOnClickListener");
+                    }
+                    return chain.proceed();
+                }
+            });
+        } catch (Throwable throwable) {
+            diagLine("sync click hook failed: " + throwable.getClass().getSimpleName());
+        }
+        try {
+            final Method performClick = View.class.getDeclaredMethod("performClick");
+            performClick.setAccessible(true);
+            hook(performClick).intercept(new XposedInterface.Hooker() {
+                @Override
+                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    Object view = chain.getThisObject();
+                    if (view instanceof View) {
+                        maybeCaptureSyncButton((View) view, null, "performClick");
+                    }
+                    return chain.proceed();
+                }
+            });
+        } catch (Throwable throwable) {
+            diagLine("sync performClick hook failed: " + throwable.getClass().getSimpleName());
+        }
+        try {
+            for (final Method method : Toast.class.getDeclaredMethods()) {
+                if (!"makeText".equals(method.getName()) || method.getParameterTypes().length < 3) {
+                    continue;
+                }
+                method.setAccessible(true);
+                hook(method).intercept(new XposedInterface.Hooker() {
+                    @Override
+                    public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                        Object result = chain.proceed();
+                        Object text = chain.getArg(1);
+                        if (text != null && isSyncSuccessText(String.valueOf(text))) {
+                            lastSyncSuccessElapsedMs = SystemClock.elapsedRealtime();
+                            diagLine("mihealth sync success toast captured");
+                        }
+                        return result;
+                    }
+                });
+            }
+        } catch (Throwable throwable) {
+            diagLine("sync toast hook failed: " + throwable.getClass().getSimpleName());
+        }
+    }
+
+    private void maybeCaptureSyncButton(View view, View.OnClickListener listener, String reason) {
+        if (!periodicSyncEnabled && !BuildConfig.DEBUG) {
+            return;
+        }
+        String text = viewText(view);
+        if (!isManualSyncText(text)) {
+            return;
+        }
+        syncButtonView = new WeakReference<>(view);
+        if (listener != null) {
+            syncButtonListener = new WeakReference<>(listener);
+        }
+        if (BuildConfig.DEBUG) {
+            diagLine("sync entry captured reason=" + reason + ", text=" + text);
+        }
+    }
+
+    private String viewText(View view) {
+        if (view instanceof TextView) {
+            CharSequence text = ((TextView) view).getText();
+            return text == null ? "" : text.toString().trim();
+        }
+        CharSequence description = view.getContentDescription();
+        return description == null ? "" : description.toString().trim();
+    }
+
+    private boolean isManualSyncText(String text) {
+        if (text == null || text.isEmpty() || !text.contains("同步")) {
+            return false;
+        }
+        return !text.contains("自动") && !text.contains("后台") && !text.contains("间隔");
+    }
+
+    private boolean isSyncSuccessText(String text) {
+        return text != null && text.contains("同步") && (text.contains("成功") || text.contains("完成"));
+    }
+
+    private void schedulePeriodicSync(Context context) {
+        if (context == null || !isMainProcess() || !periodicSyncEnabled) {
+            return;
+        }
+        final int generation = ++syncScheduleGeneration;
+        final long delayMs = Math.max(HeartwithSettings.MIN_SYNC_INTERVAL_HOURS, periodicSyncIntervalHours)
+                * 60L * 60L * 1000L;
+        scheduleSyncAlarm(context, delayMs, generation);
+        try {
+            new Handler(context.getMainLooper()).postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    if (generation != syncScheduleGeneration || !periodicSyncEnabled) {
+                        return;
+                    }
+                    triggerMiHealthSync(appContext, "timer", false);
+                    schedulePeriodicSync(appContext);
+                }
+            }, delayMs);
+        } catch (Throwable ignored) {
+        }
+        if (BuildConfig.DEBUG) {
+            diagLine("periodic sync scheduled hours=" + periodicSyncIntervalHours);
+        }
+    }
+
+    private void cancelPeriodicSync(Context context) {
+        syncScheduleGeneration++;
+        if (context == null || !isMainProcess()) {
+            return;
+        }
+        try {
+            AlarmManager alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+            if (alarmManager != null) {
+                alarmManager.cancel(syncPendingIntent(context));
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void scheduleSyncAlarm(Context context, long delayMs, int generation) {
+        try {
+            AlarmManager alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+            if (alarmManager == null) {
+                return;
+            }
+            long triggerAtMs = System.currentTimeMillis() + delayMs;
+            PendingIntent pendingIntent = syncPendingIntent(context, generation);
+            alarmManager.cancel(pendingIntent);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMs, pendingIntent);
+            } else {
+                alarmManager.set(AlarmManager.RTC_WAKEUP, triggerAtMs, pendingIntent);
+            }
+        } catch (Throwable throwable) {
+            diagLine("sync alarm schedule failed: " + throwable.getClass().getSimpleName());
+        }
+    }
+
+    private PendingIntent syncPendingIntent(Context context) {
+        return syncPendingIntent(context, syncScheduleGeneration);
+    }
+
+    private PendingIntent syncPendingIntent(Context context, int generation) {
+        Intent intent = new Intent(HeartwithSettings.ACTION_SYNC_NOW);
+        intent.setPackage(targetPackage);
+        intent.putExtra(EXTRA_SYNC_GENERATION, generation);
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            flags |= PendingIntent.FLAG_IMMUTABLE;
+        }
+        return PendingIntent.getBroadcast(context, 0x23014332, intent, flags);
+    }
+
+    private void triggerMiHealthSync(Context context, String reason, boolean manual) {
+        if (context == null || !isMainProcess()) {
+            return;
+        }
+        if (!manual && !periodicSyncEnabled) {
+            return;
+        }
+        long elapsed = SystemClock.elapsedRealtime();
+        long minGap = manual ? SYNC_MANUAL_MIN_TRIGGER_GAP_MS : SYNC_MIN_TRIGGER_GAP_MS;
+        if (lastSyncTriggerElapsedMs > 0L && elapsed - lastSyncTriggerElapsedMs < minGap) {
+            if (BuildConfig.DEBUG) {
+                diagLine("sync trigger skipped reason=" + reason + ", gapMs=" + (elapsed - lastSyncTriggerElapsedMs));
+            }
+            return;
+        }
+        lastSyncTriggerElapsedMs = elapsed;
+        ClassLoader classLoader = targetClassLoader;
+        if (classLoader != null && triggerDirectDeviceSync(classLoader, reason, manual)) {
+            return;
+        }
+        final View view = syncButtonView.get();
+        final View.OnClickListener listener = syncButtonListener.get();
+        if (view == null && listener == null) {
+            diagLine("sync trigger pending: open Xiaomi Health sync page once to capture entry");
+            return;
+        }
+        try {
+            new Handler(context.getMainLooper()).post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        if (view != null && view.isAttachedToWindow()) {
+                            view.performClick();
+                        } else if (listener != null && view != null) {
+                            listener.onClick(view);
+                        } else {
+                            diagLine("sync trigger failed: captured sync view expired");
+                        }
+                    } catch (Throwable throwable) {
+                        diagLine("sync trigger failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+                    }
+                }
+            });
+            if (BuildConfig.DEBUG) {
+                diagLine("sync trigger posted reason=" + reason + ", manual=" + manual);
+            }
+        } catch (Throwable throwable) {
+            diagLine("sync trigger post failed: " + throwable.getClass().getSimpleName());
+        }
+    }
+
+    private boolean triggerDirectDeviceSync(ClassLoader classLoader, String reason, boolean manual) {
+        Object device = getCurrentDeviceModel(classLoader);
+        if (device == null) {
+            if (BuildConfig.DEBUG) {
+                diagLine("direct sync skipped: current device is null");
+            }
+            return false;
+        }
+        updateDeviceModel(device);
+        String did = getCurrentDeviceId(device);
+        if (did == null) {
+            diagLine("direct sync skipped: current device did is null");
+            return false;
+        }
+        if (triggerWearableDeviceSync(classLoader, did, reason, manual)) {
+            return true;
+        }
+        return triggerEcoDeviceSync(classLoader, did, reason, manual);
+    }
+
+    private boolean triggerWearableDeviceSync(ClassLoader classLoader, String did, String reason, boolean manual) {
+        try {
+            Class<?> contactClass = findClass("com.xiaomi.fitness.device.contact.export.DeviceContact", classLoader);
+            Object companion = getKotlinCompanion(contactClass, "com.xiaomi.fitness.device.contact.export.DeviceContact$Companion", classLoader);
+            Class<?> extClass = findClass("com.xiaomi.fitness.device.contact.export.DeviceSyncExtKt", classLoader);
+            Object contact = callStaticMethod(extClass, "getInstance", companion);
+            callMethod(contact, "syncDataByWidget", did, Boolean.FALSE);
+            diagLine("direct sync requested: wearable did=" + maskDid(did) + ", reason=" + reason + ", manual=" + manual);
+            return true;
+        } catch (Throwable throwable) {
+            if (BuildConfig.DEBUG) {
+                diagLine("direct wearable sync unavailable: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+            }
+            return false;
+        }
+    }
+
+    private boolean triggerEcoDeviceSync(ClassLoader classLoader, String did, String reason, boolean manual) {
+        try {
+            Class<?> contactClass = findClass("com.xiaomi.fitness.eco.device.contact.export.EcoDeviceContact", classLoader);
+            Object companion = getKotlinCompanion(contactClass, "com.xiaomi.fitness.eco.device.contact.export.EcoDeviceContact$Companion", classLoader);
+            Class<?> extClass = findClass("com.xiaomi.fitness.eco.device.contact.export.EcoDeviceSyncExtKt", classLoader);
+            Object contact = callStaticMethod(extClass, "getInstance", companion);
+            callMethod(contact, "syncData", did, Boolean.FALSE);
+            diagLine("direct sync requested: eco did=" + maskDid(did) + ", reason=" + reason + ", manual=" + manual);
+            return true;
+        } catch (Throwable throwable) {
+            if (BuildConfig.DEBUG) {
+                diagLine("direct eco sync unavailable: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+            }
+            return false;
+        }
+    }
+
+    private String maskDid(String did) {
+        if (did == null || did.length() <= 6) {
+            return "***";
+        }
+        return did.substring(0, 3) + "***" + did.substring(did.length() - 3);
+    }
+
+    private Object getKotlinCompanion(Class<?> ownerClass, String companionClassName, ClassLoader classLoader) throws Exception {
+        try {
+            return getStaticObjectField(ownerClass, "Companion", "INSTANCE");
+        } catch (NoSuchFieldException ignored) {
+            Class<?> companionClass = findClass(companionClassName, classLoader);
+            return getStaticObjectField(companionClass, "$$INSTANCE", "INSTANCE");
+        }
+    }
+
     private void scheduleStartAfterAttach(final ClassLoader classLoader) {
         final Context context = appContext;
         if (context == null) {
+            return;
+        }
+        if (!heartRateHookEnabled) {
             return;
         }
         if (isMainProcess()) {
@@ -481,6 +802,9 @@ public final class MiHealthHookModule extends XposedModule {
             return;
         }
         if (!isWorkerProcess()) {
+            return;
+        }
+        if (!heartRateHookEnabled) {
             return;
         }
         try {
@@ -908,6 +1232,11 @@ public final class MiHealthHookModule extends XposedModule {
             public void run() {
                 try {
                     uploader.warmUp(context);
+                    HeartwithSettings settings = readSettingsFromProvider(context);
+                    applyRuntimeSettings(
+                            context,
+                            settings == null ? uploader.currentSettings() : settings,
+                            settings == null ? "settings warmup cache" : "settings warmup provider");
                 } catch (Throwable throwable) {
                     diagLine("warmup crashed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
                 }
@@ -923,25 +1252,60 @@ public final class MiHealthHookModule extends XposedModule {
             BroadcastReceiver receiver = new BroadcastReceiver() {
                 @Override
                 public void onReceive(Context receiverContext, Intent intent) {
-                    if (intent == null || !HeartwithSettings.ACTION_CONFIG_CHANGED.equals(intent.getAction())) {
+                    if (intent == null) {
+                        return;
+                    }
+                    if (HeartwithSettings.ACTION_SYNC_NOW.equals(intent.getAction())) {
+                        final boolean manual = intent.getBooleanExtra(HeartwithSettings.EXTRA_SYNC_MANUAL, false);
+                        if (!manual && intent.getIntExtra(EXTRA_SYNC_GENERATION, syncScheduleGeneration) != syncScheduleGeneration) {
+                            return;
+                        }
+                        triggerMiHealthSync(context, manual ? "manual" : "alarm", manual);
+                        if (!manual) {
+                            schedulePeriodicSync(context);
+                        }
+                        return;
+                    }
+                    if (ACTION_HEART_RATE_WATCHDOG.equals(intent.getAction())) {
+                        if (!isWorkerProcess()) {
+                            return;
+                        }
+                        int generation = intent.getIntExtra(
+                                EXTRA_HEART_RATE_WATCHDOG_GENERATION,
+                                heartRateWatchdogGeneration);
+                        if (generation != heartRateWatchdogGeneration) {
+                            return;
+                        }
+                        handleHeartRateAlarmWatchdog();
+                        return;
+                    }
+                    if (!HeartwithSettings.ACTION_CONFIG_CHANGED.equals(intent.getAction())) {
                         return;
                     }
                     final Context runtimeContext = context;
-                    final boolean enabled = intent.getBooleanExtra(HeartwithSettings.EXTRA_ENABLED, true);
+                    final boolean enabled = intent.hasExtra(HeartwithSettings.EXTRA_HOOK_ENABLED)
+                            ? intent.getBooleanExtra(HeartwithSettings.EXTRA_HOOK_ENABLED, false)
+                            : intent.getBooleanExtra(HeartwithSettings.EXTRA_ENABLED, false);
+                    final boolean syncEnabled = intent.getBooleanExtra(HeartwithSettings.EXTRA_SYNC_ENABLED, false);
+                    final int syncIntervalHours = intent.getIntExtra(
+                            HeartwithSettings.EXTRA_SYNC_INTERVAL_HOURS,
+                            HeartwithSettings.DEFAULT_SYNC_INTERVAL_HOURS);
                     final String serverUrl = intent.getStringExtra(HeartwithSettings.EXTRA_SERVER_URL);
                     final String displayName = intent.getStringExtra(HeartwithSettings.EXTRA_DISPLAY_NAME);
                     WORKER.execute(new Runnable() {
                         @Override
                         public void run() {
-                            uploader.applySettings(
+                            applyRuntimeSettings(
                                     runtimeContext,
-                                    new HeartwithSettings(enabled, serverUrl, displayName),
+                                    new HeartwithSettings(enabled, serverUrl, displayName, syncEnabled, syncIntervalHours),
                                     "settings broadcast synced");
                         }
                     });
                 }
             };
             IntentFilter filter = new IntentFilter(HeartwithSettings.ACTION_CONFIG_CHANGED);
+            filter.addAction(HeartwithSettings.ACTION_SYNC_NOW);
+            filter.addAction(ACTION_HEART_RATE_WATCHDOG);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
             } else {
@@ -951,6 +1315,91 @@ public final class MiHealthHookModule extends XposedModule {
         } catch (Throwable throwable) {
             diagLine("config receiver failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
         }
+    }
+
+    private void applyRuntimeSettings(Context context, HeartwithSettings settings, String reason) {
+        if (settings == null) {
+            return;
+        }
+        lastRuntimeSettingsRefreshElapsedMs = SystemClock.elapsedRealtime();
+        boolean wasHeartRateHookEnabled = heartRateHookEnabled;
+        boolean wasPeriodicSyncEnabled = periodicSyncEnabled;
+        int oldPeriodicSyncIntervalHours = periodicSyncIntervalHours;
+        heartRateHookEnabled = settings.hookEnabled;
+        periodicSyncEnabled = settings.syncEnabled;
+        periodicSyncIntervalHours = settings.syncIntervalHours;
+        uploader.applySettings(context, settings, reason);
+        if (isMainProcess() &&
+                (wasPeriodicSyncEnabled != periodicSyncEnabled ||
+                        oldPeriodicSyncIntervalHours != periodicSyncIntervalHours)) {
+            if (periodicSyncEnabled) {
+                schedulePeriodicSync(context);
+            } else {
+                cancelPeriodicSync(context);
+            }
+        }
+        if (settings.hookEnabled && !wasHeartRateHookEnabled && isWorkerProcess() && targetClassLoader != null) {
+            scheduleStartAfterAttach(targetClassLoader);
+        } else if (!settings.hookEnabled) {
+            started = false;
+            noHeartStartAttempts = 0;
+            cancelHeartRateAlarmWatchdog(context);
+        }
+    }
+
+    private void refreshRuntimeSettingsIfNeeded(Context context, boolean force) {
+        if (context == null) {
+            return;
+        }
+        long elapsed = SystemClock.elapsedRealtime();
+        if (!force && lastRuntimeSettingsRefreshElapsedMs > 0L &&
+                elapsed - lastRuntimeSettingsRefreshElapsedMs < 30_000L) {
+            return;
+        }
+        HeartwithSettings settings = readSettingsFromProvider(context);
+        if (settings != null) {
+            applyRuntimeSettings(context, settings, "runtime settings refresh");
+        }
+    }
+
+    private HeartwithSettings readSettingsFromProvider(Context context) {
+        if (context == null) {
+            return null;
+        }
+        Cursor cursor = null;
+        try {
+            cursor = context.getContentResolver().query(SettingsProvider.URI, null, null, null, null);
+            if (cursor == null || !cursor.moveToFirst()) {
+                return null;
+            }
+            boolean hookEnabled = readBoolean(cursor, HeartwithSettings.KEY_HOOK_ENABLED,
+                    readBoolean(cursor, HeartwithSettings.KEY_ENABLED, false));
+            boolean syncEnabled = readBoolean(cursor, HeartwithSettings.KEY_SYNC_ENABLED, false);
+            int syncIntervalHours = readInt(
+                    cursor,
+                    HeartwithSettings.KEY_SYNC_INTERVAL_HOURS,
+                    HeartwithSettings.DEFAULT_SYNC_INTERVAL_HOURS);
+            String serverUrl = cursor.getString(cursor.getColumnIndexOrThrow(HeartwithSettings.KEY_SERVER_URL));
+            String displayName = cursor.getString(cursor.getColumnIndexOrThrow(HeartwithSettings.KEY_DISPLAY_NAME));
+            return new HeartwithSettings(hookEnabled, serverUrl, displayName, syncEnabled, syncIntervalHours);
+        } catch (Throwable throwable) {
+            diagLine("read runtime settings failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+            return null;
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+    }
+
+    private boolean readBoolean(Cursor cursor, String column, boolean fallback) {
+        int index = cursor.getColumnIndex(column);
+        return index >= 0 ? cursor.getInt(index) != 0 : fallback;
+    }
+
+    private int readInt(Cursor cursor, String column, int fallback) {
+        int index = cursor.getColumnIndex(column);
+        return index >= 0 ? HeartwithSettings.clampSyncIntervalHours(cursor.getInt(index)) : fallback;
     }
 
     private void registerSportModeReceiver(final Context context) {
@@ -1392,6 +1841,9 @@ public final class MiHealthHookModule extends XposedModule {
     }
 
     private void ensureRealtimeHrStarted(final ClassLoader classLoader, final String reason) {
+        if (!heartRateHookEnabled) {
+            return;
+        }
         boolean force = reason.startsWith("watchdog:") || reason.startsWith("stop:");
         if ((!force && !shouldStartNow(reason)) || !starting.compareAndSet(false, true)) {
             return;
@@ -1445,27 +1897,34 @@ public final class MiHealthHookModule extends XposedModule {
 
     private void scheduleRetryIfNeeded(final ClassLoader classLoader, boolean forceRetry) {
         final Context context = appContext;
-        if (context == null || lastHr > 0) {
+        if (context == null) {
+            return;
+        }
+        if (!heartRateHookEnabled) {
             return;
         }
         if (!isWorkerProcess()) {
             return;
         }
+        boolean hasRecent = hasRecentHeartRateInAnyProcess(HEART_RATE_WATCHDOG_MS);
+        if (!forceRetry && lastHr > 0) {
+            return;
+        }
         if (!forceRetry && hasRecentHeartRateInAnyProcess()) {
             return;
         }
-        if (forceRetry && hasRecentHeartRateInAnyProcess(HEART_RATE_WATCHDOG_MS)) {
+        if (forceRetry && hasRecent) {
             return;
         }
         markLegacyKickNeeded();
         noHeartStartAttempts++;
         final long delayMs = noHeartStartAttempts <= 2 ? 9_000L : 60_000L;
-        final String retryReason = forceRetry ? "watchdog-retry:no-heart-rate" : "timer:no-heart-rate";
+        final String retryReason = forceRetry ? "watchdog:no-heart-rate-retry" : "timer:no-heart-rate";
         try {
             new Handler(context.getMainLooper()).postDelayed(new Runnable() {
                 @Override
                 public void run() {
-                    if (lastHr <= 0 && !hasRecentHeartRateInAnyProcess(HEART_RATE_WATCHDOG_MS)) {
+                    if (!hasRecentHeartRateInAnyProcess(HEART_RATE_WATCHDOG_MS)) {
                         ensureRealtimeHrStarted(classLoader, retryReason);
                     }
                 }
@@ -2268,6 +2727,10 @@ public final class MiHealthHookModule extends XposedModule {
     }
 
     private void onHeartRate(final int hr, final String source) {
+        refreshRuntimeSettingsIfNeeded(appContext, false);
+        if (!heartRateHookEnabled) {
+            return;
+        }
         if (hr < 30 || hr > 240) {
             return;
         }
@@ -2290,6 +2753,7 @@ public final class MiHealthHookModule extends XposedModule {
         lastHrElapsedMs = elapsed;
         noHeartStartAttempts = 0;
         scheduleHeartRateWatchdog();
+        scheduleHeartRateAlarmWatchdog("heart-rate");
         if (isWorkerProcess()) {
             persistLastHeartRateSeen(elapsed);
             clearLegacyKickNeededOnce();
@@ -2705,6 +3169,9 @@ public final class MiHealthHookModule extends XposedModule {
         if (context == null || classLoader == null || !isWorkerProcess()) {
             return;
         }
+        if (!heartRateHookEnabled) {
+            return;
+        }
         try {
             new Handler(context.getMainLooper()).postDelayed(new Runnable() {
                 @Override
@@ -2721,6 +3188,9 @@ public final class MiHealthHookModule extends XposedModule {
         final Context context = appContext;
         final ClassLoader classLoader = targetClassLoader;
         if (context == null || classLoader == null || !isWorkerProcess()) {
+            return;
+        }
+        if (!heartRateHookEnabled) {
             return;
         }
         if (!heartRateWatchdogScheduled.compareAndSet(false, true)) {
@@ -2743,6 +3213,85 @@ public final class MiHealthHookModule extends XposedModule {
         } catch (Throwable ignored) {
             heartRateWatchdogScheduled.set(false);
         }
+    }
+
+    private void scheduleHeartRateAlarmWatchdog(String reason) {
+        Context context = appContext;
+        if (context == null || !isWorkerProcess() || !heartRateHookEnabled) {
+            return;
+        }
+        long elapsed = SystemClock.elapsedRealtime();
+        if (lastHeartRateWatchdogAlarmElapsedMs > 0L &&
+                elapsed - lastHeartRateWatchdogAlarmElapsedMs < HEART_RATE_ALARM_RESCHEDULE_MIN_MS) {
+            return;
+        }
+        lastHeartRateWatchdogAlarmElapsedMs = elapsed;
+        int generation = ++heartRateWatchdogGeneration;
+        try {
+            AlarmManager alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+            if (alarmManager == null) {
+                return;
+            }
+            PendingIntent pendingIntent = heartRateWatchdogPendingIntent(context, generation);
+            alarmManager.cancel(pendingIntent);
+            long triggerAtMs = elapsed + HEART_RATE_ALARM_WATCHDOG_MS;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                alarmManager.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAtMs, pendingIntent);
+            } else {
+                alarmManager.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAtMs, pendingIntent);
+            }
+            if (BuildConfig.DEBUG) {
+                diagLine("hr alarm watchdog scheduled reason=" + reason + ", generation=" + generation);
+            }
+        } catch (Throwable throwable) {
+            diagLine("hr alarm watchdog schedule failed: " + throwable.getClass().getSimpleName());
+        }
+    }
+
+    private void cancelHeartRateAlarmWatchdog(Context context) {
+        heartRateWatchdogGeneration++;
+        lastHeartRateWatchdogAlarmElapsedMs = 0L;
+        if (context == null || !isWorkerProcess()) {
+            return;
+        }
+        try {
+            AlarmManager alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+            if (alarmManager != null) {
+                alarmManager.cancel(heartRateWatchdogPendingIntent(context, heartRateWatchdogGeneration));
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private PendingIntent heartRateWatchdogPendingIntent(Context context, int generation) {
+        Intent intent = new Intent(ACTION_HEART_RATE_WATCHDOG);
+        intent.setPackage(targetPackage);
+        intent.putExtra(EXTRA_HEART_RATE_WATCHDOG_GENERATION, generation);
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            flags |= PendingIntent.FLAG_IMMUTABLE;
+        }
+        return PendingIntent.getBroadcast(context, 0x23014333, intent, flags);
+    }
+
+    private void handleHeartRateAlarmWatchdog() {
+        if (!isWorkerProcess() || !heartRateHookEnabled) {
+            return;
+        }
+        ClassLoader classLoader = targetClassLoader;
+        if (classLoader == null) {
+            return;
+        }
+        if (hasRecentHeartRateInAnyProcess(HEART_RATE_ALARM_WATCHDOG_MS)) {
+            lastHeartRateWatchdogAlarmElapsedMs = 0L;
+            scheduleHeartRateAlarmWatchdog("alarm:recent");
+            return;
+        }
+        diagLine("hr alarm watchdog stale, restarting realtime heart rate");
+        resetHeartRateSource("watchdog-alarm:no-heart-rate");
+        ensureRealtimeHrStarted(classLoader, "watchdog-alarm:no-heart-rate");
+        lastHeartRateWatchdogAlarmElapsedMs = 0L;
+        scheduleHeartRateAlarmWatchdog("alarm:stale");
     }
 
     private void maybePersistActiveSource(String source) {

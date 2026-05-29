@@ -10,10 +10,12 @@ import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
 import android.view.Window;
@@ -84,16 +86,46 @@ final class HeartwithSettingsPanel {
 
     static void sendConfigBroadcast(Context context, HeartwithSettings settings) {
         for (String packageName : TARGET_PACKAGES) {
-            Intent intent = new Intent(HeartwithSettings.ACTION_CONFIG_CHANGED);
+            Intent intent = configIntent(settings);
             intent.setPackage(packageName);
-            intent.putExtra(HeartwithSettings.EXTRA_ENABLED, settings.enabled);
-            intent.putExtra(HeartwithSettings.EXTRA_SERVER_URL, settings.serverUrl);
-            intent.putExtra(HeartwithSettings.EXTRA_DISPLAY_NAME, settings.displayName);
             try {
                 context.sendBroadcast(intent);
             } catch (Throwable ignored) {
             }
         }
+        try {
+            context.sendBroadcast(configIntent(settings));
+        } catch (Throwable ignored) {
+        }
+    }
+
+    static void sendSyncNowBroadcast(Context context) {
+        for (String packageName : TARGET_PACKAGES) {
+            Intent intent = new Intent(HeartwithSettings.ACTION_SYNC_NOW);
+            intent.setPackage(packageName);
+            intent.putExtra(HeartwithSettings.EXTRA_SYNC_MANUAL, true);
+            try {
+                context.sendBroadcast(intent);
+            } catch (Throwable ignored) {
+            }
+        }
+        try {
+            Intent intent = new Intent(HeartwithSettings.ACTION_SYNC_NOW);
+            intent.putExtra(HeartwithSettings.EXTRA_SYNC_MANUAL, true);
+            context.sendBroadcast(intent);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static Intent configIntent(HeartwithSettings settings) {
+        Intent intent = new Intent(HeartwithSettings.ACTION_CONFIG_CHANGED);
+        intent.putExtra(HeartwithSettings.EXTRA_ENABLED, settings.enabled);
+        intent.putExtra(HeartwithSettings.EXTRA_HOOK_ENABLED, settings.hookEnabled);
+        intent.putExtra(HeartwithSettings.EXTRA_SYNC_ENABLED, settings.syncEnabled);
+        intent.putExtra(HeartwithSettings.EXTRA_SYNC_INTERVAL_HOURS, settings.syncIntervalHours);
+        intent.putExtra(HeartwithSettings.EXTRA_SERVER_URL, settings.serverUrl);
+        intent.putExtra(HeartwithSettings.EXTRA_DISPLAY_NAME, settings.displayName);
+        return intent;
     }
 
     static void showDialog(final Activity activity) {
@@ -206,8 +238,12 @@ final class HeartwithSettingsPanel {
         private final ScrollView root;
         private final EditText serverUrl;
         private final EditText displayName;
-        private final Switch enabled;
-        private final TextView enabledText;
+        private final EditText syncIntervalHours;
+        private final Switch hookEnabled;
+        private final Switch syncEnabled;
+        private final TextView hookEnabledText;
+        private final TextView syncEnabledText;
+        private final TextView syncIntervalHelp;
         private final TextView bpmText;
         private final TextView statusText;
         private final TextView sourceText;
@@ -231,6 +267,15 @@ final class HeartwithSettingsPanel {
             subtitle.setPadding(0, dp(activity, 4), 0, dp(activity, 24));
             content.addView(subtitle, matchWrap());
 
+            if (!HeartwithSettings.onboardingSeen(activity)) {
+                LinearLayout guideCard = card(activity);
+                guideCard.addView(label(activity, "首次使用", 18, COLOR_TEXT, true), matchWrap());
+                TextView guide = label(activity, "按需开启心率 Hook 或定时同步，保存后在小米健康进程内生效。", 14, COLOR_MUTED, false);
+                guide.setPadding(0, dp(activity, 8), 0, 0);
+                guideCard.addView(guide, matchWrap());
+                content.addView(guideCard, matchWrap());
+            }
+
             LinearLayout statusCard = card(activity);
             TextView chip = chip(activity, "Hook");
             statusCard.addView(chip, wrapWrap());
@@ -245,6 +290,29 @@ final class HeartwithSettingsPanel {
             statusCard.addView(sourceText, matchWrap());
             content.addView(statusCard, matchWrap());
 
+            if (BuildConfig.DEBUG) {
+                LinearLayout debugCard = card(activity);
+                debugCard.addView(label(activity, "Debug 悬浮红点", 18, COLOR_TEXT, true), matchWrap());
+                TextView debugText = label(activity, "前台调试时显示最近捕获的 BPM、source 和时间；后台仍看通知。", 14, COLOR_MUTED, false);
+                debugText.setPadding(0, dp(activity, 8), 0, 0);
+                debugCard.addView(debugText, matchWrap());
+                Button overlayPermission = new Button(activity);
+                overlayPermission.setText(canDrawDebugOverlay(activity) ? "悬浮窗权限已允许" : "允许悬浮窗权限");
+                overlayPermission.setAllCaps(false);
+                overlayPermission.setTextSize(15);
+                overlayPermission.setTextColor(COLOR_TEXT);
+                overlayPermission.setBackground(rounded(activity, COLOR_INPUT, 18));
+                overlayPermission.setPadding(dp(activity, 18), dp(activity, 8), dp(activity, 18), dp(activity, 8));
+                overlayPermission.setOnClickListener(new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        openOverlaySettings(activity);
+                    }
+                });
+                debugCard.addView(overlayPermission, matchWrapWithTop(activity, 12));
+                content.addView(debugCard, matchWrapWithTop(activity, 18));
+            }
+
             LinearLayout configCard = card(activity);
             configCard.addView(label(activity, "采集端", 18, COLOR_TEXT, true), matchWrap());
             serverUrl = input(activity, "服务器地址", settings.serverUrl);
@@ -252,27 +320,59 @@ final class HeartwithSettingsPanel {
             displayName = input(activity, "显示名称", settings.displayName);
             configCard.addView(displayName, matchWrapWithTop(activity, 12));
 
-            LinearLayout row = new LinearLayout(activity);
-            row.setOrientation(LinearLayout.HORIZONTAL);
-            row.setGravity(Gravity.CENTER_VERTICAL);
-            row.setPadding(0, dp(activity, 18), 0, 0);
-            LinearLayout text = new LinearLayout(activity);
-            text.setOrientation(LinearLayout.VERTICAL);
-            enabledText = label(activity, settings.enabled ? "Hook 上传已启用" : "Hook 上传已关闭", 18, COLOR_TEXT, true);
-            text.addView(enabledText, matchWrap());
-            text.addView(label(activity, "关闭后小米健康心率不会上传。", 14, COLOR_MUTED, false), matchWrapWithTop(activity, 3));
-            row.addView(text, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-            enabled = new Switch(activity);
-            enabled.setChecked(settings.enabled);
-            enabled.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+            LinearLayout hookRow = switchRow(activity, settings.hookEnabled ? "心率 Hook 已开启" : "心率 Hook 已关闭", "开启后采集小米健康实时心率并上传。");
+            hookEnabledText = (TextView) hookRow.findViewWithTag("title");
+            hookEnabled = (Switch) hookRow.findViewWithTag("switch");
+            hookEnabled.setChecked(settings.hookEnabled);
+            hookEnabled.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
                 @Override
                 public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
-                    enabledText.setText(isChecked ? "Hook 上传已启用" : "Hook 上传已关闭");
+                    hookEnabledText.setText(isChecked ? "心率 Hook 已开启" : "心率 Hook 已关闭");
                     save(false);
                 }
             });
-            row.addView(enabled, wrapWrap());
-            configCard.addView(row, matchWrap());
+            configCard.addView(hookRow, matchWrap());
+
+            syncIntervalHours = input(activity, "同步间隔", String.valueOf(settings.syncIntervalHours));
+            syncIntervalHours.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+            configCard.addView(syncIntervalHours, matchWrapWithTop(activity, 12));
+            syncIntervalHelp = label(activity,
+                    syncIntervalHelpText(settings.syncIntervalHours),
+                    13,
+                    COLOR_MUTED,
+                    false);
+            syncIntervalHelp.setPadding(dp(activity, 2), dp(activity, 6), dp(activity, 2), 0);
+            configCard.addView(syncIntervalHelp, matchWrap());
+
+            LinearLayout syncRow = switchRow(activity, settings.syncEnabled ? "后台同步已开启" : "后台同步已关闭", "按填写间隔触发小米健康同步，间隔越长越省电。");
+            syncEnabledText = (TextView) syncRow.findViewWithTag("title");
+            syncEnabled = (Switch) syncRow.findViewWithTag("switch");
+            syncEnabled.setChecked(settings.syncEnabled);
+            syncEnabled.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+                @Override
+                public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
+                    syncEnabledText.setText(isChecked ? "后台同步已开启" : "后台同步已关闭");
+                    save(false);
+                }
+            });
+            configCard.addView(syncRow, matchWrap());
+
+            Button syncNow = new Button(activity);
+            syncNow.setText("立即同步");
+            syncNow.setAllCaps(false);
+            syncNow.setTextSize(15);
+            syncNow.setTextColor(COLOR_TEXT);
+            syncNow.setBackground(rounded(activity, COLOR_INPUT, 18));
+            syncNow.setPadding(dp(activity, 18), dp(activity, 8), dp(activity, 18), dp(activity, 8));
+            syncNow.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    save(false);
+                    sendSyncNowBroadcast(activity);
+                    Toast.makeText(activity, "已请求小米健康同步", Toast.LENGTH_SHORT).show();
+                }
+            });
+            configCard.addView(syncNow, matchWrapWithTop(activity, 12));
 
             Button save = new Button(activity);
             save.setText("保存配置");
@@ -314,15 +414,41 @@ final class HeartwithSettingsPanel {
 
         private void save(boolean toast) {
             HeartwithSettings settings = new HeartwithSettings(
-                    enabled.isChecked(),
+                    hookEnabled.isChecked(),
                     serverUrl.getText().toString(),
-                    displayName.getText().toString());
+                    displayName.getText().toString(),
+                    syncEnabled.isChecked(),
+                    HeartwithSettings.parseSyncIntervalHours(syncIntervalHours.getText().toString()));
             HeartwithSettings.writeLocal(activity, settings);
             sendConfigBroadcast(activity, settings);
+            syncIntervalHelp.setText(syncIntervalHelpText(settings.syncIntervalHours));
             if (toast) {
-                Toast.makeText(activity, "已保存，小米健康下次启动会自动同步", Toast.LENGTH_SHORT).show();
+                syncIntervalHours.setText(String.valueOf(settings.syncIntervalHours));
+                Toast.makeText(activity, "已保存", Toast.LENGTH_SHORT).show();
             }
         }
+    }
+
+    private static LinearLayout switchRow(Context context, String title, String subtitle) {
+        LinearLayout row = new LinearLayout(context);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(context, 18), 0, 0);
+        LinearLayout text = new LinearLayout(context);
+        text.setOrientation(LinearLayout.VERTICAL);
+        TextView titleView = label(context, title, 18, COLOR_TEXT, true);
+        titleView.setTag("title");
+        text.addView(titleView, matchWrap());
+        text.addView(label(context, subtitle, 14, COLOR_MUTED, false), matchWrapWithTop(context, 3));
+        row.addView(text, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        Switch switchView = new Switch(context);
+        switchView.setTag("switch");
+        row.addView(switchView, wrapWrap());
+        return row;
+    }
+
+    private static String syncIntervalHelpText(int hours) {
+        return "单位：小时。当前表示每 " + hours + " 小时触发一次小米健康后台同步，间隔越长越省电。";
     }
 
     private static LinearLayout card(Context context) {
@@ -338,6 +464,28 @@ final class HeartwithSettingsPanel {
         view.setPadding(dp(context, 8), dp(context, 3), dp(context, 8), dp(context, 3));
         view.setBackground(rounded(context, 0x33248cff, 7));
         return view;
+    }
+
+    private static boolean canDrawDebugOverlay(Context context) {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(context);
+    }
+
+    private static void openOverlaySettings(Activity activity) {
+        if (activity == null) {
+            return;
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            Toast.makeText(activity, "当前系统不需要单独授权", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        try {
+            Intent intent = new Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:" + activity.getPackageName()));
+            activity.startActivity(intent);
+        } catch (Throwable throwable) {
+            Toast.makeText(activity, "无法打开悬浮窗权限页", Toast.LENGTH_SHORT).show();
+        }
     }
 
     private static TextView label(Context context, String text, int sp, int color, boolean bold) {
