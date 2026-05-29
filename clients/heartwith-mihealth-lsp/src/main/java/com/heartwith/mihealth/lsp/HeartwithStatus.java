@@ -4,16 +4,13 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
-import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.os.Build;
 import android.os.SystemClock;
-import android.util.Log;
 
 final class HeartwithStatus {
-    private static final String TAG = "HeartwithMiHealth";
     private static final String MODULE_PACKAGE = "com.heartwith.mihealth.lsp";
     private static final String RUNTIME_PREFS = "heartwith_mihealth_runtime";
     private static final String KEY_CACHED_DEVICE_MODEL = "cached_device_model";
@@ -37,10 +34,6 @@ final class HeartwithStatus {
     private static final int NOTIFICATION_CHANGE_BPM = 3;
     private static long lastNotificationElapsedMs;
     private static int lastNotificationBpm = -1;
-    private static long lastStatusFailureElapsedMs;
-    private static long nextProviderStatusAttemptMs;
-    private static long lastStatusReportElapsedMs;
-    private static int lastStatusReportBpm = -1;
     private static boolean notificationChannelReady;
 
     final int bpm;
@@ -68,28 +61,20 @@ final class HeartwithStatus {
                 .putString(KEY_LAST_SOURCE, source == null ? "" : source)
                 .putLong(KEY_LAST_SEEN_MS, seenMs)
                 .apply();
-        context.getContentResolver().notifyChange(SettingsProvider.STATUS_URI, null);
+        if (MODULE_PACKAGE.equals(context.getPackageName())) {
+            context.getContentResolver().notifyChange(SettingsProvider.STATUS_URI, null);
+        }
     }
 
-    static void writeModuleStatus(Context context, int bpm, String source, long seenMs) {
-        if (MODULE_PACKAGE.equals(context.getPackageName())) {
-            return;
-        }
-        long now = System.currentTimeMillis();
-        if (now < nextProviderStatusAttemptMs) {
-            return;
-        }
-        try {
-            ContentValues values = new ContentValues();
-            values.put(KEY_LAST_BPM, bpm);
-            values.put(KEY_LAST_SOURCE, source == null ? "" : source);
-            values.put(KEY_LAST_SEEN_MS, seenMs);
-            values.put(KEY_PROCESS_NAME, context.getPackageName());
-            context.getContentResolver().update(SettingsProvider.STATUS_URI, values, null, null);
-        } catch (Throwable throwable) {
-            nextProviderStatusAttemptMs = now + 60_000L;
-            logFailure("provider status failed", throwable);
-        }
+    static void sendRegisteredStatus(Context context, int bpm, String source, long seenMs) {
+        Intent intent = new Intent(ACTION_STATUS_CHANGED);
+        intent.setPackage(MODULE_PACKAGE);
+        intent.putExtra(EXTRA_BPM, bpm);
+        intent.putExtra(EXTRA_SOURCE, source == null ? "" : source);
+        intent.putExtra(EXTRA_SEEN_MS, seenMs);
+        intent.putExtra(EXTRA_PROCESS_NAME, context == null ? "" : context.getPackageName());
+        intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY);
+        context.sendBroadcast(intent);
     }
 
     static void markViewerActive(Context context, boolean active) {
@@ -98,28 +83,6 @@ final class HeartwithStatus {
                 .edit()
                 .putLong(KEY_VIEWER_ACTIVE_UNTIL_MS, untilMs)
                 .apply();
-    }
-
-    static void reportFromHook(Context context, int bpm, String source, String processName, long seenMs) {
-        long elapsed = SystemClock.elapsedRealtime();
-        if (lastStatusReportBpm > 0 &&
-                Math.abs(bpm - lastStatusReportBpm) < NOTIFICATION_CHANGE_BPM &&
-                elapsed - lastStatusReportElapsedMs < NOTIFICATION_MIN_INTERVAL_MS) {
-            return;
-        }
-        lastStatusReportBpm = bpm;
-        lastStatusReportElapsedMs = elapsed;
-        try {
-            Intent intent = new Intent(ACTION_STATUS_CHANGED);
-            intent.setPackage("com.heartwith.mihealth.lsp");
-            intent.putExtra(EXTRA_BPM, bpm);
-            intent.putExtra(EXTRA_SOURCE, source == null ? "" : source);
-            intent.putExtra(EXTRA_SEEN_MS, seenMs);
-            intent.putExtra(EXTRA_PROCESS_NAME, processName == null ? "" : processName);
-            context.sendBroadcast(intent);
-        } catch (Throwable throwable) {
-            logFailure("broadcast status failed", throwable);
-        }
     }
 
     @SuppressWarnings("deprecation")
@@ -189,15 +152,6 @@ final class HeartwithStatus {
             flags |= PendingIntent.FLAG_IMMUTABLE;
         }
         return PendingIntent.getActivity(context, NOTIFICATION_ID, intent, flags);
-    }
-
-    private static void logFailure(String prefix, Throwable throwable) {
-        long elapsed = SystemClock.elapsedRealtime();
-        if (lastStatusFailureElapsedMs > 0L && elapsed - lastStatusFailureElapsedMs < 60_000L) {
-            return;
-        }
-        lastStatusFailureElapsedMs = elapsed;
-        Log.w(TAG, prefix + ": " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
     }
 
     private static String readDeviceModel(Context context) {

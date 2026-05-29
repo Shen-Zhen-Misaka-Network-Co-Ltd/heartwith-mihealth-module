@@ -89,7 +89,7 @@ final class HeartwithSettings {
                 .putBoolean(KEY_ONBOARDING_SEEN, true)
                 .putString(KEY_SERVER_URL, settings.serverUrl)
                 .putString(KEY_DISPLAY_NAME, settings.displayName)
-                .apply();
+                .commit();
     }
 
     static boolean onboardingSeen(Context context) {

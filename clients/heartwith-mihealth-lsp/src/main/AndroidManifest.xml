@@ -23,12 +23,5 @@
             </intent-filter>
         </activity>
 
-        <receiver
-            android:name=".StatusReceiver"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="com.heartwith.mihealth.lsp.STATUS_CHANGED" />
-            </intent-filter>
-        </receiver>
     </application>
 </manifest>

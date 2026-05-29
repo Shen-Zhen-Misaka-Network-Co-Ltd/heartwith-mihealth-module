@@ -1,7 +1,6 @@
 package com.heartwith.mihealth.lsp;
 
 import android.content.Context;
-import android.database.Cursor;
 import android.os.Handler;
 import android.os.SystemClock;
 import android.util.Log;
@@ -28,6 +27,7 @@ final class HeartwithUploader {
     private static final String KEY_CACHED_SERVER_URL = "cached_server_url";
     private static final String KEY_CACHED_DISPLAY_NAME = "cached_display_name";
     private static final String KEY_CACHED_DEVICE_MODEL = "cached_device_model";
+    private static final String MODULE_PACKAGE = "com.heartwith.mihealth.lsp";
     private static final String DEFAULT_DEVICE_MODEL = "Xiaomi Health Hook";
     private static final String CLIENT_PLATFORM = "android-lsposed";
     private static final long BATCH_WINDOW_MS = 8_000L;
@@ -45,7 +45,6 @@ final class HeartwithUploader {
     private HeartwithSettings settings = new HeartwithSettings(false, HeartwithSettings.DEFAULT_SERVER_URL, "Android");
     private String deviceModel = DEFAULT_DEVICE_MODEL;
     private Session session;
-    private long lastSettingsReadMs;
     private boolean settingsLoaded;
     private long lastFlushMs;
     private long nextUploadAttemptMs;
@@ -198,41 +197,7 @@ final class HeartwithUploader {
 
     private void refreshSettingsIfNeeded(Context context, boolean force) {
         loadRuntimeCacheIfNeeded(context);
-        long elapsed = SystemClock.elapsedRealtime();
-        if (!force && settingsLoaded && elapsed - lastSettingsReadMs < 30_000L) {
-            return;
-        }
-        lastSettingsReadMs = elapsed;
-        Cursor cursor = null;
-        try {
-            cursor = context.getContentResolver().query(SettingsProvider.URI, null, null, null, null);
-            if (cursor != null && cursor.moveToFirst()) {
-                boolean enabled = getBooleanColumn(cursor, HeartwithSettings.KEY_HOOK_ENABLED,
-                        getBooleanColumn(cursor, HeartwithSettings.KEY_ENABLED, false));
-                boolean syncEnabled = getBooleanColumn(cursor, HeartwithSettings.KEY_SYNC_ENABLED, false);
-                int syncIntervalHours = getIntColumn(
-                        cursor,
-                        HeartwithSettings.KEY_SYNC_INTERVAL_HOURS,
-                        HeartwithSettings.DEFAULT_SYNC_INTERVAL_HOURS);
-                String serverUrl = cursor.getString(cursor.getColumnIndexOrThrow(HeartwithSettings.KEY_SERVER_URL));
-                String displayName = cursor.getString(cursor.getColumnIndexOrThrow(HeartwithSettings.KEY_DISPLAY_NAME));
-                HeartwithSettings next = new HeartwithSettings(enabled, serverUrl, displayName, syncEnabled, syncIntervalHours);
-                if (!next.serverUrl.equals(settings.serverUrl) || !next.displayName.equals(settings.displayName)) {
-                    session = null;
-                    seq = 1;
-                }
-                settings = next;
-                settingsLoaded = true;
-                persistRuntimeCache(context, next);
-                logSettings("settings provider synced");
-            }
-        } catch (Throwable throwable) {
-            logFailure("read settings failed", throwable);
-        } finally {
-            if (cursor != null) {
-                cursor.close();
-            }
-        }
+        loadXposedSettingsIfNeeded(context);
         if (!settingsLoaded) {
             applySettings(context, settings, "settings fallback");
         }
@@ -284,6 +249,54 @@ final class HeartwithUploader {
                     .putString(KEY_CACHED_SERVER_URL, next.serverUrl)
                     .putString(KEY_CACHED_DISPLAY_NAME, next.displayName)
                     .apply();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void loadXposedSettingsIfNeeded(Context context) {
+        if (settingsLoaded || MODULE_PACKAGE.equals(context.getPackageName())) {
+            return;
+        }
+        try {
+            Class<?> clazz = Class.forName("de.robv.android.xposed.XSharedPreferences");
+            Object prefs = clazz
+                    .getConstructor(String.class, String.class)
+                    .newInstance(MODULE_PACKAGE, HeartwithSettings.PREFS);
+            try {
+                clazz.getMethod("reload").invoke(prefs);
+            } catch (Throwable ignored) {
+            }
+            String serverUrl = (String) clazz
+                    .getMethod("getString", String.class, String.class)
+                    .invoke(prefs, HeartwithSettings.KEY_SERVER_URL, "");
+            if (serverUrl == null || serverUrl.trim().isEmpty()) {
+                return;
+            }
+            boolean legacyEnabled = (Boolean) clazz
+                    .getMethod("getBoolean", String.class, boolean.class)
+                    .invoke(prefs, HeartwithSettings.KEY_ENABLED, false);
+            boolean hookEnabled = (Boolean) clazz
+                    .getMethod("getBoolean", String.class, boolean.class)
+                    .invoke(prefs, HeartwithSettings.KEY_HOOK_ENABLED, legacyEnabled);
+            boolean syncEnabled = (Boolean) clazz
+                    .getMethod("getBoolean", String.class, boolean.class)
+                    .invoke(prefs, HeartwithSettings.KEY_SYNC_ENABLED, false);
+            int syncIntervalHours = (Integer) clazz
+                    .getMethod("getInt", String.class, int.class)
+                    .invoke(prefs, HeartwithSettings.KEY_SYNC_INTERVAL_HOURS, HeartwithSettings.DEFAULT_SYNC_INTERVAL_HOURS);
+            String displayName = (String) clazz
+                    .getMethod("getString", String.class, String.class)
+                    .invoke(prefs, HeartwithSettings.KEY_DISPLAY_NAME, "Android");
+            HeartwithSettings next = new HeartwithSettings(
+                    hookEnabled,
+                    serverUrl,
+                    displayName,
+                    syncEnabled,
+                    syncIntervalHours);
+            settings = next;
+            settingsLoaded = true;
+            persistRuntimeCache(context, next);
+            logSettings("xposed settings loaded");
         } catch (Throwable ignored) {
         }
     }
@@ -354,18 +367,6 @@ final class HeartwithUploader {
                 + ", server=" + settings.serverUrl
                 + ", display=" + settings.displayName
                 + ", device=" + deviceModel);
-    }
-
-    private boolean getBooleanColumn(Cursor cursor, String name, boolean fallback) {
-        int index = cursor.getColumnIndex(name);
-        return index >= 0 ? cursor.getInt(index) != 0 : fallback;
-    }
-
-    private int getIntColumn(Cursor cursor, String name, int fallback) {
-        int index = cursor.getColumnIndex(name);
-        return index >= 0
-                ? HeartwithSettings.clampSyncIntervalHours(cursor.getInt(index))
-                : fallback;
     }
 
     private void logUploadSuccess(int sampleCount) {

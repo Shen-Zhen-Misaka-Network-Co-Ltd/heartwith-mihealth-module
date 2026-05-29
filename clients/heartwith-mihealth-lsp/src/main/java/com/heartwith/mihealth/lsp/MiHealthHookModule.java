@@ -10,7 +10,6 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
-import android.database.Cursor;
 import android.content.SharedPreferences;
 import android.os.Handler;
 import android.os.Build;
@@ -74,7 +73,6 @@ public final class MiHealthHookModule extends XposedModule {
             (BuildConfig.DEBUG ? 1L : 2L) * 60L * 1000L;
     private static final long SPORT_MODE_GRACE_MS = 10_000L;
     private static final long STATUS_UPDATE_MIN_INTERVAL_MS = 10_000L;
-    private static final long STATUS_VIEWER_CHECK_MIN_INTERVAL_MS = 1_000L;
     private static final long SYNC_MIN_TRIGGER_GAP_MS = 10L * 60L * 1000L;
     private static final long SYNC_MANUAL_MIN_TRIGGER_GAP_MS = 5_000L;
     private static final int STATUS_UPDATE_CHANGE_BPM = 3;
@@ -178,8 +176,6 @@ public final class MiHealthHookModule extends XposedModule {
     private volatile long lastHeartRateSeenPersistElapsedMs;
     private volatile long lastStatusUpdateElapsedMs;
     private volatile int lastStatusUpdateBpm = -1;
-    private volatile long lastStatusViewerCheckElapsedMs;
-    private volatile long statusViewerActiveUntilMs;
     private volatile long sportModeActiveUntilMs;
     private volatile String currentDeviceIdentity;
     private volatile boolean currentDeviceModelResolved;
@@ -1240,11 +1236,10 @@ public final class MiHealthHookModule extends XposedModule {
             public void run() {
                 try {
                     uploader.warmUp(context);
-                    HeartwithSettings settings = readSettingsFromProvider(context);
                     applyRuntimeSettings(
                             context,
-                            settings == null ? uploader.currentSettings() : settings,
-                            settings == null ? "settings warmup cache" : "settings warmup provider");
+                            uploader.currentSettings(),
+                            "settings warmup cache");
                 } catch (Throwable throwable) {
                     diagLine("warmup crashed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
                 }
@@ -1364,50 +1359,7 @@ public final class MiHealthHookModule extends XposedModule {
                 elapsed - lastRuntimeSettingsRefreshElapsedMs < 30_000L) {
             return;
         }
-        HeartwithSettings settings = readSettingsFromProvider(context);
-        if (settings != null) {
-            applyRuntimeSettings(context, settings, "runtime settings refresh");
-        }
-    }
-
-    private HeartwithSettings readSettingsFromProvider(Context context) {
-        if (context == null) {
-            return null;
-        }
-        Cursor cursor = null;
-        try {
-            cursor = context.getContentResolver().query(SettingsProvider.URI, null, null, null, null);
-            if (cursor == null || !cursor.moveToFirst()) {
-                return null;
-            }
-            boolean hookEnabled = readBoolean(cursor, HeartwithSettings.KEY_HOOK_ENABLED,
-                    readBoolean(cursor, HeartwithSettings.KEY_ENABLED, false));
-            boolean syncEnabled = readBoolean(cursor, HeartwithSettings.KEY_SYNC_ENABLED, false);
-            int syncIntervalHours = readInt(
-                    cursor,
-                    HeartwithSettings.KEY_SYNC_INTERVAL_HOURS,
-                    HeartwithSettings.DEFAULT_SYNC_INTERVAL_HOURS);
-            String serverUrl = cursor.getString(cursor.getColumnIndexOrThrow(HeartwithSettings.KEY_SERVER_URL));
-            String displayName = cursor.getString(cursor.getColumnIndexOrThrow(HeartwithSettings.KEY_DISPLAY_NAME));
-            return new HeartwithSettings(hookEnabled, serverUrl, displayName, syncEnabled, syncIntervalHours);
-        } catch (Throwable throwable) {
-            diagLine("read runtime settings failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
-            return null;
-        } finally {
-            if (cursor != null) {
-                cursor.close();
-            }
-        }
-    }
-
-    private boolean readBoolean(Cursor cursor, String column, boolean fallback) {
-        int index = cursor.getColumnIndex(column);
-        return index >= 0 ? cursor.getInt(index) != 0 : fallback;
-    }
-
-    private int readInt(Cursor cursor, String column, int fallback) {
-        int index = cursor.getColumnIndex(column);
-        return index >= 0 ? HeartwithSettings.clampSyncIntervalHours(cursor.getInt(index)) : fallback;
+        applyRuntimeSettings(context, uploader.currentSettings(), "runtime settings refresh");
     }
 
     private void registerSportModeReceiver(final Context context) {
@@ -2779,20 +2731,16 @@ public final class MiHealthHookModule extends XposedModule {
         if (!handleHeartRate) {
             return;
         }
-        final boolean viewerActive = isStatusViewerActive(elapsed);
         final boolean updateNotification = shouldUpdateStatus(hr, elapsed);
-        final boolean updateStatusCache = updateNotification || viewerActive;
         final boolean uploadHeartRate = shouldUploadAcceptedHeartRate(source);
         WORKER.execute(new Runnable() {
             @Override
             public void run() {
                 long seenMs = System.currentTimeMillis();
-                if (updateStatusCache) {
+                if (updateNotification) {
                     try {
                         HeartwithStatus.writeLocal(context, hr, source, seenMs);
-                        if (viewerActive) {
-                            HeartwithStatus.writeModuleStatus(context, hr, source, seenMs);
-                        }
+                        HeartwithStatus.sendRegisteredStatus(context, hr, source, seenMs);
                     } catch (Throwable throwable) {
                         diagLine("status cache failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
                     }
@@ -2802,11 +2750,6 @@ public final class MiHealthHookModule extends XposedModule {
                         HeartwithStatus.showHookProcessNotification(context, hr, source, seenMs);
                     } catch (Throwable throwable) {
                         diagLine("notification failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
-                    }
-                    try {
-                        HeartwithStatus.reportFromHook(context, hr, source, processName, seenMs);
-                    } catch (Throwable throwable) {
-                        diagLine("status failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
                     }
                 }
                 if (uploadHeartRate) {
@@ -2865,36 +2808,6 @@ public final class MiHealthHookModule extends XposedModule {
             lastStatusUpdateBpm = hr;
             lastStatusUpdateElapsedMs = elapsed;
             return true;
-        }
-        return false;
-    }
-
-    private boolean isStatusViewerActive(long elapsed) {
-        if (statusViewerActiveUntilMs > System.currentTimeMillis()) {
-            return true;
-        }
-        if (lastStatusViewerCheckElapsedMs > 0L &&
-                elapsed - lastStatusViewerCheckElapsedMs < STATUS_VIEWER_CHECK_MIN_INTERVAL_MS) {
-            return false;
-        }
-        lastStatusViewerCheckElapsedMs = elapsed;
-        Context context = appContext;
-        if (context == null) {
-            return false;
-        }
-        Cursor cursor = null;
-        try {
-            cursor = context.getContentResolver().query(SettingsProvider.STATUS_URI, null, null, null, null);
-            if (cursor != null && cursor.moveToFirst()) {
-                long untilMs = cursor.getLong(cursor.getColumnIndexOrThrow(HeartwithStatus.KEY_VIEWER_ACTIVE_UNTIL_MS));
-                statusViewerActiveUntilMs = untilMs;
-                return untilMs > System.currentTimeMillis();
-            }
-        } catch (Throwable ignored) {
-        } finally {
-            if (cursor != null) {
-                cursor.close();
-            }
         }
         return false;
     }
@@ -3051,19 +2964,6 @@ public final class MiHealthHookModule extends XposedModule {
         }
         if (hasRecentHeartRateInLocalPrefs(context, maxAgeMs)) {
             return true;
-        }
-        Cursor cursor = null;
-        try {
-            cursor = context.getContentResolver().query(SettingsProvider.STATUS_URI, null, null, null, null);
-            if (cursor != null && cursor.moveToFirst()) {
-                long seenMs = cursor.getLong(cursor.getColumnIndexOrThrow(HeartwithStatus.KEY_LAST_SEEN_MS));
-                return seenMs > 0L && System.currentTimeMillis() - seenMs < maxAgeMs;
-            }
-        } catch (Throwable ignored) {
-        } finally {
-            if (cursor != null) {
-                cursor.close();
-            }
         }
         return false;
     }
