@@ -1,0 +1,3 @@
+-keep class com.heartwith.mihealth.lsp.MiHealthHookModule { *; }
+-keep class com.heartwith.mihealth.lsp.LegacyNpatchEntry { *; }
+-keep class com.heartwith.mihealth.lsp.SettingsProvider { *; }
