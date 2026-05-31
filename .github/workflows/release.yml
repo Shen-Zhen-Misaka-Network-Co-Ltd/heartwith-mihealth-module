@@ -17,6 +17,12 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      - uses: actions/checkout@v4
+        with:
+          repository: Shen-Zhen-Misaka-Network-Co-Ltd/heartwith-android-uploader
+          path: heartwith-android-uploader
+          fetch-depth: 0
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -47,6 +53,11 @@ jobs:
 
           current_tag="${GITHUB_REF_NAME}"
           previous_tag="$(git describe --tags --match 'mihealth-v*' --abbrev=0 "${current_tag}^" 2>/dev/null || true)"
+          previous_tag_date=""
+          if [ -n "$previous_tag" ]; then
+            previous_tag_date="$(git log -1 --format=%cI "$previous_tag")"
+          fi
+          uploader_head="$(git -C heartwith-android-uploader rev-parse --short HEAD)"
 
           {
             echo "## 变更记录"
@@ -63,6 +74,23 @@ jobs:
               echo
               git log --reverse --pretty=format:'- %s (%h)' "$current_tag"
             fi
+
+            echo
+            echo "## 上传 SDK 变更"
+            echo
+            if [ -n "$previous_tag_date" ]; then
+              uploader_changes="$(git -C heartwith-android-uploader log --since="$previous_tag_date" --reverse --pretty=format:'- %s (%h)' || true)"
+              if [ -n "$uploader_changes" ]; then
+                printf '%s\n' "$uploader_changes"
+              else
+                echo "- 本次没有新的上传 SDK 提交"
+              fi
+            else
+              git -C heartwith-android-uploader log --max-count=10 --reverse --pretty=format:'- %s (%h)'
+              echo
+            fi
+            echo
+            echo "本次构建使用上传 SDK：\`$uploader_head\`"
 
             echo
             echo "## 安装包"
