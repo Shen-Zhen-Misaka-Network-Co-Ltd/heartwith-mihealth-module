@@ -39,7 +39,7 @@ android {
         getByName("release") {
             signingConfig = signingConfigs.getByName("debug")
             // Xposed/NPatch discovers entry points and hooks through reflection.
-            // Keep release bytecode unminified; verbose logs are still gated by BuildConfig.DEBUG.
+            // Keep release bytecode unminified; debug-only diagnostics are separated by source set.
             isMinifyEnabled = false
             isShrinkResources = false
             proguardFiles(

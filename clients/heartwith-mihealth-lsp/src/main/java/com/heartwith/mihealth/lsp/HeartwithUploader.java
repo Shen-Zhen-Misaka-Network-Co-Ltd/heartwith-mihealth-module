@@ -33,7 +33,8 @@ final class HeartwithUploader {
     private static final long BATCH_WINDOW_MS = 8_000L;
     private static final long MAX_BATCH_WINDOW_MS = 8_000L;
     private static final long OFFLINE_CACHE_MS = 300_000L;
-    private static final long RETRY_BACKOFF_MS = 15_000L;
+    private static final long INITIAL_RETRY_BACKOFF_MS = 15_000L;
+    private static final long MAX_RETRY_BACKOFF_MS = 120_000L;
     private static final int CONNECT_TIMEOUT_MS = 1_500;
     private static final int READ_TIMEOUT_MS = 3_000;
     private static final int CHANGE_FLUSH_BPM = 3;
@@ -48,6 +49,7 @@ final class HeartwithUploader {
     private boolean settingsLoaded;
     private long lastFlushMs;
     private long nextUploadAttemptMs;
+    private long retryBackoffMs = INITIAL_RETRY_BACKOFF_MS;
     private long lastFailureLogElapsedMs;
     private long lastSettingsLogElapsedMs;
     private long lastUploadSuccessLogElapsedMs;
@@ -91,7 +93,7 @@ final class HeartwithUploader {
         session = null;
         seq = 1;
         persistDeviceModel(context, next);
-        if (BuildConfig.DEBUG) {
+        if (DebugBuild.ENABLED) {
             Log.i(TAG, "device model resolved: " + next);
         }
         return true;
@@ -105,14 +107,16 @@ final class HeartwithUploader {
         samples.addLast(new Sample(now, bpm, source));
         trim(now);
         if (!shouldFlush(now, bpm) || uploadInFlight || now < nextUploadAttemptMs) {
-            scheduleDelayedFlush(context);
+            scheduleDelayedFlush(context, nextFlushDelayMs(now));
             return;
         }
         uploadInFlight = true;
         try {
             refreshSettingsIfNeeded(context, false);
             if (!settingsLoaded) {
-                logState("settings unavailable; keep samples cached");
+                if (DebugBuild.ENABLED) {
+                    logState("settings unavailable; keep samples cached");
+                }
                 return;
             }
             if (settings.enabled) {
@@ -126,7 +130,14 @@ final class HeartwithUploader {
         }
     }
 
-    private void scheduleDelayedFlush(final Context context) {
+    private long nextFlushDelayMs(long now) {
+        if (nextUploadAttemptMs > now) {
+            return Math.max(MAX_BATCH_WINDOW_MS, nextUploadAttemptMs - now);
+        }
+        return MAX_BATCH_WINDOW_MS;
+    }
+
+    private void scheduleDelayedFlush(final Context context, long delayMs) {
         if (context == null || delayedFlushScheduled || samples.isEmpty()) {
             return;
         }
@@ -142,7 +153,7 @@ final class HeartwithUploader {
                         }
                     });
                 }
-            }, MAX_BATCH_WINDOW_MS);
+            }, Math.max(1_000L, delayMs));
         } catch (Throwable ignored) {
             delayedFlushScheduled = false;
         }
@@ -156,15 +167,17 @@ final class HeartwithUploader {
             return;
         }
         if (uploadInFlight || now < nextUploadAttemptMs) {
-            scheduleDelayedFlush(context);
+            scheduleDelayedFlush(context, nextFlushDelayMs(now));
             return;
         }
         uploadInFlight = true;
         try {
             refreshSettingsIfNeeded(context, false);
             if (!settingsLoaded) {
-                logState("settings unavailable; keep delayed samples cached");
-                scheduleDelayedFlush(context);
+                if (DebugBuild.ENABLED) {
+                    logState("settings unavailable; keep delayed samples cached");
+                }
+                scheduleDelayedFlush(context, nextFlushDelayMs(now));
                 return;
             }
             if (settings.enabled) {
@@ -322,63 +335,66 @@ final class HeartwithUploader {
             samples.clear();
             lastFlushMs = System.currentTimeMillis();
             nextUploadAttemptMs = 0L;
+            retryBackoffMs = INITIAL_RETRY_BACKOFF_MS;
             seq += 1;
             logUploadSuccess(sampleCount);
         } catch (Throwable throwable) {
-            nextUploadAttemptMs = System.currentTimeMillis() + RETRY_BACKOFF_MS;
-            logFailure("upload failed", throwable);
+            nextUploadAttemptMs = System.currentTimeMillis() + retryBackoffMs;
+            retryBackoffMs = Math.min(MAX_RETRY_BACKOFF_MS, retryBackoffMs * 2L);
+            if (DebugBuild.ENABLED) {
+                logFailure("upload failed", throwable);
+            }
         }
     }
 
     private void logFailure(String prefix, Throwable throwable) {
-        long elapsed = SystemClock.elapsedRealtime();
-        if (lastFailureLogElapsedMs > 0L && elapsed - lastFailureLogElapsedMs < 60_000L) {
-            return;
+        if (DebugBuild.ENABLED) {
+            long elapsed = SystemClock.elapsedRealtime();
+            if (lastFailureLogElapsedMs > 0L && elapsed - lastFailureLogElapsedMs < 60_000L) {
+                return;
+            }
+            lastFailureLogElapsedMs = elapsed;
+            Log.w(TAG, prefix + ": " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
         }
-        lastFailureLogElapsedMs = elapsed;
-        Log.w(TAG, prefix + ": " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
     }
 
     private void logState(String message) {
-        if (!BuildConfig.DEBUG) {
-            return;
+        if (DebugBuild.ENABLED) {
+            long elapsed = SystemClock.elapsedRealtime();
+            if (lastFailureLogElapsedMs > 0L && elapsed - lastFailureLogElapsedMs < 60_000L) {
+                return;
+            }
+            lastFailureLogElapsedMs = elapsed;
+            Log.i(TAG, message);
         }
-        long elapsed = SystemClock.elapsedRealtime();
-        if (lastFailureLogElapsedMs > 0L && elapsed - lastFailureLogElapsedMs < 60_000L) {
-            return;
-        }
-        lastFailureLogElapsedMs = elapsed;
-        Log.i(TAG, message);
     }
 
     private void logSettings(String prefix) {
-        if (!BuildConfig.DEBUG) {
-            return;
+        if (DebugBuild.ENABLED) {
+            long elapsed = SystemClock.elapsedRealtime();
+            if (lastSettingsLogElapsedMs > 0L && elapsed - lastSettingsLogElapsedMs < 60_000L) {
+                return;
+            }
+            lastSettingsLogElapsedMs = elapsed;
+            Log.i(TAG, prefix + ": loaded=" + settingsLoaded
+                    + ", enabled=" + settings.enabled
+                    + ", sync=" + settings.syncEnabled
+                    + ", syncIntervalHours=" + settings.syncIntervalHours
+                    + ", server=" + settings.serverUrl
+                    + ", display=" + settings.displayName
+                    + ", device=" + deviceModel);
         }
-        long elapsed = SystemClock.elapsedRealtime();
-        if (lastSettingsLogElapsedMs > 0L && elapsed - lastSettingsLogElapsedMs < 60_000L) {
-            return;
-        }
-        lastSettingsLogElapsedMs = elapsed;
-        Log.i(TAG, prefix + ": loaded=" + settingsLoaded
-                + ", enabled=" + settings.enabled
-                + ", sync=" + settings.syncEnabled
-                + ", syncIntervalHours=" + settings.syncIntervalHours
-                + ", server=" + settings.serverUrl
-                + ", display=" + settings.displayName
-                + ", device=" + deviceModel);
     }
 
     private void logUploadSuccess(int sampleCount) {
-        if (!BuildConfig.DEBUG) {
-            return;
+        if (DebugBuild.ENABLED) {
+            long elapsed = SystemClock.elapsedRealtime();
+            if (lastUploadSuccessLogElapsedMs > 0L && elapsed - lastUploadSuccessLogElapsedMs < 60_000L) {
+                return;
+            }
+            lastUploadSuccessLogElapsedMs = elapsed;
+            Log.i(TAG, "upload ok: samples=" + sampleCount + ", seq=" + (seq - 1));
         }
-        long elapsed = SystemClock.elapsedRealtime();
-        if (lastUploadSuccessLogElapsedMs > 0L && elapsed - lastUploadSuccessLogElapsedMs < 60_000L) {
-            return;
-        }
-        lastUploadSuccessLogElapsedMs = elapsed;
-        Log.i(TAG, "upload ok: samples=" + sampleCount + ", seq=" + (seq - 1));
     }
 
     private void ensureSession() throws Exception {
@@ -405,7 +421,7 @@ final class HeartwithUploader {
             throw new IllegalStateException("session response missing credentials");
         }
         session = new Session(collectorId, token);
-        if (BuildConfig.DEBUG) {
+        if (DebugBuild.ENABLED) {
             Log.i(TAG, "session created: collector=" + collectorId + ", device=" + deviceModel);
         }
     }
@@ -417,7 +433,7 @@ final class HeartwithUploader {
             if (!shouldFallbackToRawHttp(url, throwable)) {
                 throw throwable;
             }
-            if (BuildConfig.DEBUG) {
+            if (DebugBuild.ENABLED) {
                 Log.i(TAG, "fallback raw http post: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage(), throwable);
             }
             return rawHttpPost(url, contentType, body, authorization);

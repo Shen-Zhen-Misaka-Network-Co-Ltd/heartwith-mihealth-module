@@ -58,8 +58,9 @@ public final class MiHealthHookModule extends XposedModule {
     private static final String KEY_ACTIVE_SOURCE_SEEN_MS = "active_source_seen_ms";
     private static final String KEY_LAST_HR_SEEN_MS = "last_hr_seen_ms";
     private static final String KEY_LEGACY_KICK_NEEDED_MS = "legacy_kick_needed_ms";
+    private static final String KEY_LAST_COLD_START_RECYCLE_MS = "last_cold_start_recycle_ms";
     private static final long DUPLICATE_WINDOW_MS = 900L;
-    private static final long ACCEPTED_LOG_INTERVAL_MS = BuildConfig.DEBUG ? 5_000L : 60_000L;
+    private static final long ACCEPTED_LOG_INTERVAL_MS = DebugBuild.ENABLED ? 5_000L : 60_000L;
     private static final long RESTORED_SOURCE_TTL_MS = 24L * 60L * 60L * 1000L;
     private static final long CROSS_PROCESS_HR_RECENT_MS = 60_000L;
     private static final long LEGACY_KICK_REQUEST_TTL_MS = 60_000L;
@@ -68,15 +69,20 @@ public final class MiHealthHookModule extends XposedModule {
     private static final long DEVICE_MODEL_UNRESOLVED_RETRY_MS = 180_000L;
     private static final long HEART_RATE_WATCHDOG_MS = 12_000L;
     private static final long HEART_RATE_ALARM_WATCHDOG_MS =
-            (BuildConfig.DEBUG ? 2L : 5L) * 60L * 1000L;
+            (DebugBuild.ENABLED ? 2L : 5L) * 60L * 1000L;
+    private static final long HEART_RATE_ALARM_WINDOW_MS = 2L * 60L * 1000L;
     private static final long HEART_RATE_ALARM_RESCHEDULE_MIN_MS =
-            (BuildConfig.DEBUG ? 1L : 2L) * 60L * 1000L;
+            (DebugBuild.ENABLED ? 1L : 2L) * 60L * 1000L;
+    private static final long COLD_START_RECYCLE_MIN_UPTIME_MS = 90_000L;
+    private static final long COLD_START_RECYCLE_MAX_UPTIME_MS = 10L * 60L * 1000L;
+    private static final long COLD_START_RECYCLE_COOLDOWN_MS = 6L * 60L * 60L * 1000L;
     private static final long SPORT_MODE_GRACE_MS = 10_000L;
     private static final long STATUS_UPDATE_MIN_INTERVAL_MS = 10_000L;
     private static final long SYNC_MIN_TRIGGER_GAP_MS = 10L * 60L * 1000L;
     private static final long SYNC_MANUAL_MIN_TRIGGER_GAP_MS = 5_000L;
+    private static final long SYNC_ALARM_WINDOW_MS = 15L * 60L * 1000L;
     private static final int STATUS_UPDATE_CHANGE_BPM = 3;
-    private static final boolean VERBOSE_LOGS = BuildConfig.DEBUG;
+    private static final boolean VERBOSE_LOGS = DebugBuild.ENABLED;
     private static final String NPATCH_ORIGIN_ASSET = "assets/npatch/origin.apk";
     private static final String[] AROUTER_ROOTS = {
             "com.alibaba.android.arouter.routes.ARouter$$Root$$arouterapi",
@@ -143,6 +149,7 @@ public final class MiHealthHookModule extends XposedModule {
     private final AtomicBoolean sportModeReceiverRegistered = new AtomicBoolean(false);
     private final AtomicBoolean syncUiHooksInstalled = new AtomicBoolean(false);
     private final AtomicBoolean cleartextPolicyHookInstalled = new AtomicBoolean(false);
+    private final AtomicBoolean coldStartRecycleScheduled = new AtomicBoolean(false);
     private final HeartwithUploader uploader = new HeartwithUploader(UPLOAD_WORKER);
     private final List<Object> launchModels = new ArrayList<>();
     private volatile Context appContext;
@@ -198,7 +205,9 @@ public final class MiHealthHookModule extends XposedModule {
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
-        logLine("module loaded api=" + getApiVersion());
+        if (DebugBuild.ENABLED) {
+            logLine("module loaded api=" + getApiVersion());
+        }
     }
 
     @Override
@@ -218,7 +227,7 @@ public final class MiHealthHookModule extends XposedModule {
         }
         ClassLoader classLoader = param.getClassLoader();
         targetClassLoader = classLoader;
-        if (isWorkerProcess()) {
+        if (isWorkerProcess() || isMainProcess()) {
             hookHeartwithCleartextPolicy();
         }
         hookLifecycle(classLoader);
@@ -229,7 +238,9 @@ public final class MiHealthHookModule extends XposedModule {
             hookSyncUiSignals(classLoader);
             hookPassiveSportHeartRateSinks(classLoader);
         }
-        logLine("hooks installed process=" + processName);
+        if (DebugBuild.ENABLED) {
+            logLine("hooks installed process=" + processName);
+        }
     }
 
     private void hookHeartwithCleartextPolicy() {
@@ -243,7 +254,7 @@ public final class MiHealthHookModule extends XposedModule {
                 public Object intercept(XposedInterface.Chain chain) throws Throwable {
                     Object arg = chain.getArg(0);
                     if (arg instanceof String && isHeartwithServerHost((String) arg)) {
-                        if (BuildConfig.DEBUG && !cleartextPolicyAllowLogged) {
+                        if (DebugBuild.ENABLED && !cleartextPolicyAllowLogged) {
                             cleartextPolicyAllowLogged = true;
                             Log.i(TAG, "allow cleartext for Heartwith host: " + arg);
                         }
@@ -257,7 +268,7 @@ public final class MiHealthHookModule extends XposedModule {
                 @Override
                 public Object intercept(XposedInterface.Chain chain) throws Throwable {
                     if (HeartwithCleartextScope.isActive()) {
-                        if (BuildConfig.DEBUG && !cleartextPolicyAllowLogged) {
+                        if (DebugBuild.ENABLED && !cleartextPolicyAllowLogged) {
                             cleartextPolicyAllowLogged = true;
                             Log.i(TAG, "allow cleartext for Heartwith request scope");
                         }
@@ -267,10 +278,14 @@ public final class MiHealthHookModule extends XposedModule {
                 }
             });
         } catch (Throwable throwable) {
-            diagLine("heartwith cleartext policy hook failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+            if (DebugBuild.ENABLED) {
+                diagLine("heartwith cleartext policy hook failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+            }
         }
         hookAndroidOkHttpCleartextPolicy();
-        diagLine("heartwith cleartext policy hook installed");
+        if (DebugBuild.ENABLED) {
+            diagLine("heartwith cleartext policy hook installed");
+        }
     }
 
     private void hookAndroidOkHttpCleartextPolicy() {
@@ -309,10 +324,14 @@ public final class MiHealthHookModule extends XposedModule {
                     count += 1;
                 }
                 if (count > 0) {
-                    diagLine("android okhttp cleartext hook installed: " + className + " count=" + count);
+                    if (DebugBuild.ENABLED) {
+                        diagLine("android okhttp cleartext hook installed: " + className + " count=" + count);
+                    }
                 }
             } catch (Throwable throwable) {
-                diagLine("android okhttp cleartext hook unavailable: " + className + ": " + throwable.getClass().getSimpleName());
+                if (DebugBuild.ENABLED) {
+                    diagLine("android okhttp cleartext hook unavailable: " + className + ": " + throwable.getClass().getSimpleName());
+                }
             }
         }
     }
@@ -322,23 +341,29 @@ public final class MiHealthHookModule extends XposedModule {
         if (parameterTypes.length == 1) {
             Object arg = chain.getArg(0);
             if (arg instanceof String && isHeartwithServerHost((String) arg)) {
-                logCleartextAllow("allow cleartext for Heartwith host: " + arg);
+                if (DebugBuild.ENABLED) {
+                    logCleartextAllow("allow cleartext for Heartwith host: " + arg);
+                }
                 return true;
             }
             if (arg instanceof URL && isHeartwithServerHost(((URL) arg).getHost())) {
-                logCleartextAllow("allow cleartext for Heartwith url: " + ((URL) arg).getHost());
+                if (DebugBuild.ENABLED) {
+                    logCleartextAllow("allow cleartext for Heartwith url: " + ((URL) arg).getHost());
+                }
                 return true;
             }
         }
         if (HeartwithCleartextScope.isActive()) {
-            logCleartextAllow("allow cleartext for Heartwith request scope");
+            if (DebugBuild.ENABLED) {
+                logCleartextAllow("allow cleartext for Heartwith request scope");
+            }
             return true;
         }
         return false;
     }
 
     private void logCleartextAllow(String message) {
-        if (BuildConfig.DEBUG && !cleartextPolicyAllowLogged) {
+        if (DebugBuild.ENABLED && !cleartextPolicyAllowLogged) {
             cleartextPolicyAllowLogged = true;
             Log.i(TAG, message);
         }
@@ -383,13 +408,17 @@ public final class MiHealthHookModule extends XposedModule {
                 hook(method).intercept(new XposedInterface.Hooker() {
                     @Override
                     public Object intercept(XposedInterface.Chain chain) {
-                        diagLine("skip xcrash native handler for NPatch seccomp");
+                        if (DebugBuild.ENABLED) {
+                            diagLine("skip xcrash native handler for NPatch seccomp");
+                        }
                         return 0;
                     }
                 });
             }
         } catch (Throwable throwable) {
-            diagLine("xcrash native handler hook unavailable: " + throwable.getClass().getSimpleName());
+            if (DebugBuild.ENABLED) {
+                diagLine("xcrash native handler hook unavailable: " + throwable.getClass().getSimpleName());
+            }
         }
     }
 
@@ -400,7 +429,9 @@ public final class MiHealthHookModule extends XposedModule {
                 Context base = (Context) chain.getArg(0);
                 Context applicationContext = base == null ? null : base.getApplicationContext();
                 appContext = applicationContext == null ? base : applicationContext;
-                diagLine("attach process=" + processName);
+                if (DebugBuild.ENABLED) {
+                    diagLine("attach process=" + processName);
+                }
                 if (isMainProcess() && chain.getThisObject() instanceof Application) {
                     installNotificationPermissionRequest((Application) chain.getThisObject());
                 }
@@ -519,7 +550,9 @@ public final class MiHealthHookModule extends XposedModule {
                 }
             });
         } catch (Throwable throwable) {
-            diagLine("sync click hook failed: " + throwable.getClass().getSimpleName());
+            if (DebugBuild.ENABLED) {
+                diagLine("sync click hook failed: " + throwable.getClass().getSimpleName());
+            }
         }
         try {
             final Method performClick = View.class.getDeclaredMethod("performClick");
@@ -535,7 +568,9 @@ public final class MiHealthHookModule extends XposedModule {
                 }
             });
         } catch (Throwable throwable) {
-            diagLine("sync performClick hook failed: " + throwable.getClass().getSimpleName());
+            if (DebugBuild.ENABLED) {
+                diagLine("sync performClick hook failed: " + throwable.getClass().getSimpleName());
+            }
         }
         try {
             for (final Method method : Toast.class.getDeclaredMethods()) {
@@ -550,19 +585,23 @@ public final class MiHealthHookModule extends XposedModule {
                         Object text = chain.getArg(1);
                         if (text != null && isSyncSuccessText(String.valueOf(text))) {
                             lastSyncSuccessElapsedMs = SystemClock.elapsedRealtime();
-                            diagLine("mihealth sync success toast captured");
+                            if (DebugBuild.ENABLED) {
+                                diagLine("mihealth sync success toast captured");
+                            }
                         }
                         return result;
                     }
                 });
             }
         } catch (Throwable throwable) {
-            diagLine("sync toast hook failed: " + throwable.getClass().getSimpleName());
+            if (DebugBuild.ENABLED) {
+                diagLine("sync toast hook failed: " + throwable.getClass().getSimpleName());
+            }
         }
     }
 
     private void maybeCaptureSyncButton(View view, View.OnClickListener listener, String reason) {
-        if (!periodicSyncEnabled && !BuildConfig.DEBUG) {
+        if (!periodicSyncEnabled && !DebugBuild.ENABLED) {
             return;
         }
         String text = viewText(view);
@@ -573,7 +612,7 @@ public final class MiHealthHookModule extends XposedModule {
         if (listener != null) {
             syncButtonListener = new WeakReference<>(listener);
         }
-        if (BuildConfig.DEBUG) {
+        if (DebugBuild.ENABLED) {
             diagLine("sync entry captured reason=" + reason + ", text=" + text);
         }
     }
@@ -619,7 +658,7 @@ public final class MiHealthHookModule extends XposedModule {
             }, delayMs);
         } catch (Throwable ignored) {
         }
-        if (BuildConfig.DEBUG) {
+        if (DebugBuild.ENABLED) {
             diagLine("periodic sync scheduled hours=" + periodicSyncIntervalHours);
         }
     }
@@ -647,13 +686,19 @@ public final class MiHealthHookModule extends XposedModule {
             long triggerAtMs = System.currentTimeMillis() + delayMs;
             PendingIntent pendingIntent = syncPendingIntent(context, generation);
             alarmManager.cancel(pendingIntent);
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMs, pendingIntent);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                alarmManager.setWindow(
+                        AlarmManager.RTC,
+                        triggerAtMs,
+                        SYNC_ALARM_WINDOW_MS,
+                        pendingIntent);
             } else {
-                alarmManager.set(AlarmManager.RTC_WAKEUP, triggerAtMs, pendingIntent);
+                alarmManager.set(AlarmManager.RTC, triggerAtMs, pendingIntent);
             }
         } catch (Throwable throwable) {
-            diagLine("sync alarm schedule failed: " + throwable.getClass().getSimpleName());
+            if (DebugBuild.ENABLED) {
+                diagLine("sync alarm schedule failed: " + throwable.getClass().getSimpleName());
+            }
         }
     }
 
@@ -682,7 +727,7 @@ public final class MiHealthHookModule extends XposedModule {
         long elapsed = SystemClock.elapsedRealtime();
         long minGap = manual ? SYNC_MANUAL_MIN_TRIGGER_GAP_MS : SYNC_MIN_TRIGGER_GAP_MS;
         if (lastSyncTriggerElapsedMs > 0L && elapsed - lastSyncTriggerElapsedMs < minGap) {
-            if (BuildConfig.DEBUG) {
+            if (DebugBuild.ENABLED) {
                 diagLine("sync trigger skipped reason=" + reason + ", gapMs=" + (elapsed - lastSyncTriggerElapsedMs));
             }
             return;
@@ -695,7 +740,9 @@ public final class MiHealthHookModule extends XposedModule {
         final View view = syncButtonView.get();
         final View.OnClickListener listener = syncButtonListener.get();
         if (view == null && listener == null) {
-            diagLine("sync trigger pending: open Xiaomi Health sync page once to capture entry");
+            if (DebugBuild.ENABLED) {
+                diagLine("sync trigger pending: open Xiaomi Health sync page once to capture entry");
+            }
             return;
         }
         try {
@@ -708,25 +755,31 @@ public final class MiHealthHookModule extends XposedModule {
                         } else if (listener != null && view != null) {
                             listener.onClick(view);
                         } else {
-                            diagLine("sync trigger failed: captured sync view expired");
+                            if (DebugBuild.ENABLED) {
+                                diagLine("sync trigger failed: captured sync view expired");
+                            }
                         }
                     } catch (Throwable throwable) {
-                        diagLine("sync trigger failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+                        if (DebugBuild.ENABLED) {
+                            diagLine("sync trigger failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+                        }
                     }
                 }
             });
-            if (BuildConfig.DEBUG) {
+            if (DebugBuild.ENABLED) {
                 diagLine("sync trigger posted reason=" + reason + ", manual=" + manual);
             }
         } catch (Throwable throwable) {
-            diagLine("sync trigger post failed: " + throwable.getClass().getSimpleName());
+            if (DebugBuild.ENABLED) {
+                diagLine("sync trigger post failed: " + throwable.getClass().getSimpleName());
+            }
         }
     }
 
     private boolean triggerDirectDeviceSync(ClassLoader classLoader, String reason, boolean manual) {
         Object device = getCurrentDeviceModel(classLoader);
         if (device == null) {
-            if (BuildConfig.DEBUG) {
+            if (DebugBuild.ENABLED) {
                 diagLine("direct sync skipped: current device is null");
             }
             return false;
@@ -734,7 +787,9 @@ public final class MiHealthHookModule extends XposedModule {
         updateDeviceModel(device);
         String did = getCurrentDeviceId(device);
         if (did == null) {
-            diagLine("direct sync skipped: current device did is null");
+            if (DebugBuild.ENABLED) {
+                diagLine("direct sync skipped: current device did is null");
+            }
             return false;
         }
         if (triggerWearableDeviceSync(classLoader, did, reason, manual)) {
@@ -750,10 +805,12 @@ public final class MiHealthHookModule extends XposedModule {
             Class<?> extClass = findClass("com.xiaomi.fitness.device.contact.export.DeviceSyncExtKt", classLoader);
             Object contact = callStaticMethod(extClass, "getInstance", companion);
             callMethod(contact, "syncDataByWidget", did, Boolean.FALSE);
-            diagLine("direct sync requested: wearable did=" + maskDid(did) + ", reason=" + reason + ", manual=" + manual);
+            if (DebugBuild.ENABLED) {
+                diagLine("direct sync requested: wearable did=" + maskDid(did) + ", reason=" + reason + ", manual=" + manual);
+            }
             return true;
         } catch (Throwable throwable) {
-            if (BuildConfig.DEBUG) {
+            if (DebugBuild.ENABLED) {
                 diagLine("direct wearable sync unavailable: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
             }
             return false;
@@ -767,10 +824,12 @@ public final class MiHealthHookModule extends XposedModule {
             Class<?> extClass = findClass("com.xiaomi.fitness.eco.device.contact.export.EcoDeviceSyncExtKt", classLoader);
             Object contact = callStaticMethod(extClass, "getInstance", companion);
             callMethod(contact, "syncData", did, Boolean.FALSE);
-            diagLine("direct sync requested: eco did=" + maskDid(did) + ", reason=" + reason + ", manual=" + manual);
+            if (DebugBuild.ENABLED) {
+                diagLine("direct sync requested: eco did=" + maskDid(did) + ", reason=" + reason + ", manual=" + manual);
+            }
             return true;
         } catch (Throwable throwable) {
-            if (BuildConfig.DEBUG) {
+            if (DebugBuild.ENABLED) {
                 diagLine("direct eco sync unavailable: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
             }
             return false;
@@ -836,7 +895,9 @@ public final class MiHealthHookModule extends XposedModule {
                     if (!hasRecentHeartRate && hasPendingLegacyKickRequest()) {
                         if (!legacyKickAttemptLogged) {
                             legacyKickAttemptLogged = true;
-                            diagLine("legacy kick start requested from main process");
+                            if (DebugBuild.ENABLED) {
+                                diagLine("legacy kick start requested from main process");
+                            }
                         }
                         ensureRealtimeHrStarted(classLoader, "legacy-kick:no-heart-rate");
                     }
@@ -875,7 +936,9 @@ public final class MiHealthHookModule extends XposedModule {
                         if (context != null && (npatchWrappedDetected || isNpatchWrapped(context))) {
                             installArouterIndexes(classLoader);
                             if (launchMainActivity(context)) {
-                                diagLine("npatch route rescue: " + method.getName());
+                                if (DebugBuild.ENABLED) {
+                                    diagLine("npatch route rescue: " + method.getName());
+                                }
                                 return null;
                             }
                         }
@@ -884,7 +947,9 @@ public final class MiHealthHookModule extends XposedModule {
                 });
             }
         } catch (Throwable throwable) {
-            diagLine("npatch route rescue unavailable: " + throwable.getClass().getSimpleName());
+            if (DebugBuild.ENABLED) {
+                diagLine("npatch route rescue unavailable: " + throwable.getClass().getSimpleName());
+            }
         }
     }
 
@@ -901,9 +966,13 @@ public final class MiHealthHookModule extends XposedModule {
             hookBooleanNoArg(coreExt, "getHasLyra", false);
             hookBooleanNoArg(coreExt, "getLyraConnection", false);
             hookBooleanNoArg(coreExt, "isLyraEnabled", false);
-            diagLine("local wear core hooks installed");
+            if (DebugBuild.ENABLED) {
+                diagLine("local wear core hooks installed");
+            }
         } catch (Throwable throwable) {
-            diagLine("local wear core hook unavailable: " + throwable.getClass().getSimpleName());
+            if (DebugBuild.ENABLED) {
+                diagLine("local wear core hook unavailable: " + throwable.getClass().getSimpleName());
+            }
         }
     }
 
@@ -915,9 +984,13 @@ public final class MiHealthHookModule extends XposedModule {
             hookBooleanNoArg(accountManager, "isUseSystem", false);
             hookAccountVisibilityDecision(accountManager);
             hookMiAccountInternalLocalMode(classLoader);
-            diagLine("local account mode hooks installed");
+            if (DebugBuild.ENABLED) {
+                diagLine("local account mode hooks installed");
+            }
         } catch (Throwable throwable) {
-            diagLine("local account mode hook unavailable: " + throwable.getClass().getSimpleName());
+            if (DebugBuild.ENABLED) {
+                diagLine("local account mode hook unavailable: " + throwable.getClass().getSimpleName());
+            }
         }
     }
 
@@ -928,7 +1001,9 @@ public final class MiHealthHookModule extends XposedModule {
             hookBooleanNoArg(internalManager, "isUseSystem", false);
             hookSetUserSystemToLocal(internalManager);
         } catch (Throwable throwable) {
-            diagLine("mi account local mode hook unavailable: " + throwable.getClass().getSimpleName());
+            if (DebugBuild.ENABLED) {
+                diagLine("mi account local mode hook unavailable: " + throwable.getClass().getSimpleName());
+            }
         }
     }
 
@@ -998,9 +1073,13 @@ public final class MiHealthHookModule extends XposedModule {
                 });
             }
             hookOauthServiceManager(classLoader);
-            diagLine("web oauth fallback hooks installed");
+            if (DebugBuild.ENABLED) {
+                diagLine("web oauth fallback hooks installed");
+            }
         } catch (Throwable throwable) {
-            diagLine("web oauth fallback hook unavailable: " + throwable.getClass().getSimpleName());
+            if (DebugBuild.ENABLED) {
+                diagLine("web oauth fallback hook unavailable: " + throwable.getClass().getSimpleName());
+            }
         }
     }
 
@@ -1058,7 +1137,9 @@ public final class MiHealthHookModule extends XposedModule {
                 });
             }
         } catch (Throwable throwable) {
-            diagLine("npatch arouter index hook unavailable: " + throwable.getClass().getSimpleName());
+            if (DebugBuild.ENABLED) {
+                diagLine("npatch arouter index hook unavailable: " + throwable.getClass().getSimpleName());
+            }
         }
     }
 
@@ -1075,9 +1156,13 @@ public final class MiHealthHookModule extends XposedModule {
             loadArouterIndexes(classLoader, AROUTER_ROOTS, groupsIndex);
             loadArouterIndexes(classLoader, AROUTER_PROVIDERS, providersIndex);
             npatchArouterIndexesInstalled = true;
-            diagLine("npatch arouter indexes installed");
+            if (DebugBuild.ENABLED) {
+                diagLine("npatch arouter indexes installed");
+            }
         } catch (Throwable throwable) {
-            diagLine("npatch arouter index install failed: " + throwable.getClass().getSimpleName());
+            if (DebugBuild.ENABLED) {
+                diagLine("npatch arouter index install failed: " + throwable.getClass().getSimpleName());
+            }
         }
     }
 
@@ -1131,7 +1216,9 @@ public final class MiHealthHookModule extends XposedModule {
             }
             return true;
         } catch (Throwable throwable) {
-            logLine("npatch route rescue failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+            if (DebugBuild.ENABLED) {
+                logLine("npatch route rescue failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+            }
             return false;
         }
     }
@@ -1241,7 +1328,9 @@ public final class MiHealthHookModule extends XposedModule {
                             uploader.currentSettings(),
                             "settings warmup cache");
                 } catch (Throwable throwable) {
-                    diagLine("warmup crashed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+                    if (DebugBuild.ENABLED) {
+                        diagLine("warmup crashed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+                    }
                 }
             }
         });
@@ -1314,9 +1403,13 @@ public final class MiHealthHookModule extends XposedModule {
             } else {
                 context.registerReceiver(receiver, filter);
             }
-            diagLine("config receiver registered process=" + processName);
+            if (DebugBuild.ENABLED) {
+                diagLine("config receiver registered process=" + processName);
+            }
         } catch (Throwable throwable) {
-            diagLine("config receiver failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+            if (DebugBuild.ENABLED) {
+                diagLine("config receiver failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+            }
         }
     }
 
@@ -1383,9 +1476,13 @@ public final class MiHealthHookModule extends XposedModule {
             } else {
                 context.registerReceiver(receiver, filter);
             }
-            diagLine("sport mode receiver registered process=" + processName);
+            if (DebugBuild.ENABLED) {
+                diagLine("sport mode receiver registered process=" + processName);
+            }
         } catch (Throwable throwable) {
-            diagLine("sport mode receiver failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+            if (DebugBuild.ENABLED) {
+                diagLine("sport mode receiver failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+            }
         }
     }
 
@@ -1466,9 +1563,13 @@ public final class MiHealthHookModule extends XposedModule {
                     return result;
                 }
             });
-            diagLine("eco packet hook installed: " + className);
+            if (DebugBuild.ENABLED) {
+                diagLine("eco packet hook installed: " + className);
+            }
         } catch (Throwable throwable) {
-            diagLine("eco packet hook unavailable: " + className + ": " + throwable.getClass().getSimpleName());
+            if (DebugBuild.ENABLED) {
+                diagLine("eco packet hook unavailable: " + className + ": " + throwable.getClass().getSimpleName());
+            }
         }
     }
 
@@ -1502,9 +1603,13 @@ public final class MiHealthHookModule extends XposedModule {
                     return result;
                 }
             });
-            diagLine("sport packet hook installed: " + className);
+            if (DebugBuild.ENABLED) {
+                diagLine("sport packet hook installed: " + className);
+            }
         } catch (Throwable throwable) {
-            diagLine("sport packet hook unavailable: " + className + ": " + throwable.getClass().getSimpleName());
+            if (DebugBuild.ENABLED) {
+                diagLine("sport packet hook unavailable: " + className + ": " + throwable.getClass().getSimpleName());
+            }
         }
     }
 
@@ -1655,7 +1760,9 @@ public final class MiHealthHookModule extends XposedModule {
                 public Object intercept(XposedInterface.Chain chain) throws Throwable {
                     rememberHuamiController(chain.getThisObject());
                     if (shouldKeepRealtimeHrActive()) {
-                        logLine("suppress huami controller stop");
+                        if (DebugBuild.ENABLED) {
+                            logLine("suppress huami controller stop");
+                        }
                         scheduleRealtimeHrResume("stop:huami-controller");
                         return null;
                     }
@@ -1712,7 +1819,9 @@ public final class MiHealthHookModule extends XposedModule {
                 public Object intercept(XposedInterface.Chain chain) throws Throwable {
                     rememberHuamiBleDevice(chain.getThisObject());
                     if (shouldKeepRealtimeHrActive()) {
-                        logLine("suppress huami device stop");
+                        if (DebugBuild.ENABLED) {
+                            logLine("suppress huami device stop");
+                        }
                         scheduleRealtimeHrResume("stop:huami-device");
                         return null;
                     }
@@ -1736,7 +1845,9 @@ public final class MiHealthHookModule extends XposedModule {
                         @Override
                         public Object intercept(XposedInterface.Chain chain) throws Throwable {
                             if (shouldKeepRealtimeHrActive()) {
-                                logLine("suppress helper hr stop: " + method.getName());
+                                if (DebugBuild.ENABLED) {
+                                    logLine("suppress helper hr stop: " + method.getName());
+                                }
                                 scheduleRealtimeHrResume("stop:helper-" + method.getName());
                                 return defaultValue(method.getReturnType());
                             }
@@ -1820,14 +1931,18 @@ public final class MiHealthHookModule extends XposedModule {
                     boolean registered = ensureLaunchModels(classLoader, force);
                     boolean deviceStarted = startDeviceRealtimeHr(classLoader);
                     started = originalDeviceStarted || originalControllerStarted || registered || deviceStarted;
-                    diagLine("start result reason=" + reason
-                            + ", bleDevice=" + originalDeviceStarted
-                            + ", controller=" + originalControllerStarted
-                            + ", launchModels=" + registered
-                            + ", deviceHr=" + deviceStarted);
+                    if (DebugBuild.ENABLED) {
+                        diagLine("start result reason=" + reason
+                                + ", bleDevice=" + originalDeviceStarted
+                                + ", controller=" + originalControllerStarted
+                                + ", launchModels=" + registered
+                                + ", deviceHr=" + deviceStarted);
+                    }
                     scheduleRetryIfNeeded(classLoader, force);
                 } catch (Throwable throwable) {
-                    logLine("start failed: " + throwable.getClass().getSimpleName());
+                    if (DebugBuild.ENABLED) {
+                        logLine("start failed: " + throwable.getClass().getSimpleName());
+                    }
                 } finally {
                     starting.set(false);
                 }
@@ -1878,6 +1993,7 @@ public final class MiHealthHookModule extends XposedModule {
         }
         markLegacyKickNeeded();
         noHeartStartAttempts++;
+        maybeScheduleColdStartRecycle();
         final long delayMs = noHeartStartAttempts <= 2 ? 9_000L : 60_000L;
         final String retryReason = forceRetry ? "watchdog:no-heart-rate-retry" : "timer:no-heart-rate";
         try {
@@ -1891,6 +2007,65 @@ public final class MiHealthHookModule extends XposedModule {
             }, delayMs);
         } catch (Throwable ignored) {
         }
+    }
+
+    private void maybeScheduleColdStartRecycle() {
+        final Context context = appContext;
+        if (context == null || !isWorkerProcess() || !heartRateHookEnabled) {
+            return;
+        }
+        if (lastHr > 0 || noHeartStartAttempts < 3 || hasRecentHeartRateInAnyProcess()) {
+            return;
+        }
+        long uptime = SystemClock.elapsedRealtime();
+        if (uptime > COLD_START_RECYCLE_MAX_UPTIME_MS) {
+            return;
+        }
+        if (!coldStartRecycleScheduled.compareAndSet(false, true)) {
+            return;
+        }
+        long delayMs = Math.max(0L, COLD_START_RECYCLE_MIN_UPTIME_MS - uptime);
+        try {
+            new Handler(context.getMainLooper()).postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    recycleColdStartIfStillStalled(context);
+                }
+            }, delayMs);
+        } catch (Throwable ignored) {
+            coldStartRecycleScheduled.set(false);
+        }
+    }
+
+    private void recycleColdStartIfStillStalled(Context context) {
+        if (context == null || !isWorkerProcess() || !heartRateHookEnabled) {
+            coldStartRecycleScheduled.set(false);
+            return;
+        }
+        long uptime = SystemClock.elapsedRealtime();
+        if (uptime < COLD_START_RECYCLE_MIN_UPTIME_MS ||
+                uptime > COLD_START_RECYCLE_MAX_UPTIME_MS ||
+                lastHr > 0 ||
+                hasRecentHeartRateInAnyProcess()) {
+            coldStartRecycleScheduled.set(false);
+            return;
+        }
+        try {
+            SharedPreferences prefs = context.getSharedPreferences(RUNTIME_PREFS, Context.MODE_PRIVATE);
+            long lastRecycleMs = prefs.getLong(KEY_LAST_COLD_START_RECYCLE_MS, 0L);
+            long nowMs = System.currentTimeMillis();
+            if (nowMs - lastRecycleMs < COLD_START_RECYCLE_COOLDOWN_MS) {
+                coldStartRecycleScheduled.set(false);
+                return;
+            }
+            prefs.edit().putLong(KEY_LAST_COLD_START_RECYCLE_MS, nowMs).apply();
+        } catch (Throwable ignored) {
+        }
+        if (DebugBuild.ENABLED) {
+            diagLine("cold-start heart-rate stalled, recycling device process once");
+        }
+        android.os.Process.killProcess(android.os.Process.myPid());
+        System.exit(0);
     }
 
     private boolean ensureLaunchModels(ClassLoader classLoader, boolean forceRegister) {
@@ -1910,7 +2085,13 @@ public final class MiHealthHookModule extends XposedModule {
                 launchModels.add(model);
                 registerLaunchModel(model);
                 ok = true;
+                if (DebugBuild.ENABLED) {
+                    debugLine("launch model registered: " + className);
+                }
             } catch (Throwable ignored) {
+                if (DebugBuild.ENABLED) {
+                    debugLine("launch model unavailable: " + className + ": " + ignored.getClass().getSimpleName());
+                }
             }
         }
         return ok;
@@ -1922,11 +2103,23 @@ public final class MiHealthHookModule extends XposedModule {
         }
         try {
             callMethod(model, "init");
+            if (DebugBuild.ENABLED) {
+                debugLine("launch model init ok: " + model.getClass().getName());
+            }
         } catch (Throwable ignored) {
+            if (DebugBuild.ENABLED) {
+                debugLine("launch model init failed: " + model.getClass().getName() + ": " + ignored.getClass().getSimpleName());
+            }
         }
         try {
             callMethod(model, "registerDeviceHr");
+            if (DebugBuild.ENABLED) {
+                debugLine("launch model registerDeviceHr ok: " + model.getClass().getName());
+            }
         } catch (Throwable ignored) {
+            if (DebugBuild.ENABLED) {
+                debugLine("launch model registerDeviceHr failed: " + model.getClass().getName() + ": " + ignored.getClass().getSimpleName());
+            }
         }
     }
 
@@ -1961,13 +2154,25 @@ public final class MiHealthHookModule extends XposedModule {
     private boolean startDeviceRealtimeHr(ClassLoader classLoader) {
         Object device = getCurrentDeviceModel(classLoader);
         if (device == null) {
+            if (DebugBuild.ENABLED) {
+                debugLine("startDeviceRealtimeHr skipped: current device is null");
+            }
             return false;
         }
         updateDeviceModel(device);
+        if (DebugBuild.ENABLED) {
+            debugLine("startDeviceRealtimeHr device=" + describeDeviceForDebug(device));
+        }
         Object callback = null;
         try {
             callback = getOrCreateHrCallback(classLoader);
+            if (DebugBuild.ENABLED) {
+                debugLine("startDeviceRealtimeHr callback=" + describeObjectForDebug(callback));
+            }
         } catch (Throwable ignored) {
+            if (DebugBuild.ENABLED) {
+                debugLine("startDeviceRealtimeHr callback failed: " + ignored.getClass().getSimpleName());
+            }
         }
         boolean startedAny = false;
         for (String helperClassName : START_HELPERS) {
@@ -1975,8 +2180,14 @@ public final class MiHealthHookModule extends XposedModule {
                 Class<?> helperClass = findClass(helperClassName, classLoader);
                 callStaticMethod(helperClass, "startDeviceHr", device, callback);
                 startedAny = true;
+                if (DebugBuild.ENABLED) {
+                    debugLine("startDeviceHr helper ok: " + helperClassName);
+                }
                 break;
             } catch (Throwable ignored) {
+                if (DebugBuild.ENABLED) {
+                    debugLine("startDeviceHr helper failed: " + helperClassName + ": " + ignored.getClass().getSimpleName());
+                }
             }
         }
         return startedAny;
@@ -1988,8 +2199,16 @@ public final class MiHealthHookModule extends XposedModule {
             Object companion = getStaticObjectField(managerClass, "Companion");
             Class<?> extClass = findClass("com.xiaomi.fitness.device.manager.export.DeviceManagerExtKt", classLoader);
             Object manager = callStaticMethod(extClass, "getInstance", companion);
-            return callMethod(manager, "getCurrentDeviceModel");
+            Object device = callMethod(manager, "getCurrentDeviceModel");
+            if (DebugBuild.ENABLED) {
+                debugLine("getCurrentDeviceModel manager=" + describeObjectForDebug(manager)
+                        + ", device=" + describeDeviceForDebug(device));
+            }
+            return device;
         } catch (Throwable ignored) {
+            if (DebugBuild.ENABLED) {
+                debugLine("getCurrentDeviceModel failed: " + ignored.getClass().getSimpleName());
+            }
             return null;
         }
     }
@@ -2034,9 +2253,11 @@ public final class MiHealthHookModule extends XposedModule {
         Object device = getCurrentDeviceModel(classLoader);
         if (device != null) {
             updateDeviceModel(device);
-        } else if (BuildConfig.DEBUG && !deviceModelNullLogged) {
+        } else if (DebugBuild.ENABLED && !deviceModelNullLogged) {
             deviceModelNullLogged = true;
-            diagLine("current device model is null");
+            if (DebugBuild.ENABLED) {
+                diagLine("current device model is null");
+            }
         }
     }
 
@@ -2049,6 +2270,29 @@ public final class MiHealthHookModule extends XposedModule {
             return "did:" + did;
         }
         return device.getClass().getName() + "@" + System.identityHashCode(device);
+    }
+
+    private String describeObjectForDebug(Object object) {
+        if (DebugBuild.ENABLED) {
+            if (object == null) {
+                return "null";
+            }
+            return object.getClass().getName() + "@" + System.identityHashCode(object)
+                    + "/" + safeString(object.toString());
+        }
+        return "";
+    }
+
+    private String describeDeviceForDebug(Object device) {
+        if (DebugBuild.ENABLED) {
+            if (device == null) {
+                return "null";
+            }
+            return describeObjectForDebug(device)
+                    + ", id=" + getCurrentDeviceId(device)
+                    + ", name=" + describeDeviceModel(device);
+        }
+        return "";
     }
 
     private String describeDeviceModel(Object device) {
@@ -2175,7 +2419,7 @@ public final class MiHealthHookModule extends XposedModule {
     }
 
     private void dumpDeviceModelForDebug(Object device) {
-        if (!BuildConfig.DEBUG || deviceModelDumpLogged || device == null) {
+        if (!DebugBuild.ENABLED || deviceModelDumpLogged || device == null) {
             return;
         }
         deviceModelDumpLogged = true;
@@ -2187,7 +2431,9 @@ public final class MiHealthHookModule extends XposedModule {
         int count = appendStringFields(device, builder, 8);
         appendStringMethods(device, builder, Math.max(0, 12 - count));
         appendNestedObjectsForDebug(device, builder, 8);
-        diagLine(builder.toString());
+        if (DebugBuild.ENABLED) {
+            diagLine(builder.toString());
+        }
     }
 
     private String scanNestedObjectsForDeviceName(Object device) {
@@ -2597,20 +2843,22 @@ public final class MiHealthHookModule extends XposedModule {
     }
 
     private void diagRaw(String source, int type, int length, int hash, Integer hr) {
-        long elapsed = SystemClock.elapsedRealtime();
-        if (lastRawDiagElapsedMs > 0L && elapsed - lastRawDiagElapsedMs < 5_000L) {
-            return;
+        if (DebugBuild.ENABLED) {
+            long elapsed = SystemClock.elapsedRealtime();
+            if (lastRawDiagElapsedMs > 0L && elapsed - lastRawDiagElapsedMs < 5_000L) {
+                return;
+            }
+            lastRawDiagElapsedMs = elapsed;
+            diagLine("raw packet source=" + source
+                    + ", type=" + type
+                    + ", len=" + length
+                    + ", hash=" + hash
+                    + ", hr=" + (hr == null ? "?" : String.valueOf(hr)));
         }
-        lastRawDiagElapsedMs = elapsed;
-        diagLine("raw packet source=" + source +
-                ", type=" + type +
-                ", len=" + length +
-                ", hash=" + hash +
-                ", hr=" + (hr == null ? "?" : String.valueOf(hr)));
     }
 
     private void diagPacketShape(String source, Object packet) {
-        if (!VERBOSE_LOGS || packet == null) {
+        if (!DebugBuild.ENABLED || packet == null) {
             return;
         }
         long elapsed = SystemClock.elapsedRealtime();
@@ -2626,17 +2874,19 @@ public final class MiHealthHookModule extends XposedModule {
                 nested = payload == null ? null : getFieldValue(payload, "d");
             } catch (Throwable ignored) {
             }
-            diagLine("packet shape source=" + source +
-                    ", packet=" + packet.getClass().getName() +
-                    ", c=" + getFieldValue(packet, "c") +
-                    ", e=" + getFieldValue(packet, "e") +
-                    ", f=" + getFieldValue(packet, "f") +
-                    ", payload=" + payloadClass +
-                    ", ints=" + summarizeIntFields(payload, 8) +
-                    ", nested=" + (nested == null ? "null" : nested.getClass().getName()) +
-                    ", nestedInts=" + summarizeIntFields(nested, 24));
+            diagLine("packet shape source=" + source
+                    + ", packet=" + packet.getClass().getName()
+                    + ", c=" + getFieldValue(packet, "c")
+                    + ", e=" + getFieldValue(packet, "e")
+                    + ", f=" + getFieldValue(packet, "f")
+                    + ", payload=" + payloadClass
+                    + ", ints=" + summarizeIntFields(payload, 8)
+                    + ", nested=" + (nested == null ? "null" : nested.getClass().getName())
+                    + ", nestedInts=" + summarizeIntFields(nested, 24));
         } catch (Throwable throwable) {
-            diagLine("packet shape failed: " + throwable.getClass().getSimpleName());
+            if (DebugBuild.ENABLED) {
+                diagLine("packet shape failed: " + throwable.getClass().getSimpleName());
+            }
         }
     }
 
@@ -2713,23 +2963,27 @@ public final class MiHealthHookModule extends XposedModule {
         lastHrElapsedMs = elapsed;
         noHeartStartAttempts = 0;
         scheduleHeartRateWatchdog();
-        scheduleHeartRateAlarmWatchdog("heart-rate");
-        if (isWorkerProcess()) {
-            persistLastHeartRateSeen(elapsed);
-            clearLegacyKickNeededOnce();
-        }
         final Context context = appContext;
         final boolean handleHeartRate = context != null && shouldHandleAcceptedHeartRate(source);
         if (!firstHeartRateLogged && handleHeartRate) {
             firstHeartRateLogged = true;
-            diagLine("heart_rate=" + hr + ", source=" + source);
+            if (DebugBuild.ENABLED) {
+                diagLine("heart_rate=" + hr + ", source=" + source);
+            }
         }
         if (handleHeartRate && elapsed - lastAcceptedLogMs >= ACCEPTED_LOG_INTERVAL_MS) {
             lastAcceptedLogMs = elapsed;
-            logLine("heart_rate=" + hr + ", source=" + source);
+            if (DebugBuild.ENABLED) {
+                logLine("heart_rate=" + hr + ", source=" + source);
+            }
         }
         if (!handleHeartRate) {
             return;
+        }
+        persistLastHeartRateSeen(elapsed);
+        clearLegacyKickNeededOnce();
+        if (isWorkerProcess()) {
+            scheduleHeartRateAlarmWatchdog("heart-rate");
         }
         final boolean updateNotification = shouldUpdateStatus(hr, elapsed);
         final boolean uploadHeartRate = shouldUploadAcceptedHeartRate(source);
@@ -2742,14 +2996,18 @@ public final class MiHealthHookModule extends XposedModule {
                         HeartwithStatus.writeLocal(context, hr, source, seenMs);
                         HeartwithStatus.sendRegisteredStatus(context, hr, source, seenMs);
                     } catch (Throwable throwable) {
-                        diagLine("status cache failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+                        if (DebugBuild.ENABLED) {
+                            diagLine("status cache failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+                        }
                     }
                 }
                 if (updateNotification) {
                     try {
                         HeartwithStatus.showHookProcessNotification(context, hr, source, seenMs);
                     } catch (Throwable throwable) {
-                        diagLine("notification failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+                        if (DebugBuild.ENABLED) {
+                            diagLine("notification failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+                        }
                     }
                 }
                 if (uploadHeartRate) {
@@ -2759,7 +3017,9 @@ public final class MiHealthHookModule extends XposedModule {
                             try {
                                 uploader.onHeartRate(context, hr, source);
                             } catch (Throwable throwable) {
-                                diagLine("uploader crashed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+                                if (DebugBuild.ENABLED) {
+                                    diagLine("uploader crashed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+                                }
                             }
                         }
                     });
@@ -2825,7 +3085,9 @@ public final class MiHealthHookModule extends XposedModule {
             firstHeartRateLogged = false;
             persistActiveSource(null);
         }
-        diagLine("heart-rate source reset: " + reason);
+        if (DebugBuild.ENABLED) {
+            diagLine("heart-rate source reset: " + reason);
+        }
     }
 
     private boolean shouldIgnoreSource(String source) {
@@ -2905,7 +3167,9 @@ public final class MiHealthHookModule extends XposedModule {
                 activeSourceElapsedMs = SystemClock.elapsedRealtime();
                 activeSourceRestored = false;
                 maybePersistActiveSource(source);
-                diagLine("heart-rate source locked: " + source);
+                if (DebugBuild.ENABLED) {
+                    diagLine("heart-rate source locked: " + source);
+                }
                 return true;
             }
             return activeSource.equals(source);
@@ -3052,7 +3316,9 @@ public final class MiHealthHookModule extends XposedModule {
             legacyKickClearedAfterHeartRate = false;
             if (!legacyKickRequestLogged) {
                 legacyKickRequestLogged = true;
-                diagLine("legacy kick marked because device process has no heart rate yet");
+                if (DebugBuild.ENABLED) {
+                    diagLine("legacy kick marked because device process has no heart rate yet");
+                }
             }
         } catch (Throwable ignored) {
         }
@@ -3148,16 +3414,27 @@ public final class MiHealthHookModule extends XposedModule {
             PendingIntent pendingIntent = heartRateWatchdogPendingIntent(context, generation);
             alarmManager.cancel(pendingIntent);
             long triggerAtMs = elapsed + HEART_RATE_ALARM_WATCHDOG_MS;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                alarmManager.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAtMs, pendingIntent);
+            if (DebugBuild.ENABLED && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                alarmManager.setAndAllowWhileIdle(
+                        AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                        triggerAtMs,
+                        pendingIntent);
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                alarmManager.setWindow(
+                        AlarmManager.ELAPSED_REALTIME,
+                        triggerAtMs,
+                        HEART_RATE_ALARM_WINDOW_MS,
+                        pendingIntent);
             } else {
-                alarmManager.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAtMs, pendingIntent);
+                alarmManager.set(AlarmManager.ELAPSED_REALTIME, triggerAtMs, pendingIntent);
             }
-            if (BuildConfig.DEBUG) {
+            if (DebugBuild.ENABLED) {
                 diagLine("hr alarm watchdog scheduled reason=" + reason + ", generation=" + generation);
             }
         } catch (Throwable throwable) {
-            diagLine("hr alarm watchdog schedule failed: " + throwable.getClass().getSimpleName());
+            if (DebugBuild.ENABLED) {
+                diagLine("hr alarm watchdog schedule failed: " + throwable.getClass().getSimpleName());
+            }
         }
     }
 
@@ -3200,7 +3477,9 @@ public final class MiHealthHookModule extends XposedModule {
             scheduleHeartRateAlarmWatchdog("alarm:recent");
             return;
         }
-        diagLine("hr alarm watchdog stale, restarting realtime heart rate");
+        if (DebugBuild.ENABLED) {
+            diagLine("hr alarm watchdog stale, restarting realtime heart rate");
+        }
         resetHeartRateSource("watchdog-alarm:no-heart-rate");
         ensureRealtimeHrStarted(classLoader, "watchdog-alarm:no-heart-rate");
         lastHeartRateWatchdogAlarmElapsedMs = 0L;
@@ -3229,7 +3508,9 @@ public final class MiHealthHookModule extends XposedModule {
                 }
             });
         } catch (Throwable throwable) {
-            logLine("hook failed " + target.getName() + "." + methodName + ": " + throwable.getClass().getSimpleName());
+            if (DebugBuild.ENABLED) {
+                logLine("hook failed " + target.getName() + "." + methodName + ": " + throwable.getClass().getSimpleName());
+            }
         }
     }
 
@@ -3409,7 +3690,15 @@ public final class MiHealthHookModule extends XposedModule {
         if (!VERBOSE_LOGS) {
             return;
         }
-        diagLine(message);
+        if (DebugBuild.ENABLED) {
+            diagLine(message);
+        }
+    }
+
+    private void debugLine(String message) {
+        if (DebugBuild.ENABLED) {
+            diagLine(message);
+        }
     }
 
     private void diagLine(String message) {

@@ -109,7 +109,9 @@ public final class LegacyNpatchEntry implements IXposedHookLoadPackage {
                 });
             }
         } catch (Throwable throwable) {
-            log("xcrash native handler hook unavailable: " + throwable.getClass().getSimpleName());
+            if (DebugBuild.ENABLED) {
+                log("xcrash native handler hook unavailable: " + throwable.getClass().getSimpleName());
+            }
         }
     }
 
@@ -327,7 +329,7 @@ public final class LegacyNpatchEntry implements IXposedHookLoadPackage {
                         if (context == null) {
                             return;
                         }
-                        if (BuildConfig.DEBUG && !routeDiagLogged) {
+                        if (DebugBuild.ENABLED && !routeDiagLogged) {
                             routeDiagLogged = true;
                             log("legacy route check context=" + context.getClass().getName()
                                     + ", source=" + safeSourceDir(context)
@@ -339,7 +341,9 @@ public final class LegacyNpatchEntry implements IXposedHookLoadPackage {
                         }
                         installArouterIndexes(classLoader);
                         if (launchMainActivity(context)) {
-                            log("legacy npatch route rescue: " + method.getName());
+                            if (DebugBuild.ENABLED) {
+                                log("legacy npatch route rescue: " + method.getName());
+                            }
                             param.setResult(null);
                         }
                     }
@@ -603,10 +607,9 @@ public final class LegacyNpatchEntry implements IXposedHookLoadPackage {
     }
 
     private static void log(String message) {
-        if (!BuildConfig.DEBUG) {
-            return;
+        if (DebugBuild.ENABLED) {
+            Log.i(TAG, message);
+            XposedBridge.log(TAG + ": " + message);
         }
-        Log.i(TAG, message);
-        XposedBridge.log(TAG + ": " + message);
     }
 }

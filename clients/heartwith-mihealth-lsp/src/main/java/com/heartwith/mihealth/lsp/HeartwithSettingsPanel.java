@@ -227,7 +227,7 @@ final class HeartwithSettingsPanel {
     }
 
     private static void debug(String message) {
-        if (BuildConfig.DEBUG) {
+        if (DebugBuild.ENABLED) {
             Log.i(TAG, message);
         }
     }
@@ -290,7 +290,7 @@ final class HeartwithSettingsPanel {
             statusCard.addView(sourceText, matchWrap());
             content.addView(statusCard, matchWrap());
 
-            if (BuildConfig.DEBUG) {
+            if (DebugBuild.ENABLED) {
                 LinearLayout debugCard = card(activity);
                 debugCard.addView(label(activity, "Debug 悬浮红点", 18, COLOR_TEXT, true), matchWrap());
                 TextView debugText = label(activity, "前台调试时显示最近捕获的 BPM、source 和时间；后台仍看通知。", 14, COLOR_MUTED, false);

@@ -29,7 +29,7 @@ final class DebugCaptureOverlay {
     }
 
     static void update(final Context context, final int bpm, final String source, final long seenMs) {
-        if (!BuildConfig.DEBUG || context == null || bpm <= 0) {
+        if (!DebugBuild.ENABLED || context == null || bpm <= 0) {
             return;
         }
         MAIN.post(new Runnable() {
