@@ -1,22 +1,14 @@
 package com.heartwith.mihealth.lsp;
 
 import android.content.Context;
-import android.os.Handler;
 import android.os.SystemClock;
 import android.util.Log;
 
-import java.io.ByteArrayOutputStream;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.InetSocketAddress;
-import java.net.Socket;
-import java.net.URL;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayDeque;
+import com.heartwith.uploader.HeartwithUploadConfig;
+import com.heartwith.uploader.HeartwithUploadStatusListener;
+import com.heartwith.uploader.UrlConnectionHeartwithHttpClient;
+
 import java.util.concurrent.Executor;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 final class HeartwithUploader {
     private static final String TAG = "HeartwithMiHealth";
@@ -30,53 +22,53 @@ final class HeartwithUploader {
     private static final String MODULE_PACKAGE = "com.heartwith.mihealth.lsp";
     private static final String DEFAULT_DEVICE_MODEL = "Xiaomi Health Hook";
     private static final String CLIENT_PLATFORM = "android-lsposed";
-    private static final long BATCH_WINDOW_MS = 8_000L;
-    private static final long MAX_BATCH_WINDOW_MS = 8_000L;
-    private static final long OFFLINE_CACHE_MS = 300_000L;
-    private static final long INITIAL_RETRY_BACKOFF_MS = 15_000L;
-    private static final long MAX_RETRY_BACKOFF_MS = 120_000L;
-    private static final int CONNECT_TIMEOUT_MS = 1_500;
-    private static final int READ_TIMEOUT_MS = 3_000;
-    private static final int CHANGE_FLUSH_BPM = 3;
-    private static final Pattern COLLECTOR_ID = Pattern.compile("\"collector_id\"\\s*:\\s*\"([^\"]+)\"");
-    private static final Pattern COLLECTOR_TOKEN = Pattern.compile("\"collector_token\"\\s*:\\s*\"([^\"]+)\"");
 
-    private final Executor worker;
-    private final ArrayDeque<Sample> samples = new ArrayDeque<>();
+    private final com.heartwith.uploader.HeartwithUploader delegate;
     private HeartwithSettings settings = new HeartwithSettings(false, HeartwithSettings.DEFAULT_SERVER_URL, "Android");
     private String deviceModel = DEFAULT_DEVICE_MODEL;
-    private Session session;
     private boolean settingsLoaded;
-    private long lastFlushMs;
-    private long nextUploadAttemptMs;
-    private long retryBackoffMs = INITIAL_RETRY_BACKOFF_MS;
+    private boolean runtimeCacheLoaded;
     private long lastFailureLogElapsedMs;
     private long lastSettingsLogElapsedMs;
-    private long lastUploadSuccessLogElapsedMs;
-    private long seq = 1;
-    private int lastUploadedBpm = -1;
-    private boolean uploadInFlight;
-    private boolean runtimeCacheLoaded;
-    private boolean delayedFlushScheduled;
+    private long lastStatusLogElapsedMs;
 
     HeartwithUploader(Executor worker) {
-        this.worker = worker;
+        delegate = new com.heartwith.uploader.HeartwithUploader(
+                worker,
+                new UrlConnectionHeartwithHttpClient(new com.heartwith.uploader.HeartwithCleartextScope() {
+                    @Override
+                    public void enter() {
+                        HeartwithCleartextScope.enter();
+                    }
+
+                    @Override
+                    public void exit() {
+                        HeartwithCleartextScope.exit();
+                    }
+                }, true));
+        delegate.setStatusListener(new HeartwithUploadStatusListener() {
+            @Override
+            public void onUploadStatus(String status) {
+                logUploadStatus(status);
+            }
+        });
     }
 
     synchronized void warmUp(Context context) {
         refreshSettingsIfNeeded(context, true);
+        configureDelegate();
         logSettings("warmup");
     }
 
     synchronized void applySettings(Context context, HeartwithSettings next, String reason) {
-        if (!next.serverUrl.equals(settings.serverUrl) || !next.displayName.equals(settings.displayName)) {
-            session = null;
-            seq = 1;
+        if (next == null) {
+            return;
         }
         settings = next;
         settingsLoaded = true;
         runtimeCacheLoaded = true;
         persistRuntimeCache(context, next);
+        configureDelegate();
         logSettings(reason);
     }
 
@@ -90,9 +82,8 @@ final class HeartwithUploader {
             return false;
         }
         deviceModel = next;
-        session = null;
-        seq = 1;
         persistDeviceModel(context, next);
+        configureDelegate();
         if (DebugBuild.ENABLED) {
             Log.i(TAG, "device model resolved: " + next);
         }
@@ -103,112 +94,35 @@ final class HeartwithUploader {
         if (bpm < 30 || bpm > 240) {
             return;
         }
-        long now = System.currentTimeMillis();
-        samples.addLast(new Sample(now, bpm, source));
-        trim(now);
-        if (!shouldFlush(now, bpm) || uploadInFlight || now < nextUploadAttemptMs) {
-            scheduleDelayedFlush(context, nextFlushDelayMs(now));
-            return;
+        refreshSettingsIfNeeded(context, false);
+        if (!settingsLoaded) {
+            logState("settings unavailable; keep samples cached in uploader sdk");
+            configureDelegate();
         }
-        uploadInFlight = true;
-        try {
-            refreshSettingsIfNeeded(context, false);
-            if (!settingsLoaded) {
-                if (DebugBuild.ENABLED) {
-                    logState("settings unavailable; keep samples cached");
-                }
-                return;
-            }
-            if (settings.enabled) {
-                uploadLocked();
-            } else {
-                samples.clear();
-                session = null;
-            }
-        } finally {
-            uploadInFlight = false;
-        }
+        delegate.submitHeartRate(
+                bpm,
+                System.currentTimeMillis(),
+                null,
+                source == null || source.trim().isEmpty() ? "mi_health_hook" : "mi_health_hook:" + source.trim());
     }
 
-    private long nextFlushDelayMs(long now) {
-        if (nextUploadAttemptMs > now) {
-            return Math.max(MAX_BATCH_WINDOW_MS, nextUploadAttemptMs - now);
-        }
-        return MAX_BATCH_WINDOW_MS;
-    }
-
-    private void scheduleDelayedFlush(final Context context, long delayMs) {
-        if (context == null || delayedFlushScheduled || samples.isEmpty()) {
-            return;
-        }
-        delayedFlushScheduled = true;
-        try {
-            new Handler(context.getMainLooper()).postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    worker.execute(new Runnable() {
-                        @Override
-                        public void run() {
-                            flushDelayed(context);
-                        }
-                    });
-                }
-            }, Math.max(1_000L, delayMs));
-        } catch (Throwable ignored) {
-            delayedFlushScheduled = false;
-        }
-    }
-
-    private synchronized void flushDelayed(Context context) {
-        delayedFlushScheduled = false;
-        long now = System.currentTimeMillis();
-        trim(now);
-        if (samples.isEmpty()) {
-            return;
-        }
-        if (uploadInFlight || now < nextUploadAttemptMs) {
-            scheduleDelayedFlush(context, nextFlushDelayMs(now));
-            return;
-        }
-        uploadInFlight = true;
-        try {
-            refreshSettingsIfNeeded(context, false);
-            if (!settingsLoaded) {
-                if (DebugBuild.ENABLED) {
-                    logState("settings unavailable; keep delayed samples cached");
-                }
-                scheduleDelayedFlush(context, nextFlushDelayMs(now));
-                return;
-            }
-            if (settings.enabled) {
-                uploadLocked();
-            } else {
-                samples.clear();
-                session = null;
-            }
-        } finally {
-            uploadInFlight = false;
-        }
-    }
-
-    private boolean shouldFlush(long now, int bpm) {
-        if (samples.isEmpty()) {
-            return false;
-        }
-        if (lastFlushMs == 0L) {
-            lastFlushMs = samples.peekFirst().tMs;
-        }
-        Sample first = samples.peekFirst();
-        if (now - lastFlushMs >= BATCH_WINDOW_MS) {
-            return true;
-        }
-        if (first != null && now - first.tMs >= MAX_BATCH_WINDOW_MS) {
-            return true;
-        }
-        return lastUploadedBpm > 0 && Math.abs(bpm - lastUploadedBpm) >= CHANGE_FLUSH_BPM;
+    private void configureDelegate() {
+        delegate.configure(new HeartwithUploadConfig(
+                settings.enabled,
+                settings.serverUrl,
+                settings.displayName,
+                deviceModel,
+                CLIENT_PLATFORM,
+                BuildConfig.VERSION_NAME));
     }
 
     private void refreshSettingsIfNeeded(Context context, boolean force) {
+        if (context == null) {
+            return;
+        }
+        if (!force && settingsLoaded) {
+            return;
+        }
         loadRuntimeCacheIfNeeded(context);
         loadXposedSettingsIfNeeded(context);
         if (!settingsLoaded) {
@@ -217,7 +131,7 @@ final class HeartwithUploader {
     }
 
     private void loadRuntimeCacheIfNeeded(Context context) {
-        if (runtimeCacheLoaded || settingsLoaded) {
+        if (context == null || runtimeCacheLoaded || settingsLoaded) {
             return;
         }
         runtimeCacheLoaded = true;
@@ -234,6 +148,7 @@ final class HeartwithUploader {
             deviceModel = sanitizeDeviceModel(prefs.getString(KEY_CACHED_DEVICE_MODEL, DEFAULT_DEVICE_MODEL));
             settings = new HeartwithSettings(enabled, serverUrl, displayName, syncEnabled, syncIntervalHours);
             settingsLoaded = true;
+            configureDelegate();
             logSettings("settings cache loaded");
         } catch (Throwable ignored) {
         }
@@ -253,6 +168,9 @@ final class HeartwithUploader {
     }
 
     private void persistRuntimeCache(Context context, HeartwithSettings next) {
+        if (context == null || next == null) {
+            return;
+        }
         try {
             context.getSharedPreferences(RUNTIME_PREFS, Context.MODE_PRIVATE)
                     .edit()
@@ -267,7 +185,7 @@ final class HeartwithUploader {
     }
 
     private void loadXposedSettingsIfNeeded(Context context) {
-        if (settingsLoaded || MODULE_PACKAGE.equals(context.getPackageName())) {
+        if (context == null || settingsLoaded || MODULE_PACKAGE.equals(context.getPackageName())) {
             return;
         }
         try {
@@ -309,53 +227,22 @@ final class HeartwithUploader {
             settings = next;
             settingsLoaded = true;
             persistRuntimeCache(context, next);
+            configureDelegate();
             logSettings("xposed settings loaded");
         } catch (Throwable ignored) {
         }
     }
 
-    private void uploadLocked() {
-        try {
-            ensureSession();
-            if (session == null || samples.isEmpty()) {
-                return;
-            }
-            int sampleCount = samples.size();
-            byte[] body = buildBatchCbor(session.collectorId, seq, settings.displayName, deviceModel);
-            Response response = post(
-                    settings.serverUrl + "/api/v1/hr/batches",
-                    "application/cbor",
-                    body,
-                    "Bearer " + session.collectorToken);
-            if (response.code < 200 || response.code >= 300) {
-                throw new IllegalStateException("batch http " + response.code);
-            }
-            Sample last = samples.peekLast();
-            lastUploadedBpm = last != null ? last.bpm : lastUploadedBpm;
-            samples.clear();
-            lastFlushMs = System.currentTimeMillis();
-            nextUploadAttemptMs = 0L;
-            retryBackoffMs = INITIAL_RETRY_BACKOFF_MS;
-            seq += 1;
-            logUploadSuccess(sampleCount);
-        } catch (Throwable throwable) {
-            nextUploadAttemptMs = System.currentTimeMillis() + retryBackoffMs;
-            retryBackoffMs = Math.min(MAX_RETRY_BACKOFF_MS, retryBackoffMs * 2L);
-            if (DebugBuild.ENABLED) {
-                logFailure("upload failed", throwable);
-            }
+    private void logUploadStatus(String status) {
+        if (!DebugBuild.ENABLED || status == null || status.trim().isEmpty()) {
+            return;
         }
-    }
-
-    private void logFailure(String prefix, Throwable throwable) {
-        if (DebugBuild.ENABLED) {
-            long elapsed = SystemClock.elapsedRealtime();
-            if (lastFailureLogElapsedMs > 0L && elapsed - lastFailureLogElapsedMs < 60_000L) {
-                return;
-            }
-            lastFailureLogElapsedMs = elapsed;
-            Log.w(TAG, prefix + ": " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+        long elapsed = SystemClock.elapsedRealtime();
+        if (lastStatusLogElapsedMs > 0L && elapsed - lastStatusLogElapsedMs < 60_000L) {
+            return;
         }
+        lastStatusLogElapsedMs = elapsed;
+        Log.i(TAG, "upload status: " + status);
     }
 
     private void logState(String message) {
@@ -386,227 +273,6 @@ final class HeartwithUploader {
         }
     }
 
-    private void logUploadSuccess(int sampleCount) {
-        if (DebugBuild.ENABLED) {
-            long elapsed = SystemClock.elapsedRealtime();
-            if (lastUploadSuccessLogElapsedMs > 0L && elapsed - lastUploadSuccessLogElapsedMs < 60_000L) {
-                return;
-            }
-            lastUploadSuccessLogElapsedMs = elapsed;
-            Log.i(TAG, "upload ok: samples=" + sampleCount + ", seq=" + (seq - 1));
-        }
-    }
-
-    private void ensureSession() throws Exception {
-        if (session != null) {
-            return;
-        }
-        String json = "{"
-                + "\"display_name\":\"" + escapeJson(settings.displayName) + "\","
-                + "\"device_model\":\"" + escapeJson(deviceModel) + "\","
-                + "\"client_platform\":\"" + CLIENT_PLATFORM + "\","
-                + "\"app_version\":\"" + BuildConfig.VERSION_NAME + "\""
-                + "}";
-        Response response = post(
-                settings.serverUrl + "/api/v1/collector/sessions",
-                "application/json; charset=utf-8",
-                json.getBytes(StandardCharsets.UTF_8),
-                null);
-        if (response.code < 200 || response.code >= 300) {
-            throw new IllegalStateException("session http " + response.code);
-        }
-        String collectorId = match(response.body, COLLECTOR_ID);
-        String token = match(response.body, COLLECTOR_TOKEN);
-        if (collectorId == null || token == null) {
-            throw new IllegalStateException("session response missing credentials");
-        }
-        session = new Session(collectorId, token);
-        if (DebugBuild.ENABLED) {
-            Log.i(TAG, "session created: collector=" + collectorId + ", device=" + deviceModel);
-        }
-    }
-
-    private Response post(String url, String contentType, byte[] body, String authorization) throws Exception {
-        try {
-            return urlConnectionPost(url, contentType, body, authorization);
-        } catch (Exception throwable) {
-            if (!shouldFallbackToRawHttp(url, throwable)) {
-                throw throwable;
-            }
-            if (DebugBuild.ENABLED) {
-                Log.i(TAG, "fallback raw http post: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage(), throwable);
-            }
-            return rawHttpPost(url, contentType, body, authorization);
-        }
-    }
-
-    private Response urlConnectionPost(String url, String contentType, byte[] body, String authorization) throws Exception {
-        boolean cleartext = url.startsWith("http://");
-        if (cleartext) {
-            HeartwithCleartextScope.enter();
-        }
-        try {
-            HttpURLConnection connection = open(url, "POST", contentType);
-            return execute(connection, body, authorization);
-        } finally {
-            if (cleartext) {
-                HeartwithCleartextScope.exit();
-            }
-        }
-    }
-
-    private Response execute(HttpURLConnection connection, byte[] body, String authorization) throws Exception {
-        boolean completed = false;
-        if (authorization != null) {
-            connection.setRequestProperty("Authorization", authorization);
-        }
-        try {
-            writeBody(connection, body);
-            int code = connection.getResponseCode();
-            String responseBody = readAll(code >= 400 ? connection.getErrorStream() : connection.getInputStream());
-            completed = true;
-            return new Response(code, responseBody);
-        } finally {
-            if (!completed) {
-                connection.disconnect();
-            }
-        }
-    }
-
-    private boolean shouldFallbackToRawHttp(String url, Throwable throwable) {
-        if (!url.startsWith("http://")) {
-            return false;
-        }
-        String message = throwable.getMessage();
-        if (message == null) {
-            message = "";
-        }
-        String lower = message.toLowerCase();
-        return throwable instanceof SecurityException
-                || lower.contains("cleartext")
-                || lower.contains("not permitted")
-                || lower.contains("unknown service");
-    }
-
-    private Response rawHttpPost(String urlValue, String contentType, byte[] body, String authorization) throws Exception {
-        URL url = new URL(urlValue);
-        String host = url.getHost();
-        int port = url.getPort() > 0 ? url.getPort() : 80;
-        String path = url.getFile() == null || url.getFile().isEmpty() ? "/" : url.getFile();
-        Socket socket = new Socket();
-        socket.connect(new InetSocketAddress(host, port), CONNECT_TIMEOUT_MS);
-        socket.setSoTimeout(READ_TIMEOUT_MS);
-        try {
-            OutputStream output = socket.getOutputStream();
-            StringBuilder headers = new StringBuilder();
-            headers.append("POST ").append(path).append(" HTTP/1.1\r\n");
-            headers.append("Host: ").append(host);
-            if (url.getPort() > 0) {
-                headers.append(':').append(port);
-            }
-            headers.append("\r\nConnection: close\r\n");
-            headers.append("Content-Type: ").append(contentType).append("\r\n");
-            headers.append("Content-Length: ").append(body.length).append("\r\n");
-            if (authorization != null) {
-                headers.append("Authorization: ").append(authorization).append("\r\n");
-            }
-            headers.append("\r\n");
-            output.write(headers.toString().getBytes(StandardCharsets.US_ASCII));
-            output.write(body);
-            output.flush();
-
-            byte[] responseBytes = readAllBytes(socket.getInputStream());
-            String responseText = new String(responseBytes, StandardCharsets.UTF_8);
-            int statusEnd = responseText.indexOf("\r\n");
-            if (statusEnd < 0 || !responseText.startsWith("HTTP/")) {
-                throw new IllegalStateException("bad http response");
-            }
-            String statusLine = responseText.substring(0, statusEnd);
-            String[] parts = statusLine.split(" ");
-            int code = parts.length >= 2 ? Integer.parseInt(parts[1]) : 0;
-            int bodyStart = responseText.indexOf("\r\n\r\n");
-            String responseBody = bodyStart >= 0 ? responseText.substring(bodyStart + 4) : "";
-            return new Response(code, responseBody);
-        } finally {
-            socket.close();
-        }
-    }
-
-    private HttpURLConnection open(String url, String method, String contentType) throws Exception {
-        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
-        connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
-        connection.setReadTimeout(READ_TIMEOUT_MS);
-        connection.setRequestMethod(method);
-        connection.setRequestProperty("Content-Type", contentType);
-        connection.setRequestProperty("Accept", "application/json");
-        connection.setRequestProperty("Connection", "keep-alive");
-        connection.setDoOutput(true);
-        return connection;
-    }
-
-    private void writeBody(HttpURLConnection connection, byte[] body) throws Exception {
-        connection.setFixedLengthStreamingMode(body.length);
-        OutputStream output = connection.getOutputStream();
-        output.write(body);
-        output.close();
-    }
-
-    private byte[] buildBatchCbor(String collectorId, long packetSeq, String displayName, String deviceModel) {
-        long sentAtMs = System.currentTimeMillis();
-        Cbor cbor = new Cbor();
-        cbor.map(8);
-        cbor.text("schema").uint(1);
-        cbor.text("collector_id").text(collectorId);
-        cbor.text("seq").uint(packetSeq);
-        cbor.text("sent_at_ms").uint(sentAtMs);
-        cbor.text("display_name").text(displayName);
-        cbor.text("device_model").text(deviceModel);
-        cbor.text("samples").array(samples.size());
-        for (Sample sample : samples) {
-            cbor.map(2);
-            cbor.text("dt_ms").sint(sample.tMs - sentAtMs);
-            cbor.text("bpm").uint(sample.bpm);
-        }
-        Sample last = samples.peekLast();
-        cbor.text("ble").map(1);
-        cbor.text("source").text(last == null ? "mi_health_hook" : "mi_health_hook:" + last.source);
-        return cbor.bytes();
-    }
-
-    private void trim(long now) {
-        long cutoff = now - OFFLINE_CACHE_MS;
-        while (!samples.isEmpty() && samples.peekFirst().tMs < cutoff) {
-            samples.removeFirst();
-        }
-    }
-
-    private String match(String value, Pattern pattern) {
-        Matcher matcher = pattern.matcher(value);
-        return matcher.find() ? matcher.group(1) : null;
-    }
-
-    private String readAll(InputStream input) throws Exception {
-        if (input == null) {
-            return "";
-        }
-        return new String(readAllBytes(input), StandardCharsets.UTF_8);
-    }
-
-    private byte[] readAllBytes(InputStream input) throws Exception {
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        byte[] buffer = new byte[1024];
-        int read;
-        while ((read = input.read(buffer)) >= 0) {
-            out.write(buffer, 0, read);
-        }
-        input.close();
-        return out.toByteArray();
-    }
-
-    private String escapeJson(String value) {
-        return value == null ? "" : value.replace("\\", "\\\\").replace("\"", "\\\"");
-    }
-
     private String sanitizeDeviceModel(String value) {
         if (value == null) {
             return DEFAULT_DEVICE_MODEL;
@@ -622,100 +288,5 @@ final class HeartwithUploader {
             return DEFAULT_DEVICE_MODEL;
         }
         return trimmed.length() > 80 ? trimmed.substring(0, 80) : trimmed;
-    }
-
-    private static final class Session {
-        final String collectorId;
-        final String collectorToken;
-
-        Session(String collectorId, String collectorToken) {
-            this.collectorId = collectorId;
-            this.collectorToken = collectorToken;
-        }
-    }
-
-    private static final class Response {
-        final int code;
-        final String body;
-
-        Response(int code, String body) {
-            this.code = code;
-            this.body = body == null ? "" : body;
-        }
-    }
-
-    private static final class Sample {
-        final long tMs;
-        final int bpm;
-        final String source;
-
-        Sample(long tMs, int bpm, String source) {
-            this.tMs = tMs;
-            this.bpm = bpm;
-            this.source = source;
-        }
-    }
-
-    private static final class Cbor {
-        private final ByteArrayOutputStream out = new ByteArrayOutputStream();
-
-        Cbor uint(long value) {
-            typeAndValue(0, value);
-            return this;
-        }
-
-        Cbor sint(long value) {
-            if (value >= 0) {
-                typeAndValue(0, value);
-            } else {
-                typeAndValue(1, -1L - value);
-            }
-            return this;
-        }
-
-        Cbor text(String value) {
-            byte[] bytes = (value == null ? "" : value).getBytes(StandardCharsets.UTF_8);
-            typeAndValue(3, bytes.length);
-            out.write(bytes, 0, bytes.length);
-            return this;
-        }
-
-        Cbor array(int size) {
-            typeAndValue(4, size);
-            return this;
-        }
-
-        Cbor map(int size) {
-            typeAndValue(5, size);
-            return this;
-        }
-
-        byte[] bytes() {
-            return out.toByteArray();
-        }
-
-        private void typeAndValue(int major, long value) {
-            int prefix = major << 5;
-            if (value < 24) {
-                out.write(prefix | (int) value);
-            } else if (value <= 0xffL) {
-                out.write(prefix | 24);
-                out.write((int) value);
-            } else if (value <= 0xffffL) {
-                out.write(prefix | 25);
-                out.write((int) (value >>> 8));
-                out.write((int) value);
-            } else if (value <= 0xffff_ffffL) {
-                out.write(prefix | 26);
-                for (int shift = 24; shift >= 0; shift -= 8) {
-                    out.write((int) (value >>> shift));
-                }
-            } else {
-                out.write(prefix | 27);
-                for (int shift = 56; shift >= 0; shift -= 8) {
-                    out.write((int) (value >>> shift));
-                }
-            }
-        }
     }
 }
