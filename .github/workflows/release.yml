@@ -13,6 +13,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - uses: actions/setup-java@v4
         with:
@@ -38,7 +41,38 @@ jobs:
       - name: Build APK
         run: ./gradlew :heartwith-mihealth-lsp:assembleRelease --warning-mode=fail
 
+      - name: Generate release notes
+        run: |
+          set -euo pipefail
+
+          current_tag="${GITHUB_REF_NAME}"
+          previous_tag="$(git describe --tags --match 'mihealth-v*' --abbrev=0 "${current_tag}^" 2>/dev/null || true)"
+
+          {
+            echo "## 变更记录"
+            echo
+            if [ -n "$previous_tag" ]; then
+              echo "从 \`$previous_tag\` 到 \`$current_tag\` 的提交："
+              echo
+              git log --reverse --pretty=format:'- %s (%h)' "$previous_tag..$current_tag"
+              echo
+              echo
+              echo "[查看完整对比](https://github.com/${GITHUB_REPOSITORY}/compare/${previous_tag}...${current_tag})"
+            else
+              echo "首次发布，包含当前 tag 可达的提交："
+              echo
+              git log --reverse --pretty=format:'- %s (%h)' "$current_tag"
+            fi
+
+            echo
+            echo "## 安装包"
+            echo
+            echo "下载下方 APK 文件安装。"
+          } > release-notes.md
+
+          cat release-notes.md
+
       - uses: softprops/action-gh-release@v2
         with:
           files: clients/heartwith-mihealth-lsp/build/outputs/apk/release/Heartwith-*-release.apk
-          generate_release_notes: true
+          body_path: release-notes.md
