@@ -51,6 +51,7 @@ android {
 }
 
 dependencies {
+    implementation("com.heartwith:heartwith-android-uploader")
     compileOnly("io.github.libxposed:api:101.0.0")
     compileOnly(project(":xposed-api-stub"))
 }
