@@ -67,7 +67,8 @@ public final class MiHealthHookModule extends XposedModule {
     private static final long LAST_HR_SEEN_PERSIST_MS = 8_000L;
     private static final long DEVICE_MODEL_REFRESH_MS = 30_000L;
     private static final long DEVICE_MODEL_UNRESOLVED_RETRY_MS = 180_000L;
-    private static final long HEART_RATE_WATCHDOG_MS = 12_000L;
+    private static final long HEART_RATE_WATCHDOG_MS =
+            (DebugBuild.ENABLED ? 12L : 60L) * 1000L;
     private static final long HEART_RATE_ALARM_WATCHDOG_MS =
             (DebugBuild.ENABLED ? 2L : 5L) * 60L * 1000L;
     private static final long HEART_RATE_ALARM_WINDOW_MS = 2L * 60L * 1000L;
@@ -150,6 +151,7 @@ public final class MiHealthHookModule extends XposedModule {
     private final AtomicBoolean syncUiHooksInstalled = new AtomicBoolean(false);
     private final AtomicBoolean cleartextPolicyHookInstalled = new AtomicBoolean(false);
     private final AtomicBoolean coldStartRecycleScheduled = new AtomicBoolean(false);
+    private final AtomicBoolean debugLifecycleRegistered = new AtomicBoolean(false);
     private final HeartwithUploader uploader = new HeartwithUploader(UPLOAD_WORKER);
     private final List<Object> launchModels = new ArrayList<>();
     private volatile Context appContext;
@@ -219,7 +221,17 @@ public final class MiHealthHookModule extends XposedModule {
         targetPackage = packageName;
         String currentProcess = getProcessName();
         processName = currentProcess == null ? targetPackage : currentProcess;
+        if (DebugBuild.ENABLED) {
+            diagLine("package ready package=" + packageName
+                    + ", process=" + processName
+                    + ", main=" + isMainProcess()
+                    + ", worker=" + isWorkerProcess()
+                    + ", uptime=" + SystemClock.elapsedRealtime());
+        }
         if (!isMainProcess() && !isWorkerProcess()) {
+            if (DebugBuild.ENABLED) {
+                diagLine("ignore process=" + processName);
+            }
             return;
         }
         if (!installed.compareAndSet(false, true)) {
@@ -430,7 +442,12 @@ public final class MiHealthHookModule extends XposedModule {
                 Context applicationContext = base == null ? null : base.getApplicationContext();
                 appContext = applicationContext == null ? base : applicationContext;
                 if (DebugBuild.ENABLED) {
-                    diagLine("attach process=" + processName);
+                    diagLine("attach process=" + processName
+                            + ", app=" + describeObjectForDebug(chain.getThisObject())
+                            + ", base=" + describeObjectForDebug(base)
+                            + ", appContext=" + describeObjectForDebug(appContext)
+                            + ", uptime=" + SystemClock.elapsedRealtime());
+                    registerDebugLifecycleCallbacks(chain.getThisObject());
                 }
                 if (isMainProcess() && chain.getThisObject() instanceof Application) {
                     installNotificationPermissionRequest((Application) chain.getThisObject());
@@ -443,6 +460,66 @@ public final class MiHealthHookModule extends XposedModule {
                 scheduleStartAfterAttach(classLoader);
             }
         });
+    }
+
+    private void registerDebugLifecycleCallbacks(Object application) {
+        if (!DebugBuild.ENABLED || !(application instanceof Application) ||
+                !debugLifecycleRegistered.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            ((Application) application).registerActivityLifecycleCallbacks(new Application.ActivityLifecycleCallbacks() {
+                @Override
+                public void onActivityCreated(Activity activity, Bundle savedInstanceState) {
+                    debugLifecycle("created", activity);
+                }
+
+                @Override
+                public void onActivityStarted(Activity activity) {
+                    debugLifecycle("started", activity);
+                }
+
+                @Override
+                public void onActivityResumed(Activity activity) {
+                    debugLifecycle("resumed", activity);
+                }
+
+                @Override
+                public void onActivityPaused(Activity activity) {
+                    debugLifecycle("paused", activity);
+                }
+
+                @Override
+                public void onActivityStopped(Activity activity) {
+                    debugLifecycle("stopped", activity);
+                }
+
+                @Override
+                public void onActivitySaveInstanceState(Activity activity, Bundle outState) {
+                }
+
+                @Override
+                public void onActivityDestroyed(Activity activity) {
+                    debugLifecycle("destroyed", activity);
+                }
+            });
+            diagLine("debug lifecycle callbacks registered process=" + processName);
+        } catch (Throwable throwable) {
+            diagLine("debug lifecycle callbacks failed: " + describeThrowable(throwable));
+        }
+    }
+
+    private void debugLifecycle(String event, Activity activity) {
+        if (!DebugBuild.ENABLED) {
+            return;
+        }
+        diagLine("activity " + event
+                + " process=" + processName
+                + ", activity=" + (activity == null ? "null" : activity.getClass().getName())
+                + ", uptime=" + SystemClock.elapsedRealtime()
+                + ", started=" + started
+                + ", lastStartReason=" + lastStartReason
+                + ", lastHrAgeMs=" + heartRateAgeForDebug());
     }
 
     private void installNotificationPermissionRequest(Application application) {
@@ -855,16 +932,28 @@ public final class MiHealthHookModule extends XposedModule {
     private void scheduleStartAfterAttach(final ClassLoader classLoader) {
         final Context context = appContext;
         if (context == null) {
+            if (DebugBuild.ENABLED) {
+                diagLine("scheduleStartAfterAttach skipped: context is null");
+            }
             return;
         }
         if (!heartRateHookEnabled) {
+            if (DebugBuild.ENABLED) {
+                diagLine("scheduleStartAfterAttach skipped: hook disabled process=" + processName);
+            }
             return;
         }
         if (isMainProcess()) {
+            if (DebugBuild.ENABLED) {
+                diagLine("scheduleStartAfterAttach main process: schedule legacy kick");
+            }
             scheduleLegacyKickCheck(classLoader, 6_000L);
             return;
         }
         if (!isWorkerProcess()) {
+            if (DebugBuild.ENABLED) {
+                diagLine("scheduleStartAfterAttach skipped: not worker process=" + processName);
+            }
             return;
         }
         if (!heartRateHookEnabled) {
@@ -877,7 +966,13 @@ public final class MiHealthHookModule extends XposedModule {
                     ensureRealtimeHrStarted(classLoader, "application:attach");
                 }
             }, 2_000L);
+            if (DebugBuild.ENABLED) {
+                diagLine("scheduleStartAfterAttach worker process: start after 2000ms");
+            }
         } catch (Throwable ignored) {
+            if (DebugBuild.ENABLED) {
+                diagLine("scheduleStartAfterAttach failed: " + describeThrowable(ignored));
+            }
         }
     }
 
@@ -1425,6 +1520,16 @@ public final class MiHealthHookModule extends XposedModule {
         periodicSyncEnabled = settings.syncEnabled;
         periodicSyncIntervalHours = settings.syncIntervalHours;
         uploader.applySettings(context, settings, reason);
+        if (DebugBuild.ENABLED) {
+            diagLine("runtime settings applied reason=" + reason
+                    + ", process=" + processName
+                    + ", hook=" + heartRateHookEnabled
+                    + ", wasHook=" + wasHeartRateHookEnabled
+                    + ", sync=" + periodicSyncEnabled
+                    + ", intervalHours=" + periodicSyncIntervalHours
+                    + ", targetClassLoader=" + (targetClassLoader != null)
+                    + ", uptime=" + SystemClock.elapsedRealtime());
+        }
         if (isMainProcess() &&
                 (wasPeriodicSyncEnabled != periodicSyncEnabled ||
                         oldPeriodicSyncIntervalHours != periodicSyncIntervalHours)) {
@@ -1913,10 +2018,29 @@ public final class MiHealthHookModule extends XposedModule {
 
     private void ensureRealtimeHrStarted(final ClassLoader classLoader, final String reason) {
         if (!heartRateHookEnabled) {
+            if (DebugBuild.ENABLED) {
+                diagLine("start skipped: hook disabled reason=" + reason + ", process=" + processName);
+            }
             return;
         }
         boolean force = reason.startsWith("watchdog:") || reason.startsWith("stop:");
-        if ((!force && !shouldStartNow(reason)) || !starting.compareAndSet(false, true)) {
+        if (!force && !shouldStartNow(reason)) {
+            if (DebugBuild.ENABLED) {
+                diagLine("start skipped: shouldStartNow=false reason=" + reason
+                        + ", process=" + processName
+                        + ", started=" + started
+                        + ", lastStartReason=" + lastStartReason
+                        + ", lastStartAgeMs=" + (SystemClock.elapsedRealtime() - lastStartAt)
+                        + ", lastHr=" + lastHr
+                        + ", lastHrAgeMs=" + heartRateAgeForDebug()
+                        + ", crossProcessRecent=" + hasRecentHeartRateInAnyProcess());
+            }
+            return;
+        }
+        if (!starting.compareAndSet(false, true)) {
+            if (DebugBuild.ENABLED) {
+                diagLine("start skipped: already starting reason=" + reason + ", process=" + processName);
+            }
             return;
         }
         WORKER.execute(new Runnable() {
@@ -1941,7 +2065,7 @@ public final class MiHealthHookModule extends XposedModule {
                     scheduleRetryIfNeeded(classLoader, force);
                 } catch (Throwable throwable) {
                     if (DebugBuild.ENABLED) {
-                        logLine("start failed: " + throwable.getClass().getSimpleName());
+                        logLine("start failed: " + describeThrowable(throwable));
                     }
                 } finally {
                     starting.set(false);
@@ -1973,29 +2097,55 @@ public final class MiHealthHookModule extends XposedModule {
     private void scheduleRetryIfNeeded(final ClassLoader classLoader, boolean forceRetry) {
         final Context context = appContext;
         if (context == null) {
+            if (DebugBuild.ENABLED) {
+                diagLine("retry skipped: context is null");
+            }
             return;
         }
         if (!heartRateHookEnabled) {
+            if (DebugBuild.ENABLED) {
+                diagLine("retry skipped: hook disabled");
+            }
             return;
         }
         if (!isWorkerProcess()) {
+            if (DebugBuild.ENABLED) {
+                diagLine("retry skipped: not worker process=" + processName);
+            }
             return;
         }
         boolean hasRecent = hasRecentHeartRateInAnyProcess(HEART_RATE_WATCHDOG_MS);
         if (!forceRetry && lastHr > 0) {
+            if (DebugBuild.ENABLED) {
+                diagLine("retry skipped: local heart rate exists lastHr=" + lastHr
+                        + ", ageMs=" + heartRateAgeForDebug());
+            }
             return;
         }
         if (!forceRetry && hasRecentHeartRateInAnyProcess()) {
+            if (DebugBuild.ENABLED) {
+                diagLine("retry skipped: cross-process heart rate recent");
+            }
             return;
         }
         if (forceRetry && hasRecent) {
+            if (DebugBuild.ENABLED) {
+                diagLine("retry skipped: watchdog window has recent heart rate");
+            }
             return;
         }
         markLegacyKickNeeded();
         noHeartStartAttempts++;
+        final String retryReason = forceRetry ? "watchdog:no-heart-rate-retry" : "timer:no-heart-rate";
         maybeScheduleColdStartRecycle();
         final long delayMs = noHeartStartAttempts <= 2 ? 9_000L : 60_000L;
-        final String retryReason = forceRetry ? "watchdog:no-heart-rate-retry" : "timer:no-heart-rate";
+        if (DebugBuild.ENABLED) {
+            diagLine("retry scheduled reason=" + retryReason
+                    + ", delayMs=" + delayMs
+                    + ", attempts=" + noHeartStartAttempts
+                    + ", force=" + forceRetry
+                    + ", uptime=" + SystemClock.elapsedRealtime());
+        }
         try {
             new Handler(context.getMainLooper()).postDelayed(new Runnable() {
                 @Override
@@ -2006,6 +2156,9 @@ public final class MiHealthHookModule extends XposedModule {
                 }
             }, delayMs);
         } catch (Throwable ignored) {
+            if (DebugBuild.ENABLED) {
+                diagLine("retry schedule failed: " + describeThrowable(ignored));
+            }
         }
     }
 
@@ -2014,17 +2167,30 @@ public final class MiHealthHookModule extends XposedModule {
         if (context == null || !isWorkerProcess() || !heartRateHookEnabled) {
             return;
         }
-        if (lastHr > 0 || noHeartStartAttempts < 3 || hasRecentHeartRateInAnyProcess()) {
+        if (lastHr > 0 || noHeartStartAttempts < 1 || hasRecentHeartRateInAnyProcess()) {
+            if (DebugBuild.ENABLED) {
+                diagLine("cold-start recycle not scheduled: lastHr=" + lastHr
+                        + ", attempts=" + noHeartStartAttempts
+                        + ", recent=" + hasRecentHeartRateInAnyProcess());
+            }
             return;
         }
         long uptime = SystemClock.elapsedRealtime();
         if (uptime > COLD_START_RECYCLE_MAX_UPTIME_MS) {
+            if (DebugBuild.ENABLED) {
+                diagLine("cold-start recycle not scheduled: uptime too high " + uptime);
+            }
             return;
         }
         if (!coldStartRecycleScheduled.compareAndSet(false, true)) {
             return;
         }
         long delayMs = Math.max(0L, COLD_START_RECYCLE_MIN_UPTIME_MS - uptime);
+        if (DebugBuild.ENABLED) {
+            diagLine("cold-start recycle scheduled delayMs=" + delayMs
+                    + ", uptime=" + uptime
+                    + ", attempts=" + noHeartStartAttempts);
+        }
         try {
             new Handler(context.getMainLooper()).postDelayed(new Runnable() {
                 @Override
@@ -2058,8 +2224,13 @@ public final class MiHealthHookModule extends XposedModule {
                 coldStartRecycleScheduled.set(false);
                 return;
             }
-            prefs.edit().putLong(KEY_LAST_COLD_START_RECYCLE_MS, nowMs).apply();
+            if (!prefs.edit().putLong(KEY_LAST_COLD_START_RECYCLE_MS, nowMs).commit()) {
+                coldStartRecycleScheduled.set(false);
+                return;
+            }
         } catch (Throwable ignored) {
+            coldStartRecycleScheduled.set(false);
+            return;
         }
         if (DebugBuild.ENABLED) {
             diagLine("cold-start heart-rate stalled, recycling device process once");
@@ -2155,7 +2326,10 @@ public final class MiHealthHookModule extends XposedModule {
         Object device = getCurrentDeviceModel(classLoader);
         if (device == null) {
             if (DebugBuild.ENABLED) {
-                debugLine("startDeviceRealtimeHr skipped: current device is null");
+                debugLine("startDeviceRealtimeHr skipped: current device is null"
+                        + ", process=" + processName
+                        + ", uptime=" + SystemClock.elapsedRealtime()
+                        + ", lastStartReason=" + lastStartReason);
             }
             return false;
         }
@@ -2207,7 +2381,7 @@ public final class MiHealthHookModule extends XposedModule {
             return device;
         } catch (Throwable ignored) {
             if (DebugBuild.ENABLED) {
-                debugLine("getCurrentDeviceModel failed: " + ignored.getClass().getSimpleName());
+                debugLine("getCurrentDeviceModel failed: " + describeThrowable(ignored));
             }
             return null;
         }
@@ -2281,6 +2455,22 @@ public final class MiHealthHookModule extends XposedModule {
                     + "/" + safeString(object.toString());
         }
         return "";
+    }
+
+    private String describeThrowable(Throwable throwable) {
+        if (throwable == null) {
+            return "null";
+        }
+        String message = throwable.getMessage();
+        return throwable.getClass().getSimpleName()
+                + (message == null || message.isEmpty() ? "" : ": " + message);
+    }
+
+    private long heartRateAgeForDebug() {
+        if (lastHrElapsedMs <= 0L) {
+            return -1L;
+        }
+        return SystemClock.elapsedRealtime() - lastHrElapsedMs;
     }
 
     private String describeDeviceForDebug(Object device) {
