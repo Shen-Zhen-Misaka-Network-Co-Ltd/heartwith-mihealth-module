@@ -12,6 +12,7 @@ public final class SettingsProvider extends ContentProvider {
     public static final String AUTHORITY = "com.heartwith.mihealth.lsp.settings";
     public static final Uri URI = Uri.parse("content://" + AUTHORITY + "/config");
     public static final Uri STATUS_URI = Uri.parse("content://" + AUTHORITY + "/status");
+    public static final Uri SLEEP_URI = Uri.parse("content://" + AUTHORITY + "/sleep");
 
     @Override
     public boolean onCreate() {
@@ -32,6 +33,16 @@ public final class SettingsProvider extends ContentProvider {
                     .getSharedPreferences(HeartwithSettings.PREFS, Context.MODE_PRIVATE)
                     .getLong(HeartwithStatus.KEY_VIEWER_ACTIVE_UNTIL_MS, 0L);
             cursor.addRow(new Object[]{status.bpm, status.source, status.seenMs, viewerActiveUntilMs});
+            return cursor;
+        }
+        if ("sleep".equals(uri.getLastPathSegment())) {
+            HeartwithSleepDebugStatus status = HeartwithSleepDebugStatus.readLocal(getContext());
+            MatrixCursor cursor = new MatrixCursor(new String[]{
+                    HeartwithSleepDebugStatus.KEY_SLEEP_SUMMARY,
+                    HeartwithSleepDebugStatus.KEY_SLEEP_DETAILS,
+                    HeartwithSleepDebugStatus.KEY_SLEEP_SEEN_MS,
+            });
+            cursor.addRow(new Object[]{status.summary, status.details, status.seenMs});
             return cursor;
         }
         HeartwithSettings settings = HeartwithSettings.readLocal(getContext());
@@ -71,12 +82,26 @@ public final class SettingsProvider extends ContentProvider {
 
     @Override
     public int update(Uri uri, ContentValues values, String selection, String[] selectionArgs) {
-        if (!"status".equals(uri.getLastPathSegment()) || values == null) {
-            throw new UnsupportedOperationException("status only");
+        if (values == null) {
+            throw new UnsupportedOperationException("values required");
         }
         Context context = getContext();
         if (context == null) {
             return 0;
+        }
+        if ("sleep".equals(uri.getLastPathSegment())) {
+            String summary = values.getAsString(HeartwithSleepDebugStatus.KEY_SLEEP_SUMMARY);
+            String details = values.getAsString(HeartwithSleepDebugStatus.KEY_SLEEP_DETAILS);
+            Long seenMs = values.getAsLong(HeartwithSleepDebugStatus.KEY_SLEEP_SEEN_MS);
+            HeartwithSleepDebugStatus.writeLocal(
+                    context,
+                    summary == null ? "" : summary,
+                    details == null ? "" : details,
+                    seenMs == null ? System.currentTimeMillis() : seenMs);
+            return 1;
+        }
+        if (!"status".equals(uri.getLastPathSegment())) {
+            throw new UnsupportedOperationException("status/sleep only");
         }
         int bpm = values.getAsInteger(HeartwithStatus.KEY_LAST_BPM) != null
                 ? values.getAsInteger(HeartwithStatus.KEY_LAST_BPM)

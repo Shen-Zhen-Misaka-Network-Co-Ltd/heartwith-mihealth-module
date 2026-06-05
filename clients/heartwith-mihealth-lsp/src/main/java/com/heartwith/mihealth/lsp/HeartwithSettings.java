@@ -15,11 +15,14 @@ final class HeartwithSettings {
     static final String KEY_DISPLAY_NAME = "display_name";
     static final String ACTION_CONFIG_CHANGED = "com.heartwith.mihealth.lsp.CONFIG_CHANGED";
     static final String ACTION_SYNC_NOW = "com.heartwith.mihealth.lsp.SYNC_NOW";
+    static final String ACTION_DEBUG_SLEEP_NOW = "com.heartwith.mihealth.lsp.DEBUG_SLEEP_NOW";
+    static final String ACTION_DEBUG_SLEEP_PROBE = "com.heartwith.mihealth.lsp.DEBUG_SLEEP_PROBE";
     static final String EXTRA_ENABLED = "enabled";
     static final String EXTRA_HOOK_ENABLED = "hook_enabled";
     static final String EXTRA_SYNC_ENABLED = "sync_enabled";
     static final String EXTRA_SYNC_INTERVAL_HOURS = "sync_interval_hours";
     static final String EXTRA_SYNC_MANUAL = "sync_manual";
+    static final String EXTRA_DEBUG_SLEEP_PROBE_ENABLED = "debug_sleep_probe_enabled";
     static final String EXTRA_SERVER_URL = "server_url";
     static final String EXTRA_DISPLAY_NAME = "display_name";
     static final String DEFAULT_SERVER_URL = "http://52.193.131.172:8000";

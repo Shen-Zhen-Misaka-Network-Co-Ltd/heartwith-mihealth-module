@@ -117,6 +117,44 @@ final class HeartwithSettingsPanel {
         }
     }
 
+    static void sendDebugSleepNowBroadcast(Context context) {
+        for (String packageName : TARGET_PACKAGES) {
+            Intent intent = new Intent(HeartwithSettings.ACTION_DEBUG_SLEEP_NOW);
+            intent.setPackage(packageName);
+            intent.addFlags(Intent.FLAG_RECEIVER_FOREGROUND);
+            try {
+                context.sendBroadcast(intent);
+            } catch (Throwable ignored) {
+            }
+        }
+        try {
+            Intent intent = new Intent(HeartwithSettings.ACTION_DEBUG_SLEEP_NOW);
+            intent.addFlags(Intent.FLAG_RECEIVER_FOREGROUND);
+            context.sendBroadcast(intent);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    static void sendDebugSleepProbeBroadcast(Context context, boolean enabled) {
+        for (String packageName : TARGET_PACKAGES) {
+            Intent intent = new Intent(HeartwithSettings.ACTION_DEBUG_SLEEP_PROBE);
+            intent.setPackage(packageName);
+            intent.addFlags(Intent.FLAG_RECEIVER_FOREGROUND);
+            intent.putExtra(HeartwithSettings.EXTRA_DEBUG_SLEEP_PROBE_ENABLED, enabled);
+            try {
+                context.sendBroadcast(intent);
+            } catch (Throwable ignored) {
+            }
+        }
+        try {
+            Intent intent = new Intent(HeartwithSettings.ACTION_DEBUG_SLEEP_PROBE);
+            intent.addFlags(Intent.FLAG_RECEIVER_FOREGROUND);
+            intent.putExtra(HeartwithSettings.EXTRA_DEBUG_SLEEP_PROBE_ENABLED, enabled);
+            context.sendBroadcast(intent);
+        } catch (Throwable ignored) {
+        }
+    }
+
     private static Intent configIntent(HeartwithSettings settings) {
         Intent intent = new Intent(HeartwithSettings.ACTION_CONFIG_CHANGED);
         intent.putExtra(HeartwithSettings.EXTRA_ENABLED, settings.enabled);
@@ -247,6 +285,8 @@ final class HeartwithSettingsPanel {
         private final TextView bpmText;
         private final TextView statusText;
         private final TextView sourceText;
+        private TextView sleepSummaryText;
+        private TextView sleepDetailsText;
 
         Controller(final Activity activity, final Runnable closeAction) {
             this.activity = activity;
@@ -311,6 +351,79 @@ final class HeartwithSettingsPanel {
                 });
                 debugCard.addView(overlayPermission, matchWrapWithTop(activity, 12));
                 content.addView(debugCard, matchWrapWithTop(activity, 18));
+
+                LinearLayout sleepCard = card(activity);
+                sleepCard.addView(label(activity, "Debug 睡眠", 18, COLOR_TEXT, true), matchWrap());
+                TextView sleepText = label(activity, "点击后触发小米健康同步当前设备睡眠数据，解析结果会实时显示在这里。定期探测只在 debug 包用于夜间实验。", 14, COLOR_MUTED, false);
+                sleepText.setPadding(0, dp(activity, 8), 0, 0);
+                sleepCard.addView(sleepText, matchWrap());
+                Button fetchSleep = new Button(activity);
+                fetchSleep.setText("获取睡眠");
+                fetchSleep.setAllCaps(false);
+                fetchSleep.setTextSize(15);
+                fetchSleep.setTextColor(COLOR_TEXT);
+                fetchSleep.setBackground(rounded(activity, COLOR_INPUT, 18));
+                fetchSleep.setPadding(dp(activity, 18), dp(activity, 8), dp(activity, 18), dp(activity, 8));
+                fetchSleep.setOnClickListener(new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        long now = System.currentTimeMillis();
+                        HeartwithSleepDebugStatus.writeLocal(activity, "正在请求睡眠数据", "等待小米健康同步并解析睡眠数据...", now);
+                        refreshSleepDebug();
+                        sendDebugSleepNowBroadcast(activity);
+                        Toast.makeText(activity, "已请求睡眠数据", Toast.LENGTH_SHORT).show();
+                    }
+                });
+                sleepCard.addView(fetchSleep, matchWrapWithTop(activity, 12));
+                Button startSleepProbe = new Button(activity);
+                startSleepProbe.setText("开始定期探测");
+                startSleepProbe.setAllCaps(false);
+                startSleepProbe.setTextSize(15);
+                startSleepProbe.setTextColor(COLOR_TEXT);
+                startSleepProbe.setBackground(rounded(activity, COLOR_INPUT, 18));
+                startSleepProbe.setPadding(dp(activity, 18), dp(activity, 8), dp(activity, 18), dp(activity, 8));
+                startSleepProbe.setOnClickListener(new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        long now = System.currentTimeMillis();
+                        HeartwithSleepDebugStatus.writeLocal(activity,
+                                "睡眠定期探测已开启",
+                                "将立即探测一次，之后约每 10 分钟用非唤醒 alarm 尝试一次；每轮会在同步前后多次采样。日志会写入 sleep-debug.log。",
+                                now);
+                        refreshSleepDebug();
+                        sendDebugSleepProbeBroadcast(activity, true);
+                        Toast.makeText(activity, "已开启睡眠定期探测", Toast.LENGTH_SHORT).show();
+                    }
+                });
+                sleepCard.addView(startSleepProbe, matchWrapWithTop(activity, 10));
+                Button stopSleepProbe = new Button(activity);
+                stopSleepProbe.setText("停止定期探测");
+                stopSleepProbe.setAllCaps(false);
+                stopSleepProbe.setTextSize(15);
+                stopSleepProbe.setTextColor(COLOR_TEXT);
+                stopSleepProbe.setBackground(rounded(activity, COLOR_INPUT, 18));
+                stopSleepProbe.setPadding(dp(activity, 18), dp(activity, 8), dp(activity, 18), dp(activity, 8));
+                stopSleepProbe.setOnClickListener(new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        long now = System.currentTimeMillis();
+                        HeartwithSleepDebugStatus.writeLocal(activity,
+                                "睡眠定期探测已停止",
+                                "已取消后续定时探测。",
+                                now);
+                        refreshSleepDebug();
+                        sendDebugSleepProbeBroadcast(activity, false);
+                        Toast.makeText(activity, "已停止睡眠定期探测", Toast.LENGTH_SHORT).show();
+                    }
+                });
+                sleepCard.addView(stopSleepProbe, matchWrapWithTop(activity, 10));
+                sleepSummaryText = label(activity, "尚未获取", 16, COLOR_TEXT, true);
+                sleepSummaryText.setPadding(0, dp(activity, 14), 0, 0);
+                sleepCard.addView(sleepSummaryText, matchWrap());
+                sleepDetailsText = label(activity, "点击“获取睡眠”后显示结果。", 13, COLOR_MUTED, false);
+                sleepDetailsText.setPadding(0, dp(activity, 8), 0, 0);
+                sleepCard.addView(sleepDetailsText, matchWrap());
+                content.addView(sleepCard, matchWrapWithTop(activity, 18));
             }
 
             LinearLayout configCard = card(activity);
@@ -409,6 +522,26 @@ final class HeartwithSettingsPanel {
                 bpmText.setText("等待心率");
                 statusText.setText("打开小米运动健康的运动页后开始采集");
                 sourceText.setText("来源：尚未采集");
+            }
+            refreshSleepDebug();
+        }
+
+        void refreshSleepDebug() {
+            if (!DebugBuild.ENABLED || sleepSummaryText == null || sleepDetailsText == null) {
+                return;
+            }
+            HeartwithSleepDebugStatus sleep = HeartwithSleepDebugStatus.readLocal(activity);
+            if (sleep.summary.isEmpty()) {
+                sleepSummaryText.setText("尚未获取");
+                sleepDetailsText.setText("点击“获取睡眠”后显示结果。");
+                return;
+            }
+            sleepSummaryText.setText(sleep.summary);
+            String relative = HeartwithStatus.relativeTime(System.currentTimeMillis(), sleep.seenMs);
+            if (sleep.details.isEmpty()) {
+                sleepDetailsText.setText("更新时间：" + relative);
+            } else {
+                sleepDetailsText.setText(sleep.details + "\n更新时间：" + relative);
             }
         }
 

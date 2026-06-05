@@ -17,7 +17,20 @@ public final class SettingsActivity extends Activity {
     private final BroadcastReceiver statusReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            if (intent == null || !HeartwithStatus.ACTION_STATUS_CHANGED.equals(intent.getAction())) {
+            if (intent == null) {
+                return;
+            }
+            if (HeartwithSleepDebugStatus.ACTION_SLEEP_CHANGED.equals(intent.getAction())) {
+                String summary = intent.getStringExtra(HeartwithSleepDebugStatus.EXTRA_SUMMARY);
+                String details = intent.getStringExtra(HeartwithSleepDebugStatus.EXTRA_DETAILS);
+                long seenMs = intent.getLongExtra(HeartwithSleepDebugStatus.EXTRA_SEEN_MS, System.currentTimeMillis());
+                HeartwithSleepDebugStatus.writeLocal(SettingsActivity.this, summary, details, seenMs);
+                if (controller != null) {
+                    controller.refreshSleepDebug();
+                }
+                return;
+            }
+            if (!HeartwithStatus.ACTION_STATUS_CHANGED.equals(intent.getAction())) {
                 return;
             }
             int bpm = intent.getIntExtra(HeartwithStatus.EXTRA_BPM, -1);
@@ -73,6 +86,7 @@ public final class SettingsActivity extends Activity {
             return;
         }
         IntentFilter filter = new IntentFilter(HeartwithStatus.ACTION_STATUS_CHANGED);
+        filter.addAction(HeartwithSleepDebugStatus.ACTION_SLEEP_CHANGED);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(statusReceiver, filter, Context.RECEIVER_EXPORTED);
         } else {
