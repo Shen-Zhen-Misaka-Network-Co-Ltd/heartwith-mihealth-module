@@ -47,8 +47,8 @@ jobs:
       - name: Show uploader SDK revision
         run: git -C heartwith-android-uploader log -1 --oneline
 
-      - name: Build APK
-        run: ./gradlew :heartwith-mihealth-lsp:assembleRelease --warning-mode=fail
+      - name: Build APKs
+        run: ./gradlew :heartwith-mihealth-lsp:assembleDebug :heartwith-mihealth-lsp:assembleRelease --warning-mode=fail
 
       - name: Generate release notes
         run: |
@@ -98,12 +98,14 @@ jobs:
             echo
             echo "## 安装包"
             echo
-            echo "下载下方 APK 文件安装。"
+            echo "下载下方 APK 文件安装。正式使用请选择 release APK；调试问题请选择 debug APK。"
           } > release-notes.md
 
           cat release-notes.md
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: clients/heartwith-mihealth-lsp/build/outputs/apk/release/Heartwith-*-release.apk
+          files: |
+            clients/heartwith-mihealth-lsp/build/outputs/apk/release/Heartwith-*-release.apk
+            clients/heartwith-mihealth-lsp/build/outputs/apk/debug/*.apk
           body_path: release-notes.md
