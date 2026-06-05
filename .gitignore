@@ -1,6 +1,7 @@
 .gradle/
 .kotlin/
 .idea/
+.debug-logs/
 .DS_Store
 
 build/
