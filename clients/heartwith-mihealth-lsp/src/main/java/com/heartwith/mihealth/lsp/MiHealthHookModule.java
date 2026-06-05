@@ -21,8 +21,13 @@ import android.view.View;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import com.heartwith.uploader.HeartwithSleepStatus;
+
+import java.io.ByteArrayOutputStream;
 import java.io.FileInputStream;
+import java.text.SimpleDateFormat;
 import java.lang.ref.WeakReference;
+import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
@@ -32,7 +37,11 @@ import java.lang.reflect.Proxy;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Calendar;
+import java.util.Date;
 import java.util.List;
+import java.util.Locale;
 import java.util.zip.ZipFile;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -49,11 +58,17 @@ public final class MiHealthHookModule extends XposedModule {
     private static final String PATCHED_TARGET_PACKAGE = "com.mi.health.heartwith";
     private static final String RUNTIME_PREFS = "heartwith_mihealth_runtime";
     private static final String KEY_CACHED_SERVER_URL = "cached_server_url";
+    private static final String KEY_SLEEP_FINAL_UPLOADED_KEY = "sleep_final_uploaded_key";
     private static final String ACTION_SPORT_MODE_CHANGED = "com.heartwith.mihealth.lsp.SPORT_MODE_CHANGED";
+    private static final String ACTION_DEVICE_CHANGED = "com.heartwith.mihealth.lsp.DEVICE_CHANGED";
     private static final String ACTION_HEART_RATE_WATCHDOG = "com.heartwith.mihealth.lsp.HEART_RATE_WATCHDOG";
+    private static final String ACTION_SLEEP_STATUS_POLL = "com.heartwith.mihealth.lsp.SLEEP_STATUS_POLL";
     private static final String EXTRA_SPORT_MODE_UNTIL_MS = "sport_mode_until_ms";
+    private static final String EXTRA_DEVICE_DID = "device_did";
+    private static final String EXTRA_DEVICE_NAME = "device_name";
     private static final String EXTRA_SYNC_GENERATION = "sync_generation";
     private static final String EXTRA_HEART_RATE_WATCHDOG_GENERATION = "heart_rate_watchdog_generation";
+    private static final String EXTRA_SLEEP_STATUS_GENERATION = "sleep_status_generation";
     private static final String KEY_ACTIVE_SOURCE = "active_source";
     private static final String KEY_ACTIVE_SOURCE_SEEN_MS = "active_source_seen_ms";
     private static final String KEY_LAST_HR_SEEN_MS = "last_hr_seen_ms";
@@ -74,6 +89,10 @@ public final class MiHealthHookModule extends XposedModule {
     private static final long HEART_RATE_ALARM_WINDOW_MS = 2L * 60L * 1000L;
     private static final long HEART_RATE_ALARM_RESCHEDULE_MIN_MS =
             (DebugBuild.ENABLED ? 1L : 2L) * 60L * 1000L;
+    private static final long START_HELPER_WATCHDOG_COOLDOWN_MS =
+            (DebugBuild.ENABLED ? 60L : 10L * 60L) * 1000L;
+    private static final long START_HELPER_SPORT_COOLDOWN_MS =
+            (DebugBuild.ENABLED ? 15L : 60L) * 1000L;
     private static final long COLD_START_RECYCLE_MIN_UPTIME_MS = 90_000L;
     private static final long COLD_START_RECYCLE_MAX_UPTIME_MS = 10L * 60L * 1000L;
     private static final long COLD_START_RECYCLE_COOLDOWN_MS = 6L * 60L * 60L * 1000L;
@@ -82,6 +101,14 @@ public final class MiHealthHookModule extends XposedModule {
     private static final long SYNC_MIN_TRIGGER_GAP_MS = 10L * 60L * 1000L;
     private static final long SYNC_MANUAL_MIN_TRIGGER_GAP_MS = 5_000L;
     private static final long SYNC_ALARM_WINDOW_MS = 15L * 60L * 1000L;
+    private static final long DEBUG_SLEEP_PROBE_INTERVAL_MS = 10L * 60L * 1000L;
+    private static final long DEBUG_SLEEP_PROBE_WINDOW_MS = 3L * 60L * 1000L;
+    private static final long DEBUG_SLEEP_ONLY_SYNC_DELAY_MS = 30_000L;
+    private static final long DEBUG_SLEEP_ONLY_SYNC_MIN_GAP_MS = 10L * 60L * 1000L;
+    private static final long SLEEP_STATUS_POLL_INTERVAL_MS = 5L * 60L * 1000L;
+    private static final long SLEEP_STATUS_POLL_WINDOW_MS = 2L * 60L * 1000L;
+    private static final long SLEEP_STATUS_MIN_SLEEP_MS = 5L * 60L * 1000L;
+    private static final long SLEEP_STATUS_MAX_AGE_MS = 20L * 60L * 60L * 1000L;
     private static final int STATUS_UPDATE_CHANGE_BPM = 3;
     private static final boolean VERBOSE_LOGS = DebugBuild.ENABLED;
     private static final String NPATCH_ORIGIN_ASSET = "assets/npatch/origin.apk";
@@ -148,10 +175,19 @@ public final class MiHealthHookModule extends XposedModule {
     private final AtomicBoolean starting = new AtomicBoolean(false);
     private final AtomicBoolean configReceiverRegistered = new AtomicBoolean(false);
     private final AtomicBoolean sportModeReceiverRegistered = new AtomicBoolean(false);
+    private final AtomicBoolean deviceChangeReceiverRegistered = new AtomicBoolean(false);
     private final AtomicBoolean syncUiHooksInstalled = new AtomicBoolean(false);
+    private final AtomicBoolean sleepStatusHooksInstalled = new AtomicBoolean(false);
+    private final AtomicBoolean sleepStatusPollScheduled = new AtomicBoolean(false);
+    private final AtomicBoolean sleepStatusRepositoryPending = new AtomicBoolean(false);
+    private final AtomicBoolean sleepStatusTodayIdsPending = new AtomicBoolean(false);
     private final AtomicBoolean cleartextPolicyHookInstalled = new AtomicBoolean(false);
     private final AtomicBoolean coldStartRecycleScheduled = new AtomicBoolean(false);
     private final AtomicBoolean debugLifecycleRegistered = new AtomicBoolean(false);
+    private final AtomicBoolean debugSleepHooksInstalled = new AtomicBoolean(false);
+    private final AtomicBoolean debugSleepOnlySyncPending = new AtomicBoolean(false);
+    private final AtomicBoolean debugTodaySleepIdsPending = new AtomicBoolean(false);
+    private final AtomicBoolean debugSleepRepositoryPending = new AtomicBoolean(false);
     private final HeartwithUploader uploader = new HeartwithUploader(UPLOAD_WORKER);
     private final List<Object> launchModels = new ArrayList<>();
     private volatile Context appContext;
@@ -162,6 +198,9 @@ public final class MiHealthHookModule extends XposedModule {
     private volatile boolean started;
     private volatile long lastStartAt;
     private volatile String lastStartReason = "";
+    private volatile long lastStartHelperScanElapsedMs;
+    private volatile long lastSportStartHelperScanElapsedMs;
+    private volatile String lastStartHelperDeviceIdentity;
     private volatile int lastHr = -1;
     private volatile long lastHrElapsedMs;
     private volatile int noHeartStartAttempts;
@@ -197,16 +236,30 @@ public final class MiHealthHookModule extends XposedModule {
     private volatile boolean periodicSyncEnabled;
     private volatile int periodicSyncIntervalHours = HeartwithSettings.DEFAULT_SYNC_INTERVAL_HOURS;
     private volatile int syncScheduleGeneration;
+    private volatile int debugSleepProbeGeneration;
+    private volatile boolean debugSleepProbeEnabled;
     private volatile int heartRateWatchdogGeneration;
+    private volatile int sleepStatusPollGeneration;
+    private volatile long lastSleepStatusFetchElapsedMs;
+    private volatile String lastSleepStatusKey;
+    private volatile long lastSleepStatusUploadElapsedMs;
+    private volatile long sleepTrackingDayStartMs;
+    private volatile boolean sleepCandidateSeenToday;
+    private volatile boolean sleepFinalReportRequested;
+    private volatile String sleepFinalUploadedKey;
     private volatile long lastHeartRateWatchdogAlarmElapsedMs;
     private volatile long lastSyncTriggerElapsedMs;
     private volatile long lastSyncSuccessElapsedMs;
+    private volatile long lastDebugSleepOnlySyncElapsedMs;
+    private volatile int lastDebugSleepOnlySyncHash;
     private volatile long lastRuntimeSettingsRefreshElapsedMs;
     private volatile WeakReference<View> syncButtonView = new WeakReference<>(null);
     private volatile WeakReference<View.OnClickListener> syncButtonListener = new WeakReference<>(null);
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
+        importantLine("module loaded api=" + getApiVersion()
+                + ", version=" + BuildConfig.VERSION_NAME);
         if (DebugBuild.ENABLED) {
             logLine("module loaded api=" + getApiVersion());
         }
@@ -221,6 +274,11 @@ public final class MiHealthHookModule extends XposedModule {
         targetPackage = packageName;
         String currentProcess = getProcessName();
         processName = currentProcess == null ? targetPackage : currentProcess;
+        importantLine("package ready package=" + packageName
+                + ", process=" + processName
+                + ", main=" + isMainProcess()
+                + ", worker=" + isWorkerProcess()
+                + ", uptime=" + SystemClock.elapsedRealtime());
         if (DebugBuild.ENABLED) {
             diagLine("package ready package=" + packageName
                     + ", process=" + processName
@@ -242,6 +300,8 @@ public final class MiHealthHookModule extends XposedModule {
         if (isWorkerProcess() || isMainProcess()) {
             hookHeartwithCleartextPolicy();
         }
+        hookSleepStatus(classLoader);
+        hookSleepDiagnostics(classLoader);
         hookLifecycle(classLoader);
         if (isWorkerProcess()) {
             hookHeartRateSinks(classLoader);
@@ -441,6 +501,12 @@ public final class MiHealthHookModule extends XposedModule {
                 Context base = (Context) chain.getArg(0);
                 Context applicationContext = base == null ? null : base.getApplicationContext();
                 appContext = applicationContext == null ? base : applicationContext;
+                DebugSleepLog.init(appContext, processName);
+                importantLine("attach process=" + processName
+                        + ", worker=" + isWorkerProcess()
+                        + ", main=" + isMainProcess()
+                        + ", version=" + BuildConfig.VERSION_NAME
+                        + ", uptime=" + SystemClock.elapsedRealtime());
                 if (DebugBuild.ENABLED) {
                     diagLine("attach process=" + processName
                             + ", app=" + describeObjectForDebug(chain.getThisObject())
@@ -454,10 +520,12 @@ public final class MiHealthHookModule extends XposedModule {
                 }
                 maybeInstallNpatchCompatibility(classLoader, chain.getThisObject());
                 registerSportModeReceiver(appContext);
+                registerDeviceChangeReceiver(appContext);
                 registerConfigReceiver(appContext);
                 warmUpUploaderConfig(appContext);
                 restoreActiveSource(appContext);
                 scheduleStartAfterAttach(classLoader);
+                scheduleSleepStatusPoll(appContext, "attach");
             }
         });
     }
@@ -601,10 +669,12 @@ public final class MiHealthHookModule extends XposedModule {
         hookEcoPacketHandler(classLoader, "com.xiaomi.fitness.sport.model.LaunchSportModel$EcoDataHandlerImpl");
         hookEcoRawHandler(classLoader);
         hookEcoRemoteDataHandler(classLoader);
+        hookSportWearDataSinks(classLoader);
         hookHuamiCallback(classLoader, "com.xiaomi.fitness.sport_eco.model.LaunchSportModel$HuamiHrImpl");
         hookHuamiCallback(classLoader, "com.xiaomi.fitness.sport_eco_manager.model.LaunchSportModel$HuamiHrImpl");
         hookHuamiCallback(classLoader, "com.xiaomi.fitness.sport.model.LaunchSportModel$HuamiHrImpl");
         hookHuamiCallback(classLoader, "com.xiaomi.fitness.sport_manager.model.LaunchSportModel$HuamiHrImpl");
+        hookHuamiCallback(classLoader, "com.xiaomi.fitness.sport_manager.state.data.HuamiDataReceive");
         hookHuamiCallback(classLoader, "com.xiaomi.fitness.sport_eco_manager.state.data.HuamiDataReceive");
     }
 
@@ -663,7 +733,7 @@ public final class MiHealthHookModule extends XposedModule {
                         if (text != null && isSyncSuccessText(String.valueOf(text))) {
                             lastSyncSuccessElapsedMs = SystemClock.elapsedRealtime();
                             if (DebugBuild.ENABLED) {
-                                diagLine("mihealth sync success toast captured");
+                                debugSyncLine("mihealth sync success toast captured");
                             }
                         }
                         return result;
@@ -690,7 +760,7 @@ public final class MiHealthHookModule extends XposedModule {
             syncButtonListener = new WeakReference<>(listener);
         }
         if (DebugBuild.ENABLED) {
-            diagLine("sync entry captured reason=" + reason + ", text=" + text);
+            debugSyncLine("entry captured reason=" + reason + ", text=" + text);
         }
     }
 
@@ -727,6 +797,9 @@ public final class MiHealthHookModule extends XposedModule {
                 @Override
                 public void run() {
                     if (generation != syncScheduleGeneration || !periodicSyncEnabled) {
+                        debugSyncLine("timer ignored generation=" + generation
+                                + ", current=" + syncScheduleGeneration
+                                + ", enabled=" + periodicSyncEnabled);
                         return;
                     }
                     triggerMiHealthSync(appContext, "timer", false);
@@ -736,12 +809,15 @@ public final class MiHealthHookModule extends XposedModule {
         } catch (Throwable ignored) {
         }
         if (DebugBuild.ENABLED) {
-            diagLine("periodic sync scheduled hours=" + periodicSyncIntervalHours);
+            debugSyncLine("periodic scheduled hours=" + periodicSyncIntervalHours
+                    + ", delayMs=" + delayMs
+                    + ", generation=" + generation);
         }
     }
 
     private void cancelPeriodicSync(Context context) {
         syncScheduleGeneration++;
+        debugSyncLine("periodic cancelled generation=" + syncScheduleGeneration);
         if (context == null || !isMainProcess()) {
             return;
         }
@@ -772,9 +848,13 @@ public final class MiHealthHookModule extends XposedModule {
             } else {
                 alarmManager.set(AlarmManager.RTC, triggerAtMs, pendingIntent);
             }
+            debugSyncLine("alarm scheduled delayMs=" + delayMs
+                    + ", windowMs=" + SYNC_ALARM_WINDOW_MS
+                    + ", generation=" + generation
+                    + ", triggerAtMs=" + triggerAtMs);
         } catch (Throwable throwable) {
             if (DebugBuild.ENABLED) {
-                diagLine("sync alarm schedule failed: " + throwable.getClass().getSimpleName());
+                debugSyncLine("alarm schedule failed: " + throwable.getClass().getSimpleName());
             }
         }
     }
@@ -794,22 +874,155 @@ public final class MiHealthHookModule extends XposedModule {
         return PendingIntent.getBroadcast(context, 0x23014332, intent, flags);
     }
 
+    private void scheduleSleepStatusPoll(Context context, String reason) {
+        if (context == null || !isWorkerProcess() || !heartRateHookEnabled) {
+            return;
+        }
+        if (sleepStatusPollScheduled.get()) {
+            debugSleepStateLine("poll-schedule-skip", reason, null, "alreadyScheduled");
+            return;
+        }
+        final int generation = ++sleepStatusPollGeneration;
+        sleepStatusPollScheduled.set(true);
+        scheduleSleepStatusAlarm(context, SLEEP_STATUS_POLL_INTERVAL_MS, generation);
+        if (DebugBuild.ENABLED) {
+            debugSleepLine("sleep status poll scheduled reason=" + reason
+                    + ", generation=" + generation
+                    + ", intervalMs=" + SLEEP_STATUS_POLL_INTERVAL_MS);
+        }
+    }
+
+    private void cancelSleepStatusPoll(Context context) {
+        sleepStatusPollGeneration++;
+        sleepStatusPollScheduled.set(false);
+        if (context == null || !isWorkerProcess()) {
+            return;
+        }
+        try {
+            AlarmManager alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+            if (alarmManager != null) {
+                alarmManager.cancel(sleepStatusPendingIntent(context, sleepStatusPollGeneration));
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void scheduleSleepStatusAlarm(Context context, long delayMs, int generation) {
+        try {
+            AlarmManager alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+            if (alarmManager == null) {
+                return;
+            }
+            long triggerAtMs = SystemClock.elapsedRealtime() + delayMs;
+            PendingIntent pendingIntent = sleepStatusPendingIntent(context, generation);
+            alarmManager.cancel(pendingIntent);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                alarmManager.setWindow(
+                        AlarmManager.ELAPSED_REALTIME,
+                        triggerAtMs,
+                        SLEEP_STATUS_POLL_WINDOW_MS,
+                        pendingIntent);
+            } else {
+                alarmManager.set(AlarmManager.ELAPSED_REALTIME, triggerAtMs, pendingIntent);
+            }
+        } catch (Throwable throwable) {
+            if (DebugBuild.ENABLED) {
+                debugSleepLine("sleep status alarm failed: " + describeThrowable(throwable));
+            }
+        }
+    }
+
+    private PendingIntent sleepStatusPendingIntent(Context context, int generation) {
+        Intent intent = new Intent(ACTION_SLEEP_STATUS_POLL);
+        intent.setPackage(targetPackage);
+        intent.putExtra(EXTRA_SLEEP_STATUS_GENERATION, generation);
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            flags |= PendingIntent.FLAG_IMMUTABLE;
+        }
+        return PendingIntent.getBroadcast(context, 0x23014337, intent, flags);
+    }
+
+    private void handleSleepStatusPoll(Context context, String reason) {
+        sleepStatusPollScheduled.set(false);
+        refreshRuntimeSettingsIfNeeded(context, false);
+        if (!heartRateHookEnabled || !isWorkerProcess()) {
+            debugSleepStateLine("poll-cancel", reason, null,
+                    "hookEnabled=" + heartRateHookEnabled + ", worker=" + isWorkerProcess());
+            cancelSleepStatusPoll(context);
+            return;
+        }
+        debugSleepStateLine("poll-fired", reason, null, "fetch-start");
+        triggerSleepStatusFetch(context, reason);
+        scheduleSleepStatusPoll(context, reason + ":next");
+    }
+
+    private void triggerSleepStatusFetch(Context context, String reason) {
+        if (context == null || !isWorkerProcess()) {
+            debugSleepStateLine("fetch-skip", reason, null,
+                    "context=" + (context != null) + ", worker=" + isWorkerProcess());
+            return;
+        }
+        ClassLoader classLoader = targetClassLoader;
+        if (classLoader == null) {
+            debugSleepStateLine("fetch-skip", reason, null, "classLoader=null");
+            return;
+        }
+        Object device = getCurrentDeviceModel(classLoader);
+        if (device == null) {
+            debugSleepStateLine("fetch-skip", reason, null, "device=null");
+            return;
+        }
+        updateDeviceModel(device);
+        String did = getCurrentDeviceId(device);
+        if (did == null || did.length() == 0) {
+            debugSleepStateLine("fetch-skip", reason, null, "did=null, device=" + shortObject(device));
+            return;
+        }
+        debugSleepStateLine("fetch-raw-ids", reason, null,
+                "did=" + maskDid(did) + ", device=" + describeDirectSyncDevice(device));
+        lastSleepStatusFetchElapsedMs = SystemClock.elapsedRealtime();
+        requestTodaySleepIds(classLoader, did, reason);
+    }
+
+    private void maybeFetchSleepStatusAfterHeartRate(final Context context,
+                                                     long elapsedMs,
+                                                     final String source) {
+        if (context == null || !isWorkerProcess()) {
+            return;
+        }
+        long last = lastSleepStatusFetchElapsedMs;
+        if (last > 0 && elapsedMs - last < SLEEP_STATUS_POLL_INTERVAL_MS) {
+            return;
+        }
+        lastSleepStatusFetchElapsedMs = elapsedMs;
+        WORKER.execute(new Runnable() {
+            @Override
+            public void run() {
+                debugSleepStateLine("piggyback-fired", "heart-rate:" + source, null, "fetch-start");
+                triggerSleepStatusFetch(context, "heart-rate:" + source);
+            }
+        });
+    }
+
     private void triggerMiHealthSync(Context context, String reason, boolean manual) {
         if (context == null || !isMainProcess()) {
             return;
         }
         if (!manual && !periodicSyncEnabled) {
+            debugSyncLine("trigger ignored disabled reason=" + reason + ", manual=" + manual);
             return;
         }
         long elapsed = SystemClock.elapsedRealtime();
         long minGap = manual ? SYNC_MANUAL_MIN_TRIGGER_GAP_MS : SYNC_MIN_TRIGGER_GAP_MS;
         if (lastSyncTriggerElapsedMs > 0L && elapsed - lastSyncTriggerElapsedMs < minGap) {
             if (DebugBuild.ENABLED) {
-                diagLine("sync trigger skipped reason=" + reason + ", gapMs=" + (elapsed - lastSyncTriggerElapsedMs));
+                debugSyncLine("trigger skipped reason=" + reason + ", gapMs=" + (elapsed - lastSyncTriggerElapsedMs));
             }
             return;
         }
         lastSyncTriggerElapsedMs = elapsed;
+        debugSyncLine("trigger start reason=" + reason + ", manual=" + manual);
         ClassLoader classLoader = targetClassLoader;
         if (classLoader != null && triggerDirectDeviceSync(classLoader, reason, manual)) {
             return;
@@ -818,7 +1031,7 @@ public final class MiHealthHookModule extends XposedModule {
         final View.OnClickListener listener = syncButtonListener.get();
         if (view == null && listener == null) {
             if (DebugBuild.ENABLED) {
-                diagLine("sync trigger pending: open Xiaomi Health sync page once to capture entry");
+                debugSyncLine("trigger pending: open Xiaomi Health sync page once to capture entry");
             }
             return;
         }
@@ -833,22 +1046,22 @@ public final class MiHealthHookModule extends XposedModule {
                             listener.onClick(view);
                         } else {
                             if (DebugBuild.ENABLED) {
-                                diagLine("sync trigger failed: captured sync view expired");
+                                debugSyncLine("trigger failed: captured sync view expired");
                             }
                         }
                     } catch (Throwable throwable) {
                         if (DebugBuild.ENABLED) {
-                            diagLine("sync trigger failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+                            debugSyncLine("trigger failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
                         }
                     }
                 }
             });
             if (DebugBuild.ENABLED) {
-                diagLine("sync trigger posted reason=" + reason + ", manual=" + manual);
+                debugSyncLine("trigger posted reason=" + reason + ", manual=" + manual);
             }
         } catch (Throwable throwable) {
             if (DebugBuild.ENABLED) {
-                diagLine("sync trigger post failed: " + throwable.getClass().getSimpleName());
+                debugSyncLine("trigger post failed: " + throwable.getClass().getSimpleName());
             }
         }
     }
@@ -857,7 +1070,7 @@ public final class MiHealthHookModule extends XposedModule {
         Object device = getCurrentDeviceModel(classLoader);
         if (device == null) {
             if (DebugBuild.ENABLED) {
-                diagLine("direct sync skipped: current device is null");
+                debugSyncLine("direct skipped: current device is null");
             }
             return false;
         }
@@ -865,7 +1078,7 @@ public final class MiHealthHookModule extends XposedModule {
         String did = getCurrentDeviceId(device);
         if (did == null) {
             if (DebugBuild.ENABLED) {
-                diagLine("direct sync skipped: current device did is null");
+                debugSyncLine("direct skipped: current device did is null");
             }
             return false;
         }
@@ -873,6 +1086,209 @@ public final class MiHealthHookModule extends XposedModule {
             return true;
         }
         return triggerEcoDeviceSync(classLoader, did, reason, manual);
+    }
+
+    private void triggerDebugSleepFetch(Context context, String reason) {
+        if (!DebugBuild.ENABLED) {
+            return;
+        }
+        if (context == null) {
+            debugSleepLine("debug sleep ignored: process=" + processName + ", reason=" + reason);
+            return;
+        }
+        ClassLoader classLoader = targetClassLoader;
+        if (classLoader == null) {
+            writeDebugSleepStatus("无法获取睡眠数据", "小米健康 ClassLoader 尚未就绪。");
+            debugSleepLine("debug sleep skipped: classLoader null");
+            return;
+        }
+        Object device = getCurrentDeviceModel(classLoader);
+        if (device == null) {
+            writeDebugSleepStatus("无法获取睡眠数据", "当前设备为空，请确认小米健康已连接手环/手表。");
+            debugSleepLine("debug sleep skipped: current device null");
+            return;
+        }
+        updateDeviceModel(device);
+        String did = getCurrentDeviceId(device);
+        if (did == null || did.length() == 0) {
+            writeDebugSleepStatus("无法获取睡眠数据", "当前设备 did 为空。");
+            debugSleepLine("debug sleep skipped: did null");
+            return;
+        }
+        debugSleepLine("debug sleep fetch start process=" + processName
+                + ", reason=" + reason
+                + ", did=" + maskDid(did)
+                + ", device=" + describeDeviceModel(device));
+        writeDebugSleepStatus("正在获取睡眠数据", "设备：" + describeDeviceModel(device)
+                + "\n正在读取本地仓库，并同时尝试 wearable / eco / syncer 直连同步入口。");
+        requestDebugSleepSnapshot(classLoader, did, "before-sync:" + reason);
+        triggerDebugFitnessSyncerSync(classLoader, did, "settings:" + reason);
+        String syncReason = "debug-sleep:" + reason;
+        boolean wearable = triggerWearableDeviceSync(classLoader, did, syncReason + ":wearable", true);
+        boolean eco = triggerEcoDeviceSync(classLoader, did, syncReason + ":eco", true);
+        debugSleepLine("debug sleep sync triggers reason=" + reason
+                + ", wearable=" + wearable
+                + ", eco=" + eco);
+        scheduleDebugSleepFollowUpSnapshots(context, classLoader, did, reason);
+        if (!wearable && !eco) {
+            writeDebugSleepStatus("正在获取睡眠数据", "设备：" + describeDeviceModel(device)
+                    + "\n直接同步入口不可用，已保留 today/history ids 与本地仓库快照。");
+        }
+    }
+
+    private void requestDebugSleepSnapshot(ClassLoader classLoader, String did, String reason) {
+        requestDebugSleepRepositoryReports(classLoader, did, reason);
+        requestDebugLocalFdsSleepIds(classLoader, did, reason);
+        requestDebugTodaySleepIds(classLoader, did, "debug-sleep-today:" + reason);
+        requestDebugHistorySleepIds(classLoader, did, "debug-sleep-history:" + reason);
+    }
+
+    private void scheduleDebugSleepFollowUpSnapshots(final Context context,
+                                                     final ClassLoader classLoader,
+                                                     final String did,
+                                                     final String reason) {
+        if (!DebugBuild.ENABLED || context == null || classLoader == null || did == null || did.length() == 0) {
+            return;
+        }
+        final long[] delays = new long[]{60_000L, 3L * 60L * 1000L, 10L * 60L * 1000L};
+        final Handler handler = new Handler(context.getMainLooper());
+        for (final long delay : delays) {
+            try {
+                handler.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        debugSleepLine("debug sleep follow-up snapshot delayMs=" + delay
+                                + ", reason=" + reason);
+                        requestDebugSleepSnapshot(classLoader, did, "after-sync+" + delay + "ms:" + reason);
+                    }
+                }, delay);
+            } catch (Throwable throwable) {
+                debugSleepLine("debug sleep follow-up schedule failed delayMs=" + delay
+                        + ": " + describeThrowable(throwable));
+            }
+        }
+    }
+
+    private void setDebugSleepProbe(Context context, boolean enabled, String reason) {
+        if (!DebugBuild.ENABLED) {
+            return;
+        }
+        debugSleepProbeEnabled = enabled;
+        debugSleepProbeGeneration++;
+        if (!enabled) {
+            cancelDebugSleepProbeAlarm(context);
+            debugSleepLine("sleep probe stopped reason=" + reason
+                    + ", generation=" + debugSleepProbeGeneration);
+            return;
+        }
+        debugSleepLine("sleep probe started reason=" + reason
+                + ", intervalMs=" + DEBUG_SLEEP_PROBE_INTERVAL_MS
+                + ", generation=" + debugSleepProbeGeneration);
+        triggerDebugSleepFetch(context, "probe-start:" + reason);
+        scheduleDebugSleepProbeAlarm(context, DEBUG_SLEEP_PROBE_INTERVAL_MS, debugSleepProbeGeneration);
+    }
+
+    private void handleDebugSleepProbeAlarm(Context context, Intent intent) {
+        if (!DebugBuild.ENABLED) {
+            return;
+        }
+        int generation = intent == null
+                ? debugSleepProbeGeneration
+                : intent.getIntExtra(EXTRA_SYNC_GENERATION, debugSleepProbeGeneration);
+        if (!debugSleepProbeEnabled || generation != debugSleepProbeGeneration) {
+            debugSleepLine("sleep probe alarm ignored generation=" + generation
+                    + ", current=" + debugSleepProbeGeneration
+                    + ", enabled=" + debugSleepProbeEnabled);
+            return;
+        }
+        debugSleepLine("sleep probe alarm fired generation=" + generation);
+        triggerDebugSleepFetch(context, "probe-alarm");
+        scheduleDebugSleepProbeAlarm(context, DEBUG_SLEEP_PROBE_INTERVAL_MS, generation);
+    }
+
+    private void scheduleDebugSleepProbeAlarm(Context context, long delayMs, int generation) {
+        if (!DebugBuild.ENABLED || context == null || !isMainProcess()) {
+            return;
+        }
+        try {
+            AlarmManager alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+            if (alarmManager == null) {
+                return;
+            }
+            PendingIntent pendingIntent = debugSleepProbePendingIntent(context, generation);
+            alarmManager.cancel(pendingIntent);
+            long triggerAtMs = System.currentTimeMillis() + delayMs;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                alarmManager.setWindow(
+                        AlarmManager.RTC,
+                        triggerAtMs,
+                        DEBUG_SLEEP_PROBE_WINDOW_MS,
+                        pendingIntent);
+            } else {
+                alarmManager.set(AlarmManager.RTC, triggerAtMs, pendingIntent);
+            }
+            debugSleepLine("sleep probe alarm scheduled delayMs=" + delayMs
+                    + ", windowMs=" + DEBUG_SLEEP_PROBE_WINDOW_MS
+                    + ", generation=" + generation
+                    + ", triggerAtMs=" + triggerAtMs);
+        } catch (Throwable throwable) {
+            debugSleepLine("sleep probe alarm schedule failed: " + describeThrowable(throwable));
+        }
+    }
+
+    private void cancelDebugSleepProbeAlarm(Context context) {
+        if (!DebugBuild.ENABLED || context == null || !isMainProcess()) {
+            return;
+        }
+        try {
+            AlarmManager alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+            if (alarmManager != null) {
+                alarmManager.cancel(debugSleepProbePendingIntent(context, debugSleepProbeGeneration));
+            }
+        } catch (Throwable throwable) {
+            debugSleepLine("sleep probe alarm cancel failed: " + describeThrowable(throwable));
+        }
+    }
+
+    private PendingIntent debugSleepProbePendingIntent(Context context, int generation) {
+        Intent intent = new Intent(HeartwithSettings.ACTION_DEBUG_SLEEP_PROBE);
+        intent.setPackage(targetPackage);
+        intent.putExtra(HeartwithSettings.EXTRA_DEBUG_SLEEP_PROBE_ENABLED, true);
+        intent.putExtra(EXTRA_SYNC_GENERATION, generation);
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            flags |= PendingIntent.FLAG_IMMUTABLE;
+        }
+        return PendingIntent.getBroadcast(context, 0x23014337, intent, flags);
+    }
+
+    private void triggerDebugFitnessSyncerSync(ClassLoader classLoader, String did, String reason) {
+        if (!DebugBuild.ENABLED) {
+            return;
+        }
+        if (!isMainProcess()) {
+            debugSleepLine("app-level sync skipped: process=" + processName + ", reason=" + reason);
+            return;
+        }
+        try {
+            Class<?> syncerClass = findClass("com.xiaomi.fit.fitness.sync.export.api.FitnessSyncer", classLoader);
+            Object companion = getStaticObjectField(syncerClass, "INSTANCE", "Companion");
+            Class<?> extClass = findClass("com.xiaomi.fit.fitness.sync.export.di.FitnessSyncExtKt", classLoader);
+            Object syncer = callStaticMethod(extClass, "getInstance", companion);
+            debugSleepLine("app-level sync request triggerDataSync(true), reason=" + reason
+                    + ", syncer=" + describeObjectForDebug(syncer));
+            callMethod(syncer, "triggerDataSync", Boolean.TRUE);
+            if (did != null && did.length() > 0) {
+                debugSleepLine("app-level sync request syncDataAuto(did), reason=" + reason
+                        + ", did=" + maskDid(did));
+                callMethod(syncer, "syncDataAuto", did, null);
+            }
+            debugSleepLine("app-level sync request testDeviceSync(true), reason=" + reason);
+            callMethod(syncer, "testDeviceSync", Boolean.TRUE);
+        } catch (Throwable throwable) {
+            debugSleepLine("app-level sync failed: " + describeThrowable(throwable)
+                    + ", reason=" + reason);
+        }
     }
 
     private boolean triggerWearableDeviceSync(ClassLoader classLoader, String did, String reason, boolean manual) {
@@ -883,12 +1299,13 @@ public final class MiHealthHookModule extends XposedModule {
             Object contact = callStaticMethod(extClass, "getInstance", companion);
             callMethod(contact, "syncDataByWidget", did, Boolean.FALSE);
             if (DebugBuild.ENABLED) {
-                diagLine("direct sync requested: wearable did=" + maskDid(did) + ", reason=" + reason + ", manual=" + manual);
+                debugSyncLine("direct requested: wearable did=" + maskDid(did) + ", reason=" + reason + ", manual=" + manual);
+                requestDebugTodaySleepIds(classLoader, did, "wearable:" + reason);
             }
             return true;
         } catch (Throwable throwable) {
             if (DebugBuild.ENABLED) {
-                diagLine("direct wearable sync unavailable: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+                debugSyncLine("direct wearable unavailable: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
             }
             return false;
         }
@@ -902,12 +1319,13 @@ public final class MiHealthHookModule extends XposedModule {
             Object contact = callStaticMethod(extClass, "getInstance", companion);
             callMethod(contact, "syncData", did, Boolean.FALSE);
             if (DebugBuild.ENABLED) {
-                diagLine("direct sync requested: eco did=" + maskDid(did) + ", reason=" + reason + ", manual=" + manual);
+                debugSyncLine("direct requested: eco did=" + maskDid(did) + ", reason=" + reason + ", manual=" + manual);
+                requestDebugTodaySleepIds(classLoader, did, "eco:" + reason);
             }
             return true;
         } catch (Throwable throwable) {
             if (DebugBuild.ENABLED) {
-                diagLine("direct eco sync unavailable: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+                debugSyncLine("direct eco unavailable: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
             }
             return false;
         }
@@ -1445,11 +1863,35 @@ public final class MiHealthHookModule extends XposedModule {
                     if (HeartwithSettings.ACTION_SYNC_NOW.equals(intent.getAction())) {
                         final boolean manual = intent.getBooleanExtra(HeartwithSettings.EXTRA_SYNC_MANUAL, false);
                         if (!manual && intent.getIntExtra(EXTRA_SYNC_GENERATION, syncScheduleGeneration) != syncScheduleGeneration) {
+                            debugSyncLine("alarm ignored stale generation intent="
+                                    + intent.getIntExtra(EXTRA_SYNC_GENERATION, -1)
+                                    + ", current=" + syncScheduleGeneration);
                             return;
                         }
+                        debugSyncLine("broadcast received manual=" + manual
+                                + ", generation=" + intent.getIntExtra(EXTRA_SYNC_GENERATION, -1));
                         triggerMiHealthSync(context, manual ? "manual" : "alarm", manual);
                         if (!manual) {
                             schedulePeriodicSync(context);
+                        }
+                        return;
+                    }
+                    if (HeartwithSettings.ACTION_DEBUG_SLEEP_NOW.equals(intent.getAction())) {
+                        debugSleepLine("debug sleep broadcast received");
+                        triggerDebugSleepFetch(context, "settings");
+                        return;
+                    }
+                    if (HeartwithSettings.ACTION_DEBUG_SLEEP_PROBE.equals(intent.getAction())) {
+                        if (!DebugBuild.ENABLED) {
+                            return;
+                        }
+                        if (intent.hasExtra(EXTRA_SYNC_GENERATION)) {
+                            handleDebugSleepProbeAlarm(context, intent);
+                        } else {
+                            boolean enabled = intent.getBooleanExtra(
+                                    HeartwithSettings.EXTRA_DEBUG_SLEEP_PROBE_ENABLED,
+                                    false);
+                            setDebugSleepProbe(context, enabled, "settings");
                         }
                         return;
                     }
@@ -1464,6 +1906,19 @@ public final class MiHealthHookModule extends XposedModule {
                             return;
                         }
                         handleHeartRateAlarmWatchdog();
+                        return;
+                    }
+                    if (ACTION_SLEEP_STATUS_POLL.equals(intent.getAction())) {
+                        if (!isWorkerProcess()) {
+                            return;
+                        }
+                        int generation = intent.getIntExtra(
+                                EXTRA_SLEEP_STATUS_GENERATION,
+                                sleepStatusPollGeneration);
+                        if (generation != sleepStatusPollGeneration) {
+                            return;
+                        }
+                        handleSleepStatusPoll(context, "alarm");
                         return;
                     }
                     if (!HeartwithSettings.ACTION_CONFIG_CHANGED.equals(intent.getAction())) {
@@ -1492,7 +1947,10 @@ public final class MiHealthHookModule extends XposedModule {
             };
             IntentFilter filter = new IntentFilter(HeartwithSettings.ACTION_CONFIG_CHANGED);
             filter.addAction(HeartwithSettings.ACTION_SYNC_NOW);
+            filter.addAction(HeartwithSettings.ACTION_DEBUG_SLEEP_NOW);
+            filter.addAction(HeartwithSettings.ACTION_DEBUG_SLEEP_PROBE);
             filter.addAction(ACTION_HEART_RATE_WATCHDOG);
+            filter.addAction(ACTION_SLEEP_STATUS_POLL);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
             } else {
@@ -1520,6 +1978,20 @@ public final class MiHealthHookModule extends XposedModule {
         periodicSyncEnabled = settings.syncEnabled;
         periodicSyncIntervalHours = settings.syncIntervalHours;
         uploader.applySettings(context, settings, reason);
+        if (wasHeartRateHookEnabled != heartRateHookEnabled
+                || wasPeriodicSyncEnabled != periodicSyncEnabled
+                || oldPeriodicSyncIntervalHours != periodicSyncIntervalHours
+                || (reason != null && (reason.contains("warmup") || reason.contains("cache")
+                || reason.contains("settings broadcast")))) {
+            importantLine("settings applied reason=" + reason
+                    + ", process=" + processName
+                    + ", hook=" + heartRateHookEnabled
+                    + ", wasHook=" + wasHeartRateHookEnabled
+                    + ", sync=" + periodicSyncEnabled
+                    + ", intervalHours=" + periodicSyncIntervalHours
+                    + ", worker=" + isWorkerProcess()
+                    + ", main=" + isMainProcess());
+        }
         if (DebugBuild.ENABLED) {
             diagLine("runtime settings applied reason=" + reason
                     + ", process=" + processName
@@ -1529,6 +2001,11 @@ public final class MiHealthHookModule extends XposedModule {
                     + ", intervalHours=" + periodicSyncIntervalHours
                     + ", targetClassLoader=" + (targetClassLoader != null)
                     + ", uptime=" + SystemClock.elapsedRealtime());
+            debugSyncLine("settings applied reason=" + reason
+                    + ", process=" + processName
+                    + ", sync=" + periodicSyncEnabled
+                    + ", intervalHours=" + periodicSyncIntervalHours
+                    + ", main=" + isMainProcess());
         }
         if (isMainProcess() &&
                 (wasPeriodicSyncEnabled != periodicSyncEnabled ||
@@ -1545,6 +2022,11 @@ public final class MiHealthHookModule extends XposedModule {
             started = false;
             noHeartStartAttempts = 0;
             cancelHeartRateAlarmWatchdog(context);
+        }
+        if (settings.hookEnabled) {
+            scheduleSleepStatusPoll(context, reason);
+        } else {
+            cancelSleepStatusPoll(context);
         }
     }
 
@@ -1591,6 +2073,55 @@ public final class MiHealthHookModule extends XposedModule {
         }
     }
 
+    private void registerDeviceChangeReceiver(final Context context) {
+        if (context == null || !deviceChangeReceiverRegistered.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            BroadcastReceiver receiver = new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context receiverContext, Intent intent) {
+                    if (intent == null || !ACTION_DEVICE_CHANGED.equals(intent.getAction())) {
+                        return;
+                    }
+                    if (!isWorkerProcess()) {
+                        return;
+                    }
+                    String did = intent.getStringExtra(EXTRA_DEVICE_DID);
+                    String name = intent.getStringExtra(EXTRA_DEVICE_NAME);
+                    String identity = did == null || did.length() == 0 ? null : "did:" + did;
+                    if (identity != null && identity.equals(lastStartHelperDeviceIdentity)
+                            && hasRecentHeartRateInAnyProcess()) {
+                        if (DebugBuild.ENABLED) {
+                            diagLine("device change ignored: same active device did=" + maskDid(did)
+                                    + ", name=" + name);
+                        }
+                        return;
+                    }
+                    if (DebugBuild.ENABLED) {
+                        diagLine("device change received did=" + maskDid(did)
+                                + ", name=" + name
+                                + ", previous=" + lastStartHelperDeviceIdentity);
+                    }
+                    scheduleRealtimeHrResume("device-changed:sync-start");
+                }
+            };
+            IntentFilter filter = new IntentFilter(ACTION_DEVICE_CHANGED);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                context.registerReceiver(receiver, filter);
+            }
+            if (DebugBuild.ENABLED) {
+                diagLine("device change receiver registered process=" + processName);
+            }
+        } catch (Throwable throwable) {
+            if (DebugBuild.ENABLED) {
+                diagLine("device change receiver failed: " + describeThrowable(throwable));
+            }
+        }
+    }
+
     private void hookHeartRateSinks(final ClassLoader classLoader) {
         hookWearRawHandler(classLoader);
         hookSportPacketHandler(classLoader, "com.xiaomi.fitness.sport.model.LaunchSportModel$DataHandlerImpl");
@@ -1600,6 +2131,7 @@ public final class MiHealthHookModule extends XposedModule {
         hookEcoPacketHandler(classLoader, "com.xiaomi.fitness.sport.model.LaunchSportModel$EcoDataHandlerImpl");
         hookEcoRawHandler(classLoader);
         hookEcoRemoteDataHandler(classLoader);
+        hookSportWearDataSinks(classLoader);
         hookLegacyHuamiHeartRateProfile(classLoader);
         hookOriginalHuamiHeartRateController(classLoader);
         hookOriginalHuamiBleDevice(classLoader);
@@ -1608,11 +2140,2434 @@ public final class MiHealthHookModule extends XposedModule {
         hookHuamiCallback(classLoader, "com.xiaomi.fitness.sport_eco_manager.model.LaunchSportModel$HuamiHrImpl");
         hookHuamiCallback(classLoader, "com.xiaomi.fitness.sport.model.LaunchSportModel$HuamiHrImpl");
         hookHuamiCallback(classLoader, "com.xiaomi.fitness.sport_manager.model.LaunchSportModel$HuamiHrImpl");
+        hookHuamiCallback(classLoader, "com.xiaomi.fitness.sport_manager.state.data.HuamiDataReceive");
         hookHuamiCallback(classLoader, "com.xiaomi.fitness.sport_eco_manager.state.data.HuamiDataReceive");
         hookHuamiCallback(classLoader, "auu");
         hookHuamiCallback(classLoader, "com.xiaomi.hm.health.bt.sdk.HuamiDevice$y");
         hookHuamiCallback(classLoader, "com.xiaomi.fit.device.huami.HuaMiApiCallerImpl$startRealtimeMeasureHr$1");
         hookHuamiCallback(classLoader, "com.xiaomi.wearable.HuamiApiImpl$startRealtimeMeasureHr$1");
+    }
+
+    private void hookSleepDiagnostics(final ClassLoader classLoader) {
+        if (!DebugBuild.ENABLED || !debugSleepHooksInstalled.compareAndSet(false, true)) {
+            return;
+        }
+        debugSleepLine("installing sleep diagnostics process=" + processName);
+        hookSleepParserDiagnostics(classLoader);
+        hookSleepRecorderDiagnostics(classLoader);
+        hookSleepSegmentUtilsDiagnostics(classLoader);
+        hookFitnessSyncFlowDiagnostics(classLoader);
+        hookSleepDirectDeviceSyncDiagnostics(classLoader);
+        hookSleepStorageDiagnostics(classLoader);
+        hookSleepAggregateDiagnostics(classLoader);
+        hookSleepServerDiagnostics(classLoader);
+    }
+
+    private void hookSleepStatus(final ClassLoader classLoader) {
+        if (!sleepStatusHooksInstalled.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            Class<?> dataIdClass = findClass("com.xiaomi.fit.data.common.data.mi.FitnessDataId", classLoader);
+            Class<?> allDayParser = findClass("com.xiaomi.fit.fitness.parser.daily.AllDaySleepParser", classLoader);
+            hookAfter(allDayParser, "schemaParse", new Class<?>[]{dataIdClass, byte[].class}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    publishSleepStatusFromAllDay("all-day-parser", result);
+                }
+            });
+        } catch (Throwable throwable) {
+            if (DebugBuild.ENABLED) {
+                debugSleepLine("sleep status parser hook unavailable: " + describeThrowable(throwable));
+            }
+        }
+        try {
+            Class<?> sleepBizClass = findClass("com.xiaomi.fitness.repo.sleep.SleepBiz", classLoader);
+            hookAfter(sleepBizClass, "splitDailyReport",
+                    new Class<?>[]{String.class, String.class, long.class, java.util.Map.class},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            if (containsSleepRecordKey(chain.getArg(3))) {
+                                publishSleepStatusFromReport("sleep-biz", result);
+                            }
+                        }
+                    });
+        } catch (Throwable throwable) {
+            if (DebugBuild.ENABLED) {
+                debugSleepLine("sleep status report hook unavailable: " + describeThrowable(throwable));
+            }
+        }
+    }
+
+    private void publishSleepStatusFromAllDay(String source, Object sleep) {
+        SleepSnapshot snapshot = sleepSnapshotFromAllDay(source, sleep);
+        if (snapshot == null) {
+            debugSleepStateLine("raw-parse-empty", source, null, "object=" + shortObject(sleep));
+            return;
+        }
+        debugSleepStateLine("raw-parse", source, snapshot, "candidate-mark");
+        markSleepCandidateFromRaw(snapshot);
+        if (HeartwithSleepStatus.STATE_AWAKE.equals(snapshot.state)) {
+            if (isFinalSleepUploaded(snapshot)) {
+                sleepCandidateSeenToday = false;
+                sleepFinalReportRequested = false;
+                debugSleepStateLine("raw-wake-skip", source, snapshot,
+                        "finalAlreadyUploaded key=" + finalSleepKey(snapshot));
+                if (DebugBuild.ENABLED) {
+                    debugSleepLine("sleep raw wake skipped: final already uploaded, key=" + finalSleepKey(snapshot));
+                }
+                return;
+            }
+            debugSleepStateLine("raw-wake", source, snapshot, "submit-raw-and-request-final-report");
+            publishSleepSnapshot(snapshot);
+            requestFinalSleepReportAfterWake("raw-wake:" + source);
+            return;
+        }
+        debugSleepStateLine("raw-active", source, snapshot, "submit-progress");
+        publishSleepSnapshot(snapshot);
+    }
+
+    private void publishSleepStatusFromReport(String source, Object report) {
+        SleepSnapshot snapshot = sleepSnapshotFromReport(source, report);
+        debugSleepStateLine("report-parse", source, snapshot, "object=" + shortObject(report));
+        if (!shouldPublishFinalSleepReport(snapshot, source)) {
+            return;
+        }
+        debugSleepStateLine("report-final", source, snapshot, "submit-final");
+        publishSleepSnapshot(snapshot);
+        markFinalSleepUploaded(snapshot);
+    }
+
+    private void publishSleepSnapshot(SleepSnapshot snapshot) {
+        if (snapshot == null || !heartRateHookEnabled) {
+            debugSleepStateLine("upload-skip", "invalid", snapshot,
+                    "hookEnabled=" + heartRateHookEnabled);
+            return;
+        }
+        long elapsed = SystemClock.elapsedRealtime();
+        String key = snapshot.state + "|" + snapshot.bedAtMs + "|" + snapshot.sleepAtMs + "|"
+                + snapshot.wakeAtMs + "|" + snapshot.goBedAtMs + "|" + snapshot.deviceBedAtMs + "|"
+                + snapshot.leaveBedAtMs + "|" + snapshot.deviceWakeAtMs + "|"
+                + snapshot.durationMinutes + "|" + snapshot.source;
+        if (key.equals(lastSleepStatusKey)
+                && elapsed - lastSleepStatusUploadElapsedMs < SLEEP_STATUS_POLL_INTERVAL_MS) {
+            debugSleepStateLine("upload-skip", "duplicate-window", snapshot,
+                    "ageMs=" + (elapsed - lastSleepStatusUploadElapsedMs));
+            return;
+        }
+        lastSleepStatusKey = key;
+        lastSleepStatusUploadElapsedMs = elapsed;
+        uploader.onSleepStatus(appContext, new HeartwithSleepStatus(
+                snapshot.state,
+                snapshot.observedAtMs,
+                snapshot.bedAtMs,
+                snapshot.sleepAtMs,
+                snapshot.wakeAtMs,
+                snapshot.goBedAtMs,
+                snapshot.deviceBedAtMs,
+                snapshot.leaveBedAtMs,
+                snapshot.deviceWakeAtMs,
+                snapshot.source,
+                snapshot.stable,
+                snapshot.durationMinutes));
+        debugSleepStateLine("upload-submit", "sdk", snapshot, "key=" + key);
+        importantLine("sleep status uploaded state=" + snapshot.state
+                + ", source=" + snapshot.source
+                + ", bed=" + formatEpochMillis(snapshot.bedAtMs)
+                + ", sleep=" + formatEpochMillis(snapshot.sleepAtMs)
+                + ", wake=" + formatEpochMillis(snapshot.wakeAtMs)
+                + ", durationMin=" + snapshot.durationMinutes);
+        if (DebugBuild.ENABLED) {
+            debugSleepLine("sleep status uploaded state=" + snapshot.state
+                    + ", source=" + snapshot.source
+                    + ", bed=" + formatEpochMillis(snapshot.bedAtMs)
+                    + ", sleep=" + formatEpochMillis(snapshot.sleepAtMs)
+                    + ", wake=" + formatEpochMillis(snapshot.wakeAtMs)
+                    + ", goBed=" + formatEpochMillis(snapshot.goBedAtMs)
+                    + ", deviceBed=" + formatEpochMillis(snapshot.deviceBedAtMs)
+                    + ", leaveBed=" + formatEpochMillis(snapshot.leaveBedAtMs)
+                    + ", deviceWake=" + formatEpochMillis(snapshot.deviceWakeAtMs)
+                    + ", durationMin=" + snapshot.durationMinutes);
+        }
+    }
+
+    private SleepSnapshot sleepSnapshotFromAllDay(String source, Object sleep) {
+        Object allDaySleep = allDaySleepObject(sleep);
+        if (allDaySleep == null) {
+            return null;
+        }
+        long goBedMs = secondsToMillis(longInvoke(allDaySleep, "getGoBedTime"));
+        long deviceBedMs = secondsToMillis(longInvoke(allDaySleep, "getDeviceBedTime"));
+        long leaveBedMs = secondsToMillis(longInvoke(allDaySleep, "getLeaveBedTime"));
+        long deviceWakeMs = secondsToMillis(longInvoke(allDaySleep, "getDeviceWakeupTime"));
+        long durationMs = Math.max(0L, longInvoke(allDaySleep, "getLinBedDuration")) * 1000L;
+        long bedAtMs = goBedMs > 0L ? goBedMs : deviceBedMs;
+        long wakeAtMs = deviceWakeMs > 0L ? deviceWakeMs : leaveBedMs;
+        return buildSleepSnapshot(source, bedAtMs, deviceBedMs, wakeAtMs, durationMs,
+                goBedMs, deviceBedMs, leaveBedMs, deviceWakeMs);
+    }
+
+    private Object allDaySleepObject(Object value) {
+        if (value == null) {
+            return null;
+        }
+        Object nested = safeInvokeObject(value, "getAllDaySleepReport");
+        if (looksLikeAllDaySleep(nested)) {
+            return nested;
+        }
+        nested = safeInvokeObject(value, "getAllDaySleep");
+        if (looksLikeAllDaySleep(nested)) {
+            return nested;
+        }
+        nested = safeInvokeObject(value, "getAllDaySleepParseData");
+        if (looksLikeAllDaySleep(nested)) {
+            return nested;
+        }
+        if (looksLikeAllDaySleep(value)) {
+            return value;
+        }
+        return null;
+    }
+
+    private boolean looksLikeAllDaySleep(Object value) {
+        if (value == null) {
+            return false;
+        }
+        return longInvoke(value, "getGoBedTime") > 0L
+                || longInvoke(value, "getDeviceBedTime") > 0L
+                || longInvoke(value, "getLeaveBedTime") > 0L
+                || longInvoke(value, "getDeviceWakeupTime") > 0L
+                || longInvoke(value, "getLinBedDuration") > 0L
+                || booleanInvoke(value, "isSleepFinish");
+    }
+
+    private SleepSnapshot sleepSnapshotFromReport(String source, Object report) {
+        if (report == null) {
+            return null;
+        }
+        Object primarySegment = findPrimarySleepSegment(safeInvokeObject(report, "getSleepSegments"));
+        long bedMs = secondsToMillis(longInvoke(primarySegment, "getBedTime"));
+        long deviceBedMs = secondsToMillis(longInvoke(primarySegment, "getDeviceBedTime"));
+        long goBedMs = firstPositiveMillis(
+                secondsToMillis(longInvoke(primarySegment, "getGoBedTime")),
+                secondsToMillis(longInvoke(report, "getGoBedTime")),
+                bedMs);
+        long wakeMs = secondsToMillis(longInvoke(primarySegment, "getWakeupTime"));
+        long deviceWakeMs = secondsToMillis(longInvoke(primarySegment, "getDeviceWakeupTime"));
+        long leaveBedMs = firstPositiveMillis(
+                secondsToMillis(longInvoke(primarySegment, "getLeaveBedTime")),
+                secondsToMillis(longInvoke(report, "getLeaveBedTime")),
+                wakeMs);
+        long durationMs = Math.max(
+                Math.max(0L, longInvoke(primarySegment, "getSleepDuration")),
+                Math.max(0L, longInvoke(report, "getTotalDuration"))) * 60L * 1000L;
+        long bedAtMs = goBedMs > 0L ? goBedMs : bedMs;
+        long wakeAtMs = deviceWakeMs > 0L ? deviceWakeMs : leaveBedMs;
+        return buildSleepSnapshot(source, bedAtMs, deviceBedMs, wakeAtMs, durationMs,
+                goBedMs, deviceBedMs, leaveBedMs, deviceWakeMs);
+    }
+
+    private SleepSnapshot buildSleepSnapshot(String source,
+                                             long bedAtMs,
+                                             long sleepAtMs,
+                                             long wakeAtMs,
+                                             long durationMs,
+                                             long goBedAtMs,
+                                             long deviceBedAtMs,
+                                             long leaveBedAtMs,
+                                             long deviceWakeAtMs) {
+        long nowMs = System.currentTimeMillis();
+        long latestMs = Math.max(bedAtMs, Math.max(sleepAtMs, wakeAtMs));
+        if (latestMs <= 0L || nowMs - latestMs > SLEEP_STATUS_MAX_AGE_MS) {
+            return null;
+        }
+        String state;
+        boolean stable = false;
+        if (wakeAtMs > 0L) {
+            state = HeartwithSleepStatus.STATE_AWAKE;
+            stable = true;
+        } else if (sleepAtMs > 0L && (durationMs >= SLEEP_STATUS_MIN_SLEEP_MS
+                || nowMs - sleepAtMs >= SLEEP_STATUS_MIN_SLEEP_MS)) {
+            state = HeartwithSleepStatus.STATE_ASLEEP;
+        } else if (bedAtMs > 0L) {
+            state = HeartwithSleepStatus.STATE_IN_BED;
+        } else {
+            return null;
+        }
+        return new SleepSnapshot(
+                state,
+                nowMs,
+                bedAtMs,
+                sleepAtMs,
+                wakeAtMs,
+                goBedAtMs,
+                deviceBedAtMs,
+                leaveBedAtMs,
+                deviceWakeAtMs,
+                source == null ? "mi_health_sleep" : source,
+                stable,
+                Math.max(0L, durationMs / 60_000L));
+    }
+
+    private long firstPositiveMillis(long... values) {
+        if (values == null) {
+            return 0L;
+        }
+        for (long value : values) {
+            if (value > 0L) {
+                return value;
+            }
+        }
+        return 0L;
+    }
+
+    private void markSleepCandidateFromRaw(SleepSnapshot snapshot) {
+        if (snapshot == null) {
+            return;
+        }
+        sleepTrackingDayStartMs = sleepDayStartMillis(snapshot);
+        sleepCandidateSeenToday = true;
+        debugSleepStateLine("candidate-marked", snapshot.source, snapshot,
+                "trackingDay=" + formatEpochMillis(sleepTrackingDayStartMs));
+    }
+
+    private boolean shouldPublishFinalSleepReport(SleepSnapshot snapshot, String source) {
+        if (snapshot == null || !HeartwithSleepStatus.STATE_AWAKE.equals(snapshot.state)) {
+            return false;
+        }
+        if (isFinalSleepUploaded(snapshot)) {
+            debugSleepStateLine("report-final-skip", source, snapshot,
+                    "alreadyUploaded key=" + finalSleepKey(snapshot));
+            if (DebugBuild.ENABLED) {
+                debugSleepLine("sleep final report skipped: already uploaded, source=" + source
+                        + ", key=" + finalSleepKey(snapshot));
+            }
+            return false;
+        }
+        long dayStartMs = sleepDayStartMillis(snapshot);
+        boolean sameSleepDay = sleepTrackingDayStartMs == 0L || sleepTrackingDayStartMs == dayStartMs;
+        boolean allowed = sleepFinalReportRequested
+                || (sleepCandidateSeenToday && sameSleepDay);
+        if (!allowed && isRecentFinalSleepReport(snapshot)) {
+            allowed = true;
+            debugSleepStateLine("report-final-allow", source, snapshot,
+                    "recentStableReportWithoutCandidate");
+        }
+        if (!allowed && DebugBuild.ENABLED) {
+            debugSleepStateLine("report-final-skip", source, snapshot,
+                    "notRequestedOrCandidate");
+            debugSleepLine("sleep final report ignored source=" + source
+                    + ", candidate=" + sleepCandidateSeenToday
+                    + ", requested=" + sleepFinalReportRequested
+                    + ", day=" + dayStartMs
+                    + ", trackingDay=" + sleepTrackingDayStartMs);
+        }
+        return allowed;
+    }
+
+    private boolean isRecentFinalSleepReport(SleepSnapshot snapshot) {
+        if (snapshot == null || !snapshot.stable || snapshot.wakeAtMs <= 0L) {
+            return false;
+        }
+        long nowMs = System.currentTimeMillis();
+        return snapshot.durationMinutes > 0L
+                && nowMs >= snapshot.wakeAtMs
+                && nowMs - snapshot.wakeAtMs <= SLEEP_STATUS_MAX_AGE_MS;
+    }
+
+    private boolean shouldRequestSleepRepository(String reason) {
+        if (sleepFinalReportRequested || sleepCandidateSeenToday) {
+            debugSleepStateLine("repository-allow", reason, null, "candidate-or-final-requested");
+            return true;
+        }
+        debugSleepStateLine("repository-skip", reason, null, "no-candidate");
+        if (DebugBuild.ENABLED) {
+            debugSleepLine("sleep repository skipped: no sleep candidate, reason=" + reason);
+        }
+        return false;
+    }
+
+    private boolean isFinalSleepUploaded(SleepSnapshot snapshot) {
+        String key = finalSleepKey(snapshot);
+        if (key.length() == 0) {
+            return false;
+        }
+        if (key.equals(sleepFinalUploadedKey)) {
+            return true;
+        }
+        Context context = appContext;
+        if (context == null) {
+            return false;
+        }
+        String persisted = context.getSharedPreferences(RUNTIME_PREFS, Context.MODE_PRIVATE)
+                .getString(KEY_SLEEP_FINAL_UPLOADED_KEY, "");
+        if (persisted != null && persisted.equals(key)) {
+            sleepFinalUploadedKey = persisted;
+            return true;
+        }
+        return false;
+    }
+
+    private void markFinalSleepUploaded(SleepSnapshot snapshot) {
+        String key = finalSleepKey(snapshot);
+        if (key.length() == 0) {
+            return;
+        }
+        sleepFinalUploadedKey = key;
+        sleepFinalReportRequested = false;
+        sleepCandidateSeenToday = false;
+        debugSleepStateLine("final-marked", snapshot.source, snapshot, "key=" + key);
+        Context context = appContext;
+        if (context != null) {
+            context.getSharedPreferences(RUNTIME_PREFS, Context.MODE_PRIVATE)
+                    .edit()
+                    .putString(KEY_SLEEP_FINAL_UPLOADED_KEY, key)
+                    .apply();
+        }
+    }
+
+    private String finalSleepKey(SleepSnapshot snapshot) {
+        if (snapshot == null || snapshot.wakeAtMs <= 0L) {
+            return "";
+        }
+        return sleepDayStartMillis(snapshot) + "|"
+                + snapshot.bedAtMs + "|"
+                + snapshot.sleepAtMs + "|"
+                + snapshot.wakeAtMs;
+    }
+
+    private long sleepDayStartMillis(SleepSnapshot snapshot) {
+        long anchor = snapshot == null ? 0L : firstPositiveMillis(
+                snapshot.sleepAtMs,
+                snapshot.bedAtMs,
+                snapshot.wakeAtMs,
+                System.currentTimeMillis());
+        Calendar calendar = Calendar.getInstance();
+        calendar.setTimeInMillis(anchor);
+        calendar.set(Calendar.HOUR_OF_DAY, 0);
+        calendar.set(Calendar.MINUTE, 0);
+        calendar.set(Calendar.SECOND, 0);
+        calendar.set(Calendar.MILLISECOND, 0);
+        return calendar.getTimeInMillis();
+    }
+
+    private void requestFinalSleepReportAfterWake(String reason) {
+        ClassLoader classLoader = targetClassLoader;
+        if (classLoader == null || !isWorkerProcess()) {
+            debugSleepStateLine("final-request-skip", reason, null,
+                    "classLoader=" + (classLoader != null) + ", worker=" + isWorkerProcess());
+            return;
+        }
+        Object device = getCurrentDeviceModel(classLoader);
+        if (device == null) {
+            debugSleepStateLine("final-request-skip", reason, null, "device=null");
+            return;
+        }
+        String did = getCurrentDeviceId(device);
+        if (did == null || did.length() == 0) {
+            debugSleepStateLine("final-request-skip", reason, null, "did=null");
+            return;
+        }
+        sleepFinalReportRequested = true;
+        debugSleepStateLine("final-request", reason, null, "did=" + maskDid(did));
+        requestSleepRepositoryReports(classLoader, did, reason);
+    }
+
+    private long secondsToMillis(long seconds) {
+        return seconds <= 0L ? 0L : seconds * 1000L;
+    }
+
+    private void hookSleepParserDiagnostics(ClassLoader classLoader) {
+        try {
+            Class<?> dataIdClass = findClass("com.xiaomi.fit.data.common.data.mi.FitnessDataId", classLoader);
+            Class<?> parserClass = findClass("com.xiaomi.fit.fitness.parser.FitnessDataParser", classLoader);
+            hookAfter(parserClass, "parseDailyData", new Class<?>[]{byte[].class, int.class, int.class}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    logFitnessParseResult("FitnessDataParser.parseDailyData dailyType=" + chain.getArg(1)
+                            + ", fileType=" + chain.getArg(2), result);
+                }
+            });
+            hookAfter(parserClass, "parse", new Class<?>[]{dataIdClass, byte[].class}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    logFitnessParseResult("FitnessDataParser.parse dataId=" + chain.getArg(0), result);
+                }
+            });
+        } catch (Throwable throwable) {
+            debugSleepLine("parser diagnostics unavailable: " + describeThrowable(throwable));
+        }
+        try {
+            Class<?> binaryDataClass = findClass("com.xiaomi.fit.fitness.parser.data.FitnessBinaryData", classLoader);
+            Class<?> dataIdClass = findClass("com.xiaomi.fit.data.common.data.mi.FitnessDataId", classLoader);
+            Class<?> allDayParser = findClass("com.xiaomi.fit.fitness.parser.daily.AllDaySleepParser", classLoader);
+            hookAfter(allDayParser, "nativeParse", new Class<?>[]{binaryDataClass}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    logFitnessParseResult("AllDaySleepParser.nativeParse", result);
+                }
+            });
+            hookAfter(allDayParser, "schemaParse", new Class<?>[]{dataIdClass, byte[].class}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    Object dataId = chain.getArg(0);
+                    logFitnessParseResult("AllDaySleepParser.schemaParse dataId=" + dataId, result);
+                    publishDebugSleepParseResult("AllDaySleepParser.schemaParse", dataId, result);
+                    maybeScheduleDebugSleepOnlySync(dataId);
+                }
+            });
+        } catch (Throwable throwable) {
+            debugSleepLine("all-day sleep parser diagnostics unavailable: " + describeThrowable(throwable));
+        }
+    }
+
+    private void hookSleepRecorderDiagnostics(ClassLoader classLoader) {
+        try {
+            Class<?> recorderClass = findClass("com.xiaomi.fit.fitness.device.mi.parse.utils.MiParsedDataRecorder", classLoader);
+            Class<?> dataIdClass = findClass("com.xiaomi.fit.data.common.data.mi.FitnessDataId", classLoader);
+            Class<?> allDaySleepClass = findClass("com.xiaomi.fit.fitness.parser.data.AllDaySleepParseData", classLoader);
+            Class<?> continuationClass = findClass("kotlin.coroutines.Continuation", classLoader);
+            hookAfter(recorderClass, "recordSleepSegment",
+                    new Class<?>[]{String.class, dataIdClass, allDaySleepClass, continuationClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("MiParsedDataRecorder.recordSleepSegment sid=" + chain.getArg(0)
+                                    + ", dataId=" + chain.getArg(1)
+                                    + ", sleep=" + describeAllDaySleep(chain.getArg(2))
+                                    + ", result=" + describeCoroutineResult(result));
+                        }
+                    });
+        } catch (Throwable throwable) {
+            debugSleepLine("mi parsed recorder sleep diagnostics unavailable: " + describeThrowable(throwable));
+        }
+        try {
+            Class<?> recorderClass = findClass("com.xiaomi.fit.fitness.device.mi.parse.utils.MiParsedDataRecorder", classLoader);
+            Class<?> dataIdClass = findClass("com.xiaomi.fit.data.common.data.mi.FitnessDataId", classLoader);
+            Class<?> nightSleepClass = findClass("com.xiaomi.fit.fitness.parser.data.NightSleepReport", classLoader);
+            Class<?> daytimeSleepClass = findClass("com.xiaomi.fit.fitness.parser.data.DaytimeSleepReport", classLoader);
+            hookAfter(recorderClass, "recordNightSleepReport",
+                    new Class<?>[]{String.class, dataIdClass, nightSleepClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("MiParsedDataRecorder.recordNightSleepReport sid=" + chain.getArg(0)
+                                    + ", dataId=" + chain.getArg(1)
+                                    + ", report=" + describeNightSleep(chain.getArg(2))
+                                    + ", result=" + result);
+                        }
+                    });
+            hookAfter(recorderClass, "recordDaytimeSleepReport",
+                    new Class<?>[]{String.class, dataIdClass, daytimeSleepClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("MiParsedDataRecorder.recordDaytimeSleepReport sid=" + chain.getArg(0)
+                                    + ", dataId=" + chain.getArg(1)
+                                    + ", report=" + describeDaytimeSleep(chain.getArg(2))
+                                    + ", result=" + result);
+                        }
+                    });
+        } catch (Throwable throwable) {
+            debugSleepLine("legacy sleep recorder diagnostics unavailable: " + describeThrowable(throwable));
+        }
+        try {
+            Class<?> recorderClass = findClass("com.xiaomi.fit.fitness.impl.FitnessDataRecorderImpl", classLoader);
+            Class<?> reportClass = findClass("com.xiaomi.fit.fitness.export.data.item.SleepSegmentReport", classLoader);
+            Class<?> reportArrayClass = Array.newInstance(reportClass, 0).getClass();
+            hookAfter(recorderClass, "recordSleepSegment",
+                    new Class<?>[]{String.class, int.class, boolean.class, reportArrayClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("FitnessDataRecorderImpl.recordSleepSegment array sid=" + chain.getArg(0)
+                                    + ", tz=" + chain.getArg(1)
+                                    + ", complete=" + chain.getArg(2)
+                                    + ", reports=" + describeSleepReports(chain.getArg(3))
+                                    + ", result=" + result);
+                        }
+                    });
+            hookAfter(recorderClass, "recordSleepSegment",
+                    new Class<?>[]{String.class, int.class, reportArrayClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("FitnessDataRecorderImpl.recordSleepSegment default sid=" + chain.getArg(0)
+                                    + ", tz=" + chain.getArg(1)
+                                    + ", reports=" + describeSleepReports(chain.getArg(2))
+                                    + ", result=" + result);
+                        }
+                    });
+            hookAfter(recorderClass, "recordSleepSegment",
+                    new Class<?>[]{String.class, int.class, java.util.List.class},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("FitnessDataRecorderImpl.recordSleepSegment list sid=" + chain.getArg(0)
+                                    + ", tz=" + chain.getArg(1)
+                                    + ", reports=" + describeSleepReports(chain.getArg(2))
+                                    + ", result=" + result);
+                        }
+                    });
+        } catch (Throwable throwable) {
+            debugSleepLine("fitness recorder sleep diagnostics unavailable: " + describeThrowable(throwable));
+        }
+    }
+
+    private void hookSleepSegmentUtilsDiagnostics(ClassLoader classLoader) {
+        try {
+            Class<?> utilsClass = findClass("com.xiaomi.fit.fitness.device.mi.parse.utils.SleepSegmentUtils", classLoader);
+            Class<?> dataIdClass = findClass("com.xiaomi.fit.data.common.data.mi.FitnessDataId", classLoader);
+            Class<?> allDaySleepClass = findClass("com.xiaomi.fit.fitness.parser.data.AllDaySleepParseData", classLoader);
+            Class<?> continuationClass = findClass("kotlin.coroutines.Continuation", classLoader);
+            hookAfter(utilsClass, "computeSleepSegmentReport",
+                    new Class<?>[]{dataIdClass, allDaySleepClass, continuationClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("SleepSegmentUtils.computeSleepSegmentReport dataId=" + chain.getArg(0)
+                                    + ", sleep=" + describeAllDaySleep(chain.getArg(1))
+                                    + ", result=" + describeCoroutineResult(result)
+                                    + ", reports=" + describeSleepReports(result));
+                        }
+                    });
+        } catch (Throwable throwable) {
+            debugSleepLine("sleep segment utils diagnostics unavailable: " + describeThrowable(throwable));
+        }
+    }
+
+    private void hookFitnessSyncFlowDiagnostics(final ClassLoader classLoader) {
+        try {
+            final Class<?> sentCallbackClass =
+                    findClass("com.xiaomi.fit.fitness.device.mi.send.FitnessWearSender$SentCallback", classLoader);
+            Class<?> senderClass = findClass("com.xiaomi.fit.fitness.device.mi.send.FitnessWearSender", classLoader);
+            Class<?> dataIdClass = findClass("com.xiaomi.fit.data.common.data.mi.FitnessDataId", classLoader);
+            Class<?> continuationClass = findClass("kotlin.coroutines.Continuation", classLoader);
+            hookAfter(senderClass, "requestData",
+                    new Class<?>[]{String.class, sentCallbackClass, Boolean.class},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("sync flow requestData did=" + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", isBgAutoSync=" + chain.getArg(2));
+                        }
+                    });
+            hookAfter(senderClass, "requestTodayData",
+                    new Class<?>[]{String.class, sentCallbackClass, Boolean.class},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("sync flow requestTodayData did=" + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", isBgAutoSync=" + chain.getArg(2));
+                        }
+                    });
+            hookAfter(senderClass, "requestHistoryData",
+                    new Class<?>[]{String.class, sentCallbackClass, boolean.class},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("sync flow requestHistoryData did=" + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", hasTodayDataToSync=" + chain.getArg(2));
+                        }
+                    });
+            hookAfter(senderClass, "requestDataIdIfHas",
+                    new Class<?>[]{String.class, byte[].class, boolean.class, sentCallbackClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("sync flow requestDataIdIfHas did=" + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", today=" + chain.getArg(2)
+                                    + ", ids=" + describeFitnessDataIdBytes(classLoader, (byte[]) chain.getArg(1), 16));
+                        }
+                    });
+            hookAfter(senderClass, "sendRequestDataToWear",
+                    new Class<?>[]{String.class, byte[].class, sentCallbackClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("sync flow sendRequestDataToWear did=" + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", selected=" + describeFitnessDataIdBytes(classLoader, (byte[]) chain.getArg(1), 16));
+                        }
+                    });
+            hookAfter(senderClass, "saveDataIdToSynced",
+                    new Class<?>[]{String.class, dataIdClass, boolean.class, continuationClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            Object dataId = chain.getArg(1);
+                            if (!isSleepFitnessDataId(dataId)) {
+                                return;
+                            }
+                            debugSleepLine("sync db saveDataIdToSynced did=" + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", dataId=" + dataId
+                                    + ", forceSync=" + chain.getArg(2)
+                                    + ", result=" + describeCoroutineResult(result)
+                                    + ", stack=" + compactStackTrace(7));
+                        }
+                    });
+        } catch (Throwable throwable) {
+            debugSleepLine("fitness wear sender diagnostics unavailable: " + describeThrowable(throwable));
+        }
+
+        try {
+            Class<?> pbClass = findClass("com.xiaomi.fit.fitness.device.mi.send.FitnessWearPbImpl", classLoader);
+            Class<?> idsCallbackClass =
+                    findClass("com.xiaomi.fit.fitness.sync.export.api.OnGetFitnessIdsCallback", classLoader);
+            Class<?> function1Class = findClass("kotlin.jvm.functions.Function1", classLoader);
+            hookAfter(pbClass, "getTodayFitnessIds",
+                    new Class<?>[]{String.class, Boolean.class, idsCallbackClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("sync pb getTodayFitnessIds did=" + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", isBgAutoSync=" + chain.getArg(1));
+                        }
+                    });
+            hookAfter(pbClass, "getHistoryFitnessIds",
+                    new Class<?>[]{String.class, idsCallbackClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("sync pb getHistoryFitnessIds did=" + maskDid(String.valueOf(chain.getArg(0))));
+                        }
+                    });
+            hookAfter(pbClass, "requestFitnessIds",
+                    new Class<?>[]{String.class, byte[].class, function1Class},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("sync pb requestFitnessIds did=" + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", ids=" + describeFitnessDataIdBytes(classLoader, (byte[]) chain.getArg(1), 16));
+                        }
+                    });
+        } catch (Throwable throwable) {
+            debugSleepLine("fitness pb diagnostics unavailable: " + describeThrowable(throwable));
+        }
+    }
+
+    private void hookSleepStorageDiagnostics(final ClassLoader classLoader) {
+        try {
+            Class<?> headerCompanionClass = findClass("com.xiaomi.fit.data.common.data.mi.FitnessDataHeader$Companion", classLoader);
+            Class<?> dataIdClass = findClass("com.xiaomi.fit.data.common.data.mi.FitnessDataId", classLoader);
+            hookAfter(headerCompanionClass, "getDailyDataId",
+                    new Class<?>[]{byte[].class, int.class, int.class},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            int dailyType = ((Number) chain.getArg(1)).intValue();
+                            if (dailyType != 7 && dailyType != 8) {
+                                return;
+                            }
+                            debugSleepLine("FitnessDataHeader.getDailyDataId dailyType=" + dailyType
+                                    + ", fileType=" + chain.getArg(2)
+                                    + ", header=" + describeBytes((byte[]) chain.getArg(0), 24)
+                                    + ", dataId=" + describeFitnessDataId(result)
+                                    + ", stack=" + compactStackTrace(8));
+                        }
+                    });
+            hookAfter(headerCompanionClass, "parseDataHeader",
+                    new Class<?>[]{dataIdClass, byte[].class},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            Object dataId = chain.getArg(0);
+                            if (!isSleepFitnessDataIdQuiet(dataId)) {
+                                return;
+                            }
+                            debugSleepLine("FitnessDataHeader.parseDataHeader dataId=" + describeFitnessDataId(dataId)
+                                    + ", header=" + describeBytes((byte[]) chain.getArg(1), 32)
+                                    + ", result=" + shortObject(result)
+                                    + ", dataValid=" + describeBytes((byte[]) safeInvokeObject(result, "getDataValid"), 16)
+                                    + ", invalidVersion=" + safeInvoke(result, "getDataInvalidVersion"));
+                        }
+                    });
+        } catch (Throwable throwable) {
+            debugSleepLine("fitness data header diagnostics unavailable: " + describeThrowable(throwable));
+        }
+
+        try {
+            Class<?> updaterClass = findClass("com.xiaomi.fit.fitness.remote.FitnessDBDataUpdater", classLoader);
+            hookAfter(updaterClass, "recordDailyRecord",
+                    new Class<?>[]{String.class, String.class, java.util.List.class, boolean.class, boolean.class},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            String persistKey = String.valueOf(chain.getArg(0));
+                            if (!"sleep".equals(persistKey)) {
+                                return;
+                            }
+                            Object items = chain.getArg(2);
+                            debugSleepLine("sleep db recordDailyRecord sid=" + maskDid(String.valueOf(chain.getArg(1)))
+                                    + ", items=" + describeRecordItems(items, 3)
+                                    + ", allowSwitchProcess=" + chain.getArg(3)
+                                    + ", allowUpdate=" + chain.getArg(4)
+                                    + ", result=" + result
+                                    + ", stack=" + compactStackTrace(10));
+                        }
+                    });
+        } catch (Throwable throwable) {
+            debugSleepLine("sleep db updater diagnostics unavailable: " + describeThrowable(throwable));
+        }
+
+        try {
+            Class<?> baseClass = findClass("com.xiaomi.fit.fitness.device.FitnessDataSyncBaseImpl", classLoader);
+            Class<?> dataIdClass = findClass("com.xiaomi.fit.data.common.data.mi.FitnessDataId", classLoader);
+            Class<?> continuationClass = findClass("kotlin.coroutines.Continuation", classLoader);
+            hookAfter(baseClass, "updateSyncStatus",
+                    new Class<?>[]{String.class, dataIdClass, int.class, boolean.class, continuationClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            Object dataId = chain.getArg(1);
+                            if (!isSleepFitnessDataId(dataId)) {
+                                return;
+                            }
+                            debugSleepLine("sync db updateSyncStatus did=" + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", dataId=" + dataId
+                                    + ", status=" + chain.getArg(2)
+                                    + ", forceSync=" + chain.getArg(3)
+                                    + ", result=" + describeCoroutineResult(result)
+                                    + ", stack=" + compactStackTrace(7));
+                        }
+                    });
+            hookAfter(baseClass, "deleteSyncStatus",
+                    new Class<?>[]{String.class, dataIdClass, int.class, continuationClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            Object dataId = chain.getArg(1);
+                            if (!isSleepFitnessDataId(dataId)) {
+                                return;
+                            }
+                            debugSleepLine("sync db deleteSyncStatus did=" + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", dataId=" + dataId
+                                    + ", status=" + chain.getArg(2)
+                                    + ", result=" + describeCoroutineResult(result)
+                                    + ", stack=" + compactStackTrace(7));
+                        }
+                    });
+        } catch (Throwable throwable) {
+            debugSleepLine("sync db status diagnostics unavailable: " + describeThrowable(throwable));
+        }
+
+        try {
+            Class<?> utilsClass = findClass("com.xiaomi.fit.fitness.persist.db.utils.FitnessFDSDataDaoUtils", classLoader);
+            Class<?> dataIdClass = findClass("com.xiaomi.fit.data.common.data.mi.FitnessDataId", classLoader);
+            hookAfter(utilsClass, "recordFDSDataIdToDB",
+                    new Class<?>[]{String.class, dataIdClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            Object dataId = chain.getArg(1);
+                            if (!isSleepFitnessDataIdQuiet(dataId)) {
+                                return;
+                            }
+                            debugSleepLine("sleep fds recordFDSDataIdToDB sid=" + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", dataId=" + describeFitnessDataId(dataId)
+                                    + ", result=" + result
+                                    + ", stack=" + compactStackTrace(8));
+                        }
+                    });
+            hookAfter(utilsClass, "getDailyFDSIds",
+                    new Class<?>[]{String.class, int.class, long.class},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            int dailyType = ((Number) chain.getArg(1)).intValue();
+                            if (dailyType != 7 && dailyType != 8) {
+                                return;
+                            }
+                            debugSleepLine("sleep fds getDailyFDSIds sid=" + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", dailyType=" + dailyType
+                                    + ", since=" + chain.getArg(2)
+                                    + ", result=" + describeFdsEntities(classLoader, result, 12));
+                        }
+                    });
+        } catch (Throwable throwable) {
+            debugSleepLine("sleep fds dao diagnostics unavailable: " + describeThrowable(throwable));
+        }
+
+        try {
+            Class<?> uploaderClass = findClass("com.xiaomi.fit.fitness.persist.SleepDataFDSUploader", classLoader);
+            Class<?> dataIdClass = findClass("com.xiaomi.fit.data.common.data.mi.FitnessDataId", classLoader);
+            hookAfter(uploaderClass, "uploadSleepSrcData",
+                    new Class<?>[]{String.class, dataIdClass, String.class, byte[].class},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("SleepDataFDSUploader.uploadSleepSrcData sid=" + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", dataId=" + describeFitnessDataId(chain.getArg(1))
+                                    + ", fileName=" + safeString(String.valueOf(chain.getArg(2)))
+                                    + ", sleepData=" + describeBytes((byte[]) chain.getArg(3), 32)
+                                    + ", result=" + result
+                                    + ", stack=" + compactStackTrace(8));
+                        }
+                    });
+        } catch (Throwable throwable) {
+            debugSleepLine("sleep fds uploader diagnostics unavailable: " + describeThrowable(throwable));
+        }
+
+        try {
+            Class<?> syncerClass = findClass("com.xiaomi.fitness.sleep.MiuiSleepSyncer", classLoader);
+            Class<?> reportClass = findClass("com.xiaomi.sleep.provider.SleepReport", classLoader);
+            hookAfter(syncerClass, "onReceiveMiuiSleep",
+                    new Class<?>[]{reportClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("miui phone sleep onReceiveMiuiSleep report="
+                                    + shortObject(chain.getArg(0))
+                                    + ", result=" + result
+                                    + ", stack=" + compactStackTrace(8));
+                        }
+                    });
+        } catch (Throwable throwable) {
+            debugSleepLine("miui phone sleep diagnostics unavailable: " + describeThrowable(throwable));
+        }
+    }
+
+    private void hookSleepDirectDeviceSyncDiagnostics(final ClassLoader classLoader) {
+        try {
+            Class<?> receiverClass = findClass("com.xiaomi.fit.fitness.device.mi.receive.FitnessDataReceiver", classLoader);
+            hookAfter(receiverClass, "onReceive", new Class<?>[]{byte[].class}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    byte[] data = (byte[]) chain.getArg(0);
+                    debugSleepLine("direct sync FitnessDataReceiver.onReceive sid="
+                            + maskDid(String.valueOf(getFieldValueQuietly(chain.getThisObject(), "sid")))
+                            + ", chunk=" + describeFitnessSyncChunk(data)
+                            + ", current=" + getFieldValueQuietly(chain.getThisObject(), "mCurrentCount")
+                            + "/" + getFieldValueQuietly(chain.getThisObject(), "mTotalCount")
+                            + ", totalBytes=" + getFieldValueQuietly(chain.getThisObject(), "mTotalBytes"));
+                }
+            });
+            hookAfter(receiverClass, "merge", new Class<?>[]{}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    debugSleepLine("direct sync FitnessDataReceiver.merge sid="
+                            + maskDid(String.valueOf(getFieldValueQuietly(chain.getThisObject(), "sid")))
+                            + ", totalBytes=" + getFieldValueQuietly(chain.getThisObject(), "mTotalBytes")
+                            + ", segments=" + describeListShort(getFieldValueQuietly(chain.getThisObject(), "mSegments"), 3));
+                }
+            });
+        } catch (Throwable throwable) {
+            debugSleepLine("direct sync FitnessDataReceiver diagnostics unavailable: " + describeThrowable(throwable));
+        }
+
+        try {
+            Class<?> managerClass = findClass("com.xiaomi.fit.fitness.device.mi.FitnessDeviceSyncManager", classLoader);
+            Class<?> dataIdClass = findClass("com.xiaomi.fit.data.common.data.mi.FitnessDataId", classLoader);
+            Class<?> callbackClass = findFirstClass(classLoader, "hfa", "defpackage.hfa");
+            Class<?> continuationClass = findClass("kotlin.coroutines.Continuation", classLoader);
+            hookAfter(managerClass, "startSyncWithDevice$fitness_sync_chinaProductRelease",
+                    new Class<?>[]{String.class, callbackClass, Boolean.class},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("direct sync FitnessDeviceSyncManager.startSyncWithDevice sid="
+                                    + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", isBgAutoSync=" + chain.getArg(2)
+                                    + ", result=" + result);
+                        }
+                    });
+            hookAfter(managerClass, "syncWithDevice",
+                    new Class<?>[]{String.class, byte[].class, callbackClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("direct sync FitnessDeviceSyncManager.syncWithDevice sid="
+                                    + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", ids=" + describeFitnessDataIdBytes(classLoader, (byte[]) chain.getArg(1), 16)
+                                    + ", result=" + result);
+                        }
+                    });
+            hookAfter(managerClass, "syncTheData",
+                    new Class<?>[]{String.class, dataIdClass, byte[].class},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            Object dataId = chain.getArg(1);
+                            debugSleepLine("direct sync FitnessDeviceSyncManager.syncTheData sid="
+                                    + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", dataId=" + describeFitnessDataId(dataId)
+                                    + ", sleep=" + isSleepFitnessDataIdQuiet(dataId)
+                                    + ", data=" + describeBytes((byte[]) chain.getArg(2), 32)
+                                    + ", result=" + result);
+                        }
+                    });
+            hookAfter(managerClass, "parseTheFitnessData",
+                    new Class<?>[]{String.class, dataIdClass, byte[].class, continuationClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            Object dataId = chain.getArg(1);
+                            if (!isSleepFitnessDataIdQuiet(dataId)) {
+                                return;
+                            }
+                            debugSleepLine("direct sync FitnessDeviceSyncManager.parseTheFitnessData sid="
+                                    + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", dataId=" + describeFitnessDataId(dataId)
+                                    + ", data=" + describeBytes((byte[]) chain.getArg(2), 32)
+                                    + ", result=" + describeCoroutineResult(result));
+                        }
+                    });
+            hookAfter(managerClass, "parseBinaryData",
+                    new Class<?>[]{String.class, dataIdClass, byte[].class, continuationClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            Object dataId = chain.getArg(1);
+                            if (!isSleepFitnessDataIdQuiet(dataId)) {
+                                return;
+                            }
+                            debugSleepLine("direct sync FitnessDeviceSyncManager.parseBinaryData sid="
+                                    + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", dataId=" + describeFitnessDataId(dataId)
+                                    + ", data=" + describeBytes((byte[]) chain.getArg(2), 32)
+                                    + ", result=" + describeCoroutineResult(result));
+                        }
+                    });
+            hookAfter(managerClass, "onParseSuccess",
+                    new Class<?>[]{String.class, dataIdClass, int.class, continuationClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            Object dataId = chain.getArg(1);
+                            if (!isSleepFitnessDataIdQuiet(dataId)) {
+                                return;
+                            }
+                            debugSleepLine("direct sync FitnessDeviceSyncManager.onParseSuccess sid="
+                                    + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", dataId=" + describeFitnessDataId(dataId)
+                                    + ", code=" + chain.getArg(2)
+                                    + ", result=" + describeCoroutineResult(result));
+                        }
+                    });
+        } catch (Throwable throwable) {
+            debugSleepLine("direct sync FitnessDeviceSyncManager diagnostics unavailable: " + describeThrowable(throwable));
+        }
+
+        try {
+            Class<?> processorClass = findClass("com.xiaomi.fit.fitness.device.mi.parse.FitnessDataProcessor", classLoader);
+            Class<?> dataIdClass = findClass("com.xiaomi.fit.data.common.data.mi.FitnessDataId", classLoader);
+            Class<?> continuationClass = findClass("kotlin.coroutines.Continuation", classLoader);
+            hookAfter(processorClass, "parseAndRecord",
+                    new Class<?>[]{String.class, dataIdClass, byte[].class, continuationClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            Object dataId = chain.getArg(1);
+                            if (!isSleepFitnessDataIdQuiet(dataId)) {
+                                return;
+                            }
+                            debugSleepLine("direct sync FitnessDataProcessor.parseAndRecord sid="
+                                    + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", dataId=" + describeFitnessDataId(dataId)
+                                    + ", data=" + describeBytes((byte[]) chain.getArg(2), 32)
+                                    + ", result=" + describeCoroutineResult(result));
+                        }
+                    });
+        } catch (Throwable throwable) {
+            debugSleepLine("direct sync FitnessDataProcessor diagnostics unavailable: " + describeThrowable(throwable));
+        }
+
+        try {
+            Class<?> remoteClass = findClass("com.xiaomi.fit.fitness.remote.FitnessSyncRemoteImpl", classLoader);
+            hookAfter(remoteClass, "triggerDataSync", new Class<?>[]{boolean.class}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    debugSleepLine("direct sync triggerDataSync manualForce=" + chain.getArg(0)
+                            + ", result=" + result
+                            + ", stack=" + compactStackTrace(8));
+                }
+            });
+            hookAfter(remoteClass, "triggerDataSyncByWidget", new Class<?>[]{boolean.class}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    debugSleepLine("direct sync triggerDataSyncByWidget manualForce=" + chain.getArg(0)
+                            + ", result=" + result
+                            + ", stack=" + compactStackTrace(8));
+                }
+            });
+        } catch (Throwable throwable) {
+            debugSleepLine("direct sync remote diagnostics unavailable: " + describeThrowable(throwable));
+        }
+
+        try {
+            Class<?> contactClass = findClass("com.xiaomi.fitness.device.contact.DeviceContactImpl", classLoader);
+            Class<?> modelClass = findClass("com.xiaomi.fitness.device.manager.export.WearableDeviceModel", classLoader);
+            Class<?> callbackClass = findClass("com.xiaomi.fitness.device.contact.export.DeviceSyncCallback", classLoader);
+            Class<?> handlerClass = findClass("com.xiaomi.fitness.device.contact.export.DataHandlerWrapper", classLoader);
+            Class<?> packetClass = findClass("ixs", classLoader);
+            Class<?> onSyncCallbackClass = findClass("com.xiaomi.fitness.device.contact.export.OnSyncCallback", classLoader);
+            Class<?> stateListenerClass = findClass("com.xiaomi.fitness.device.contact.export.SyncStateListener", classLoader);
+
+            hookAfter(contactClass, "syncData", new Class<?>[]{String.class, boolean.class}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    debugSleepLine("direct sync DeviceContact.syncData did=" + maskDid(String.valueOf(chain.getArg(0)))
+                            + ", isAuto=" + chain.getArg(1)
+                            + ", result=" + result);
+                }
+            });
+            hookAfter(contactClass, "syncData", new Class<?>[]{modelClass, boolean.class, callbackClass}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    Object device = chain.getArg(0);
+                    debugSleepLine("direct sync DeviceContact.syncData model=" + describeDirectSyncDevice(device)
+                            + ", isAuto=" + chain.getArg(1)
+                            + ", callback=" + shortObject(chain.getArg(2))
+                            + ", result=" + result);
+                }
+            });
+            hookAfter(contactClass, "syncDataAtFixRate", new Class<?>[]{String.class}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    debugSleepLine("direct sync DeviceContact.syncDataAtFixRate did=" + maskDid(String.valueOf(chain.getArg(0)))
+                            + ", result=" + result);
+                }
+            });
+            hookAfter(contactClass, "syncDataAtFixRate", new Class<?>[]{modelClass}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    debugSleepLine("direct sync DeviceContact.syncDataAtFixRate model="
+                            + describeDirectSyncDevice(chain.getArg(0))
+                            + ", result=" + result);
+                }
+            });
+            hookAfter(contactClass, "addDataHandler", new Class<?>[]{int.class, handlerClass}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    debugSleepLine("direct sync DeviceContact.addDataHandler type=" + chain.getArg(0)
+                            + ", handler=" + shortObject(chain.getArg(1)));
+                }
+            });
+            hookAfter(contactClass, "call", new Class<?>[]{String.class, packetClass, boolean.class, onSyncCallbackClass, int.class}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    debugSleepLine("direct sync DeviceContact.call packet did=" + maskDid(String.valueOf(chain.getArg(0)))
+                            + ", packet=" + describePacketObject(chain.getArg(1))
+                            + ", needResponse=" + chain.getArg(2)
+                            + ", timeout=" + chain.getArg(4)
+                            + ", result=" + result);
+                }
+            });
+            hookAfter(contactClass, "call", new Class<?>[]{String.class, int.class, byte[].class, boolean.class, onSyncCallbackClass, int.class}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    debugSleepLine("direct sync DeviceContact.call raw did=" + maskDid(String.valueOf(chain.getArg(0)))
+                            + ", type=" + chain.getArg(1)
+                            + ", data=" + describeBytes((byte[]) chain.getArg(2), 32)
+                            + ", needResponse=" + chain.getArg(3)
+                            + ", timeout=" + chain.getArg(5)
+                            + ", result=" + result);
+                }
+            });
+            hookAfter(contactClass, "sendFile",
+                    new Class<?>[]{String.class, int.class, int.class, String.class, int.class, stateListenerClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("direct sync DeviceContact.sendFile did=" + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", type=" + chain.getArg(1)
+                                    + ", detailType=" + chain.getArg(2)
+                                    + ", path=" + chain.getArg(3)
+                                    + ", segmentLength=" + chain.getArg(4)
+                                    + ", result=" + result);
+                        }
+                    });
+        } catch (Throwable throwable) {
+            debugSleepLine("direct sync DeviceContact diagnostics unavailable: " + describeThrowable(throwable));
+        }
+
+        try {
+            Class<?> observersClass = findClass("com.xiaomi.fitness.device.contact.SyncObservers", classLoader);
+            Class<?> callbackClass = findClass("com.xiaomi.fitness.device.contact.export.DeviceSyncCallback", classLoader);
+            Class<?> syncerClass = findClass("com.xiaomi.fitness.device.contact.export.DeviceSyncer", classLoader);
+            Class<?> modelClass = findClass("com.xiaomi.fitness.device.manager.export.WearableDeviceModel", classLoader);
+            hookAfter(observersClass, "addSyncer", new Class<?>[]{syncerClass}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    debugSleepLine("direct sync SyncObservers.addSyncer syncer=" + shortObject(chain.getArg(0)));
+                }
+            });
+            hookAfter(observersClass, "syncData", new Class<?>[]{String.class, callbackClass}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    debugSleepLine("direct sync SyncObservers.syncData did=" + maskDid(String.valueOf(chain.getArg(0)))
+                            + ", callback=" + shortObject(chain.getArg(1))
+                            + ", syncers=" + describeListShort(safeInvokeObject(chain.getThisObject(), "getMSyncers"), 8)
+                            + ", injectSyncers=" + describeListShort(safeInvokeObject(chain.getThisObject(), "getInjectSyncers"), 8)
+                            + ", result=" + result);
+                }
+            });
+            hookAfter(observersClass, "dispatchResult", new Class<?>[]{String.class, int.class, boolean.class, Object.class}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    debugSleepLine("direct sync SyncObservers.dispatchResult did=" + maskDid(String.valueOf(chain.getArg(0)))
+                            + ", type=" + chain.getArg(1)
+                            + ", success=" + chain.getArg(2)
+                            + ", obj=" + shortObject(chain.getArg(3)));
+                }
+            });
+            hookAfter(observersClass, "onStart", new Class<?>[]{modelClass}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    Object model = chain.getArg(0);
+                    debugSleepLine("direct sync SyncObservers.onStart model=" + describeDirectSyncDevice(model));
+                    notifyDeviceChangedFromSync(model);
+                }
+            });
+            hookAfter(observersClass, "onFinish", new Class<?>[]{modelClass, int.class}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    debugSleepLine("direct sync SyncObservers.onFinish model=" + describeDirectSyncDevice(chain.getArg(0))
+                            + ", code=" + chain.getArg(1));
+                }
+            });
+        } catch (Throwable throwable) {
+            debugSleepLine("direct sync observer diagnostics unavailable: " + describeThrowable(throwable));
+        }
+
+        try {
+            Class<?> engineClass = findClass("com.xiaomi.fitness.device.contact.remote.DeviceContactEngineImpl", classLoader);
+            Class<?> binderHandlerClass = findFirstClass(classLoader, "c06", "defpackage.c06");
+            Class<?> callbackClass = findClass("com.xiaomi.fitness.device.contact.export.a", classLoader);
+            Class<?> fileCallbackClass = findFirstClass(classLoader, "iod", "defpackage.iod");
+            hookAfter(engineClass, "addDataHandler", new Class<?>[]{binderHandlerClass}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    debugSleepLine("direct sync Engine.addDataHandler binder=" + shortObject(chain.getArg(0)));
+                }
+            });
+            hookAfter(engineClass, "getDataHandler", new Class<?>[]{String.class}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    debugSleepLine("direct sync Engine.getDataHandler did=" + maskDid(String.valueOf(chain.getArg(0)))
+                            + ", result=" + shortObject(result));
+                }
+            });
+            hookAfter(engineClass, "removeDataHandler", new Class<?>[]{String.class}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    debugSleepLine("direct sync Engine.removeDataHandler did=" + maskDid(String.valueOf(chain.getArg(0))));
+                }
+            });
+            hookAfter(engineClass, "callTimeoutWithData",
+                    new Class<?>[]{String.class, int.class, byte[].class, boolean.class, callbackClass, int.class},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("direct sync Engine.callTimeoutWithData did=" + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", type=" + chain.getArg(1)
+                                    + ", data=" + describeBytes((byte[]) chain.getArg(2), 32)
+                                    + ", needResponse=" + chain.getArg(3)
+                                    + ", timeout=" + chain.getArg(5)
+                                    + ", result=" + result);
+                        }
+                    });
+            hookAfter(engineClass, "sendFile",
+                    new Class<?>[]{String.class, int.class, int.class, String.class, int.class, fileCallbackClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("direct sync Engine.sendFile did=" + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", type=" + chain.getArg(1)
+                                    + ", detailType=" + chain.getArg(2)
+                                    + ", path=" + chain.getArg(3)
+                                    + ", segmentLength=" + chain.getArg(4)
+                                    + ", result=" + result);
+                        }
+                    });
+        } catch (Throwable throwable) {
+            debugSleepLine("direct sync engine diagnostics unavailable: " + describeThrowable(throwable));
+        }
+
+        try {
+            Class<?> adapterClass = findClass("com.xiaomi.fitness.device.contact.DeviceDataHandlerAdapter", classLoader);
+            hookAfter(adapterClass, "handleDataInternal", new Class<?>[]{String.class, int.class, byte[].class}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    debugSleepLine("direct sync adapter.handleData did=" + maskDid(String.valueOf(chain.getArg(0)))
+                            + ", type=" + chain.getArg(1)
+                            + ", data=" + describeBytes((byte[]) chain.getArg(2), 32)
+                            + ", handled=" + result);
+                }
+            });
+            hookAfter(adapterClass, "handlePacketInternal", new Class<?>[]{String.class, int.class, byte[].class}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    debugSleepLine("direct sync adapter.handlePacket did=" + maskDid(String.valueOf(chain.getArg(0)))
+                            + ", type=" + chain.getArg(1)
+                            + ", data=" + describeBytes((byte[]) chain.getArg(2), 32)
+                            + ", handled=" + result);
+                }
+            });
+        } catch (Throwable throwable) {
+            debugSleepLine("direct sync adapter diagnostics unavailable: " + describeThrowable(throwable));
+        }
+
+        try {
+            Class<?> bleHandlerClass = findClass("com.xiaomi.fitness.sync.BleDataHandler", classLoader);
+            Class<?> packetClass = findFirstClass(classLoader, "ixs", "defpackage.ixs");
+            hookAfter(bleHandlerClass, "handlePacket", new Class<?>[]{String.class, int.class, packetClass}, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    debugSleepLine("direct sync BleDataHandler.handlePacket did=" + maskDid(String.valueOf(chain.getArg(0)))
+                            + ", type=" + chain.getArg(1)
+                            + ", packet=" + describePacketObject(chain.getArg(2))
+                            + ", handled=" + result);
+                }
+            });
+        } catch (Throwable throwable) {
+            debugSleepLine("direct sync BleDataHandler diagnostics unavailable: " + describeThrowable(throwable));
+        }
+    }
+
+    private String describeDirectSyncDevice(Object device) {
+        if (device == null) {
+            return "null";
+        }
+        return "Device{did=" + maskDid(String.valueOf(safeInvokeObject(device, "getDid")))
+                + ", name=" + describeDeviceModel(device)
+                + ", connected=" + safeInvoke(device, "getIsDeviceConnected")
+                + ", status=" + safeInvoke(device, "getDeviceStatus")
+                + ", class=" + device.getClass().getName()
+                + "}";
+    }
+
+    private String describePacketObject(Object packet) {
+        if (packet == null) {
+            return "null";
+        }
+        return "Packet{class=" + packet.getClass().getName()
+                + ", type=" + safeInvoke(packet, "getType")
+                + ", e=" + safeField(packet, "e")
+                + ", payload=" + describePacketPayload(packet)
+                + ", text=" + shortObject(packet)
+                + "}";
+    }
+
+    private String describePacketPayload(Object packet) {
+        if (packet == null) {
+            return "null";
+        }
+        String[] methods = {"G", "H", "I", "K", "M", "N", "toByteArray", "getData", "getPayload"};
+        for (String method : methods) {
+            Object value = safeInvokeObject(packet, method);
+            if (value instanceof byte[]) {
+                return method + "=" + describeBytes((byte[]) value, 32);
+            }
+        }
+        return "unknown";
+    }
+
+    private String describeBytes(byte[] bytes, int maxBytes) {
+        if (bytes == null) {
+            return "null";
+        }
+        int count = Math.min(bytes.length, Math.max(0, maxBytes));
+        StringBuilder builder = new StringBuilder("bytes(len=").append(bytes.length).append(", head=");
+        for (int i = 0; i < count; i++) {
+            int value = bytes[i] & 0xff;
+            if (value < 0x10) {
+                builder.append('0');
+            }
+            builder.append(Integer.toHexString(value));
+        }
+        if (bytes.length > count) {
+            builder.append("...");
+        }
+        return builder.append(')').toString();
+    }
+
+    private String describeFitnessSyncChunk(byte[] bytes) {
+        if (bytes == null) {
+            return "null";
+        }
+        String header = "";
+        if (bytes.length >= 4) {
+            int total = littleEndianU16(bytes, 0);
+            int sequence = littleEndianU16(bytes, 2);
+            header = "total=" + total + ", sequence=" + sequence + ", ";
+        }
+        return "Chunk{" + header + describeBytes(bytes, 24) + "}";
+    }
+
+    private int littleEndianU16(byte[] bytes, int offset) {
+        if (bytes == null || bytes.length < offset + 2) {
+            return -1;
+        }
+        return (bytes[offset] & 0xff) | ((bytes[offset + 1] & 0xff) << 8);
+    }
+
+    private String describeFitnessDataId(Object dataId) {
+        if (dataId == null) {
+            return "null";
+        }
+        byte[] bytes = fitnessDataIdBytesQuiet(dataId);
+        return "FitnessDataId{dataType=" + safeInvoke(dataId, "getDataType")
+                + ", dailyType=" + safeInvoke(dataId, "getDailyType")
+                + ", sportType=" + safeInvoke(dataId, "getSportType")
+                + ", fileType=" + safeInvoke(dataId, "getFileType")
+                + ", time=" + safeInvoke(dataId, "getTimeStamp")
+                + ", tz=" + safeInvoke(dataId, "getTzOffsetInSec")
+                + ", version=" + safeInvoke(dataId, "getVersion")
+                + ", bytes=" + (bytes == null ? "null" : hex(bytes))
+                + ", text=" + shortObject(dataId)
+                + "}";
+    }
+
+    private String describeFieldList(Object target, String fieldName) {
+        Object value = getFieldValueQuietly(target, fieldName);
+        if (value == null) {
+            return "null";
+        }
+        return describeListShort(value, 8);
+    }
+
+    private String safeField(Object target, String fieldName) {
+        Object value = getFieldValueQuietly(target, fieldName);
+        return value == null ? "null" : safeString(String.valueOf(value));
+    }
+
+    private void hookSleepAggregateDiagnostics(final ClassLoader classLoader) {
+        try {
+            Class<?> dataTypeClass = findClass("com.xiaomi.fit.fitness.export.data.annotation.HomeDataType", classLoader);
+            Class<?> reportClass = findClass("com.xiaomi.fit.fitness.export.data.aggregation.DailyBasicReport", classLoader);
+            Class<?> reportArrayClass = Array.newInstance(reportClass, 0).getClass();
+            Class<?> proxyClass = findClass("com.xiaomi.fitness.aggregation.health.dao.FitnessDailyReportDaoProxy", classLoader);
+            hookAfter(proxyClass, "insert",
+                    new Class<?>[]{dataTypeClass, reportArrayClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            Object dataType = chain.getArg(0);
+                            if (!isSleepHomeDataType(dataType)) {
+                                return;
+                            }
+                            debugSleepLine("daily aggregate insert dataType=" + dataType
+                                    + ", reports=" + describeDailyBasicReports(chain.getArg(1), 4)
+                                    + ", result=" + result
+                                    + ", stack=" + compactStackTrace(10));
+                        }
+                    });
+        } catch (Throwable throwable) {
+            debugSleepLine("sleep aggregate dao diagnostics unavailable: " + describeThrowable(throwable));
+        }
+
+        try {
+            Class<?> dataTypeClass = findClass("com.xiaomi.fit.fitness.export.data.annotation.HomeDataType", classLoader);
+            Class<?> utilsClass = findClass("com.xiaomi.fit.fitness.persist.db.utils.DailyRecordDaoUtils", classLoader);
+            hookAfter(utilsClass, "requestFromServer",
+                    new Class<?>[]{dataTypeClass, long.class, Long.class},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            Object dataType = chain.getArg(0);
+                            if (!isSleepHomeDataType(dataType)) {
+                                return;
+                            }
+                            debugSleepLine("daily aggregate requestFromServer dataType=" + dataType
+                                    + ", start=" + chain.getArg(1)
+                                    + ", end=" + chain.getArg(2)
+                                    + ", result=" + result
+                                    + ", stack=" + compactStackTrace(8));
+                        }
+                    });
+        } catch (Throwable throwable) {
+            debugSleepLine("sleep aggregate server-request diagnostics unavailable: " + describeThrowable(throwable));
+        }
+
+        try {
+            Class<?> sleepBizClass = findClass("com.xiaomi.fitness.repo.sleep.SleepBiz", classLoader);
+            Class<?> relativeDataModelClass =
+                    findClass("com.xiaomi.fit.fitness.persist.server.data.RelativeDataModel", classLoader);
+            hookAfter(sleepBizClass, "convertServerAggregateReport",
+                    new Class<?>[]{long.class, String.class, relativeDataModelClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("SleepBiz.convertServerAggregateReport time=" + chain.getArg(0)
+                                    + ", viewTag=" + chain.getArg(1)
+                                    + ", dataModel=" + describeRelativeDataModel(chain.getArg(2))
+                                    + ", result=" + describeAllDaySleepReport(result)
+                                    + ", stack=" + compactStackTrace(8));
+                        }
+                    });
+            hookAfter(sleepBizClass, "splitDailyReport",
+                    new Class<?>[]{String.class, String.class, long.class, java.util.Map.class},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            Object itemMap = chain.getArg(3);
+                            if (!containsSleepRecordKey(itemMap)) {
+                                return;
+                            }
+                            debugSleepLine("SleepBiz.splitDailyReport sid=" + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", viewTag=" + chain.getArg(1)
+                                    + ", time=" + chain.getArg(2)
+                                    + ", keys=" + describeMapKeys(itemMap)
+                                    + ", result=" + describeAllDaySleepReport(result)
+                                    + ", stack=" + compactStackTrace(8));
+                        }
+                    });
+        } catch (Throwable throwable) {
+            debugSleepLine("sleep biz aggregate diagnostics unavailable: " + describeThrowable(throwable));
+        }
+    }
+
+    private void hookSleepServerDiagnostics(final ClassLoader classLoader) {
+        try {
+            Class<?> requestClass = findClass("com.xiaomi.fit.fitness.persist.server.FitnessDataRequest", classLoader);
+            Class<?> continuationClass = findClass("kotlin.coroutines.Continuation", classLoader);
+            Class<?> aggregateTimeParamClass =
+                    findClass("com.xiaomi.fit.fitness.persist.dailyreport.bean.AggregateFitnessDataByTimeParam", classLoader);
+            hookAfter(requestClass, "getAggregatedDataByTime",
+                    new Class<?>[]{aggregateTimeParamClass, continuationClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            Object param = chain.getArg(0);
+                            if (!looksSleepRelated(param)) {
+                                return;
+                            }
+                            debugSleepLine("server getAggregatedDataByTime param=" + shortObject(param)
+                                    + ", result=" + describeCoroutineResult(result));
+                        }
+                    });
+            hookAfter(requestClass, "getAggregatedDataByWM",
+                    new Class<?>[]{String.class, long.class, int.class, continuationClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            String tag = String.valueOf(chain.getArg(0));
+                            if (!containsSleepText(tag)) {
+                                return;
+                            }
+                            debugSleepLine("server getAggregatedDataByWM tag=" + tag
+                                    + ", watermark=" + chain.getArg(1)
+                                    + ", limit=" + chain.getArg(2)
+                                    + ", result=" + describeCoroutineResult(result));
+                        }
+                    });
+            Class<?> latestModelClass =
+                    findClass("com.xiaomi.fit.fitness.persist.server.data.LatestFitnessDataModel", classLoader);
+            hookAfter(requestClass, "getLatestFitnessData",
+                    new Class<?>[]{java.util.List.class, continuationClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            Object requestDataList = chain.getArg(0);
+                            if (!looksSleepRelated(requestDataList)) {
+                                return;
+                            }
+                            debugSleepLine("server getLatestFitnessData request=" + describeListShort(requestDataList, 6)
+                                    + ", result=" + describeCoroutineResult(result));
+                        }
+                    });
+            Class<?> fitnessTimeParamClass =
+                    findClass("com.xiaomi.fit.fitness.persist.server.data.GetFitnessDataByTime", classLoader);
+            hookAfter(requestClass, "getFitnessDataByTime",
+                    new Class<?>[]{fitnessTimeParamClass, continuationClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            Object param = chain.getArg(0);
+                            if (!looksSleepRelated(param)) {
+                                return;
+                            }
+                            debugSleepLine("server getFitnessDataByTime param=" + shortObject(param)
+                                    + ", result=" + describeCoroutineResult(result));
+                        }
+                    });
+            hookAfter(requestClass, "getFitnessDataByWM",
+                    new Class<?>[]{long.class, continuationClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("server getFitnessDataByWM watermark=" + chain.getArg(0)
+                                    + ", result=" + describeCoroutineResult(result));
+                        }
+                    });
+            if (latestModelClass == null) {
+                debugSleepLine("server diagnostics impossible: latestModelClass null");
+            }
+        } catch (Throwable throwable) {
+            debugSleepLine("sleep server diagnostics unavailable: " + describeThrowable(throwable));
+        }
+    }
+
+    private void maybeScheduleDebugSleepOnlySync(Object dataId) {
+        if (!DebugBuild.ENABLED || dataId == null || !isSleepFitnessDataId(dataId)) {
+            return;
+        }
+        final byte[] dataIdBytes = fitnessDataIdBytes(dataId);
+        if (dataIdBytes == null || dataIdBytes.length != 7) {
+            debugSleepLine("sleep-only candidate ignored: invalid dataId bytes, dataId=" + dataId);
+            return;
+        }
+        int hash = Arrays.hashCode(dataIdBytes);
+        long elapsed = SystemClock.elapsedRealtime();
+        if (lastDebugSleepOnlySyncElapsedMs > 0L
+                && elapsed - lastDebugSleepOnlySyncElapsedMs < DEBUG_SLEEP_ONLY_SYNC_MIN_GAP_MS
+                && hash == lastDebugSleepOnlySyncHash) {
+            debugSleepLine("sleep-only candidate skipped: recent same dataId=" + dataId
+                    + ", ageMs=" + (elapsed - lastDebugSleepOnlySyncElapsedMs));
+            return;
+        }
+        if (!debugSleepOnlySyncPending.compareAndSet(false, true)) {
+            debugSleepLine("sleep-only candidate skipped: pending exists dataId=" + dataId);
+            return;
+        }
+        lastDebugSleepOnlySyncElapsedMs = elapsed;
+        lastDebugSleepOnlySyncHash = hash;
+        debugSleepLine("sleep-only candidate captured dataId=" + dataId
+                + ", bytes=" + hex(dataIdBytes)
+                + ", delayMs=" + DEBUG_SLEEP_ONLY_SYNC_DELAY_MS);
+        WORKER.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Thread.sleep(DEBUG_SLEEP_ONLY_SYNC_DELAY_MS);
+                    ClassLoader classLoader = targetClassLoader;
+                    if (classLoader == null) {
+                        debugSleepLine("sleep-only sync skipped: classLoader null");
+                        return;
+                    }
+                    Object device = getCurrentDeviceModel(classLoader);
+                    String did = getCurrentDeviceId(device);
+                    if (did == null || did.length() == 0) {
+                        debugSleepLine("sleep-only sync skipped: current did null");
+                        return;
+                    }
+                    triggerDebugSleepOnlySync(classLoader, did, dataIdBytes);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    debugSleepLine("sleep-only sync interrupted");
+                } catch (Throwable throwable) {
+                    debugSleepLine("sleep-only sync failed: " + describeThrowable(throwable));
+                } finally {
+                    debugSleepOnlySyncPending.set(false);
+                }
+            }
+        });
+    }
+
+    private boolean isSleepFitnessDataId(Object dataId) {
+        try {
+            Object dataType = callMethod(dataId, "getDataType");
+            Object dailyType = callMethod(dataId, "getDailyType");
+            int daily = dailyType instanceof Number ? ((Number) dailyType).intValue() : -1;
+            return dataType instanceof Number
+                    && ((Number) dataType).intValue() == 0
+                    && (daily == 7 || daily == 8);
+        } catch (Throwable throwable) {
+            debugSleepLine("sleep-only candidate inspect failed: " + describeThrowable(throwable)
+                    + ", dataId=" + dataId);
+            return false;
+        }
+    }
+
+    private boolean isSleepFitnessDataIdQuiet(Object dataId) {
+        try {
+            Object dataType = callMethod(dataId, "getDataType");
+            Object dailyType = callMethod(dataId, "getDailyType");
+            int daily = dailyType instanceof Number ? ((Number) dailyType).intValue() : -1;
+            return dataType instanceof Number
+                    && ((Number) dataType).intValue() == 0
+                    && (daily == 7 || daily == 8);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private byte[] fitnessDataIdBytes(Object dataId) {
+        try {
+            Object bytes = callMethod(dataId, "toByteArray");
+            if (bytes instanceof byte[]) {
+                return (byte[]) bytes;
+            }
+        } catch (Throwable throwable) {
+            debugSleepLine("sleep-only candidate toByteArray failed: " + describeThrowable(throwable));
+        }
+        return null;
+    }
+
+    private byte[] fitnessDataIdBytesQuiet(Object dataId) {
+        try {
+            Object bytes = callMethod(dataId, "toByteArray");
+            if (bytes instanceof byte[]) {
+                return (byte[]) bytes;
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private void triggerDebugSleepOnlySync(ClassLoader classLoader, String did, byte[] dataIdBytes) throws Exception {
+        Class<?> syncerClass = findClass("com.xiaomi.fit.fitness.sync.export.api.FitnessSyncer", classLoader);
+        Object companion = getStaticObjectField(syncerClass, "INSTANCE", "Companion");
+        Class<?> extClass = findClass("com.xiaomi.fit.fitness.sync.export.di.FitnessSyncExtKt", classLoader);
+        Object syncer = callStaticMethod(extClass, "getInstance", companion);
+        Object callback = newDebugSleepOnlySyncCallback(classLoader, did, dataIdBytes);
+        debugSleepLine("sleep-only sync request did=" + maskDid(did)
+                + ", bytes=" + hex(dataIdBytes)
+                + ", syncer=" + describeObjectForDebug(syncer));
+        callMethod(syncer, "syncData", did, dataIdBytes, callback);
+    }
+
+    private Object newDebugSleepOnlySyncCallback(ClassLoader classLoader, final String did, final byte[] dataIdBytes)
+            throws ClassNotFoundException {
+        Class<?> callbackClass = findClass("com.xiaomi.fitness.device.contact.export.DeviceSyncCallback", classLoader);
+        return Proxy.newProxyInstance(classLoader, new Class<?>[]{callbackClass}, new InvocationHandler() {
+            @Override
+            public Object invoke(Object proxy, Method method, Object[] args) {
+                String name = method.getName();
+                if ("toString".equals(name)) {
+                    return "HeartwithSleepOnlySyncCallback";
+                }
+                if ("hashCode".equals(name)) {
+                    return System.identityHashCode(proxy);
+                }
+                if ("equals".equals(name)) {
+                    return proxy == (args == null || args.length == 0 ? null : args[0]);
+                }
+                debugSleepLine("sleep-only sync callback method=" + name
+                        + ", did=" + maskDid(did)
+                        + ", bytes=" + hex(dataIdBytes)
+                        + ", args=" + describeArgs(args));
+                if (!"onSyncSuccess".equals(name)) {
+                    writeDebugSleepStatus("睡眠同步状态：" + name, describeArgs(args));
+                }
+                return null;
+            }
+        });
+    }
+
+    private void requestDebugTodaySleepIds(final ClassLoader classLoader, final String did, final String reason) {
+        if (!DebugBuild.ENABLED || did == null || did.length() == 0) {
+            return;
+        }
+        if (!isWorkerProcess()) {
+            debugSleepLine("today sleep ids skipped: process=" + processName + ", reason=" + reason);
+            return;
+        }
+        final boolean diagnosticOnly = isDebugSleepSyncReason(reason);
+        if (!debugTodaySleepIdsPending.compareAndSet(false, true)) {
+            debugSleepLine("today sleep ids skipped: pending exists, reason=" + reason);
+            if (!diagnosticOnly) {
+                writeDebugSleepStatus("正在获取睡眠数据", "已有睡眠请求正在执行，请稍候。");
+            }
+            return;
+        }
+        if (!diagnosticOnly) {
+            writeDebugSleepStatus("正在获取睡眠数据", "正在向小米健康请求今天的 fitness ids。");
+        }
+        WORKER.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Object pbApi = newWearFitnessPbApi(classLoader);
+                    Object callback = newDebugTodayIdsCallback(classLoader, did, "wear", reason);
+                    debugSleepLine("today sleep ids request api=wear, did=" + maskDid(did)
+                            + ", reason=" + reason
+                            + ", pb=" + describeObjectForDebug(pbApi));
+                    callMethod(pbApi, "getTodayFitnessIds", did, Boolean.TRUE, callback);
+                } catch (Throwable wearThrowable) {
+                    debugSleepLine("today sleep ids wear request failed: " + describeThrowable(wearThrowable)
+                            + ", reason=" + reason);
+                    try {
+                        Object pbApi = newEcoFitnessPbApi(classLoader);
+                        Object callback = newDebugTodayIdsCallback(classLoader, did, "eco", reason);
+                        debugSleepLine("today sleep ids request api=eco, did=" + maskDid(did)
+                                + ", reason=" + reason
+                                + ", pb=" + describeObjectForDebug(pbApi));
+                        callMethod(pbApi, "getTodayFitnessIds", did, Boolean.TRUE, callback);
+                    } catch (Throwable ecoThrowable) {
+                        debugSleepLine("today sleep ids eco request failed: " + describeThrowable(ecoThrowable)
+                                + ", reason=" + reason);
+                        writeDebugSleepStatus("获取睡眠失败", "请求 today fitness ids 失败："
+                                + describeThrowable(ecoThrowable));
+                        debugTodaySleepIdsPending.set(false);
+                    }
+                }
+            }
+        });
+    }
+
+    private void requestTodaySleepIds(final ClassLoader classLoader, final String did, final String reason) {
+        if (did == null || did.length() == 0 || !isWorkerProcess()) {
+            debugSleepStateLine("raw-ids-skip", reason, null,
+                    "did=" + maskDid(did) + ", worker=" + isWorkerProcess());
+            return;
+        }
+        if (!sleepStatusTodayIdsPending.compareAndSet(false, true)) {
+            debugSleepStateLine("raw-ids-skip", reason, null, "pending=true");
+            return;
+        }
+        debugSleepStateLine("raw-ids-request", reason, null, "api=wear, did=" + maskDid(did));
+        WORKER.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Object pbApi = newWearFitnessPbApi(classLoader);
+                    Object callback = newTodaySleepIdsCallback(classLoader, did, "wear", reason);
+                    callMethod(pbApi, "getTodayFitnessIds", did, Boolean.TRUE, callback);
+                } catch (Throwable wearThrowable) {
+                    debugSleepStateLine("raw-ids-request-fallback", reason, null,
+                            "wearFailed=" + describeThrowable(wearThrowable) + ", api=eco");
+                    try {
+                        Object pbApi = newEcoFitnessPbApi(classLoader);
+                        Object callback = newTodaySleepIdsCallback(classLoader, did, "eco", reason);
+                        callMethod(pbApi, "getTodayFitnessIds", did, Boolean.TRUE, callback);
+                    } catch (Throwable ecoThrowable) {
+                        sleepStatusTodayIdsPending.set(false);
+                        debugSleepStateLine("raw-ids-request-failed", reason, null,
+                                "ecoFailed=" + describeThrowable(ecoThrowable));
+                        requestSleepRepositoryReports(classLoader, did, "raw-ids-request-failed:" + reason);
+                        if (DebugBuild.ENABLED) {
+                            debugSleepLine("sleep status today ids failed: " + describeThrowable(ecoThrowable));
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    private Object newTodaySleepIdsCallback(final ClassLoader classLoader,
+                                            final String did,
+                                            final String api,
+                                            final String reason)
+            throws ClassNotFoundException {
+        Class<?> callbackClass = findClass("com.xiaomi.fit.fitness.sync.export.api.OnGetFitnessIdsCallback", classLoader);
+        return Proxy.newProxyInstance(classLoader, new Class<?>[]{callbackClass}, new InvocationHandler() {
+            @Override
+            public Object invoke(Object proxy, Method method, Object[] args) {
+                String name = method.getName();
+                if ("toString".equals(name)) {
+                    return "HeartwithSleepStatusIdsCallback";
+                }
+                if ("hashCode".equals(name)) {
+                    return System.identityHashCode(proxy);
+                }
+                if ("equals".equals(name)) {
+                    return proxy == (args == null || args.length == 0 ? null : args[0]);
+                }
+                try {
+                    if ("onSuccess".equals(name)) {
+                        byte[] rawIds = args != null && args.length > 0 && args[0] instanceof byte[]
+                                ? (byte[]) args[0]
+                                : null;
+                        byte[] sleepIds = filterSleepDataIds(classLoader, rawIds);
+                        int rawLen = rawIds == null ? 0 : rawIds.length;
+                        int rawCount = rawIds == null ? 0 : rawIds.length / 7;
+                        int rawTrailing = rawIds == null ? 0 : rawIds.length % 7;
+                        int sleepCount = sleepIds == null ? 0 : sleepIds.length / 7;
+                        debugSleepStateLine("raw-ids-success", api + ":" + reason, null,
+                                "rawLen=" + rawLen
+                                        + ", rawCount=" + rawCount
+                                        + ", trailing=" + rawTrailing
+                                        + ", sleepCount=" + sleepCount
+                                        + ", sleepBytes=" + hex(sleepIds));
+                        if (sleepIds != null && sleepIds.length > 0) {
+                            triggerSleepOnlySync(classLoader, did, sleepIds, api + ":" + reason);
+                        } else {
+                            debugSleepStateLine("raw-ids-empty", api + ":" + reason, null,
+                                    "fallback=repository");
+                            requestSleepRepositoryReports(classLoader, did, "raw-ids-empty:" + api + ":" + reason);
+                        }
+                    } else if ("onError".equals(name)) {
+                        debugSleepStateLine("raw-ids-error", api + ":" + reason, null,
+                                "args=" + describeArgs(args));
+                        requestSleepRepositoryReports(classLoader, did, "raw-ids-error:" + api + ":" + reason);
+                        if (DebugBuild.ENABLED) {
+                            debugSleepLine("sleep status ids error api=" + api + ", args=" + describeArgs(args));
+                        }
+                    }
+                } catch (Throwable throwable) {
+                    debugSleepStateLine("raw-ids-callback-failed", api + ":" + reason, null,
+                            describeThrowable(throwable));
+                    requestSleepRepositoryReports(classLoader, did, "raw-ids-callback-failed:" + api + ":" + reason);
+                    if (DebugBuild.ENABLED) {
+                        debugSleepLine("sleep status ids callback failed: " + describeThrowable(throwable));
+                    }
+                } finally {
+                    if ("onSuccess".equals(name) || "onError".equals(name)) {
+                        sleepStatusTodayIdsPending.set(false);
+                    }
+                }
+                return null;
+            }
+        });
+    }
+
+    private void triggerSleepOnlySync(ClassLoader classLoader, String did, byte[] dataIdBytes, String reason) throws Exception {
+        if (dataIdBytes == null || dataIdBytes.length == 0) {
+            debugSleepStateLine("raw-sync-skip", reason, null, "ids=0");
+            return;
+        }
+        Class<?> syncerClass = findClass("com.xiaomi.fit.fitness.sync.export.api.FitnessSyncer", classLoader);
+        Object companion = getStaticObjectField(syncerClass, "INSTANCE", "Companion");
+        Class<?> extClass = findClass("com.xiaomi.fit.fitness.sync.export.di.FitnessSyncExtKt", classLoader);
+        Object syncer = callStaticMethod(extClass, "getInstance", companion);
+        Object callback = newSleepOnlySyncCallback(classLoader, did, reason);
+        callMethod(syncer, "syncData", did, dataIdBytes, callback);
+        debugSleepStateLine("raw-sync-request", reason, null,
+                "did=" + maskDid(did) + ", ids=" + dataIdBytes.length / 7);
+        if (DebugBuild.ENABLED) {
+            debugSleepLine("sleep status sync requested did=" + maskDid(did)
+                    + ", ids=" + dataIdBytes.length / 7
+                    + ", reason=" + reason);
+        }
+    }
+
+    private Object newSleepOnlySyncCallback(ClassLoader classLoader, final String did, final String reason)
+            throws ClassNotFoundException {
+        Class<?> callbackClass = findClass("com.xiaomi.fitness.device.contact.export.DeviceSyncCallback", classLoader);
+        return Proxy.newProxyInstance(classLoader, new Class<?>[]{callbackClass}, new InvocationHandler() {
+            @Override
+            public Object invoke(Object proxy, Method method, Object[] args) {
+                if (DebugBuild.ENABLED && !"toString".equals(method.getName())
+                        && !"hashCode".equals(method.getName())
+                        && !"equals".equals(method.getName())) {
+                    debugSleepLine("sleep status sync callback method=" + method.getName()
+                            + ", did=" + maskDid(did)
+                            + ", reason=" + reason
+                            + ", args=" + describeArgs(args));
+                }
+                if ("toString".equals(method.getName())) {
+                    return "HeartwithSleepStatusSyncCallback";
+                }
+                if ("hashCode".equals(method.getName())) {
+                    return System.identityHashCode(proxy);
+                }
+                if ("equals".equals(method.getName())) {
+                    return proxy == (args == null || args.length == 0 ? null : args[0]);
+                }
+                if ("onError".equals(method.getName())) {
+                    debugSleepStateLine("raw-sync-error", reason, null,
+                            "did=" + maskDid(did) + ", args=" + describeArgs(args));
+                    requestSleepRepositoryReports(classLoader, did, "raw-sync-error:" + reason);
+                }
+                return null;
+            }
+        });
+    }
+
+    private void requestSleepRepositoryReports(final ClassLoader classLoader,
+                                               final String did,
+                                               final String reason) {
+        if (did == null || did.length() == 0) {
+            debugSleepStateLine("repository-skip", reason, null, "did=null");
+            return;
+        }
+        if (!shouldRequestSleepRepository(reason)) {
+            return;
+        }
+        if (!sleepStatusRepositoryPending.compareAndSet(false, true)) {
+            debugSleepStateLine("repository-skip", reason, null, "pending=true");
+            return;
+        }
+        debugSleepStateLine("repository-request", reason, null, "did=" + maskDid(did));
+        WORKER.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Class<?> repoManagerClass = findClass("com.xiaomi.fitness.repo.RepositoryManager", classLoader);
+                    Class<?> sleepRepoClass =
+                            findClass("com.xiaomi.fit.fitness.export.api.repository.ISleepRepository", classLoader);
+                    Object repoManager = newInstance(repoManagerClass);
+                    Object sleepRepo = callMethod(repoManager, "getRepository", sleepRepoClass);
+                    long beginInSecond = todayStartSeconds();
+                    Object reports = callMethod(sleepRepo, "getDailyReportListSync",
+                            did, beginInSecond, 10, 1);
+                    Object latest = selectLatestSleepReport(reports);
+                    debugSleepStateLine("repository-result", reason, null,
+                            "latest=" + describeAllDaySleepReport(latest));
+                    publishSleepStatusFromReport("sleep-repository", latest);
+                    if (DebugBuild.ENABLED) {
+                        debugSleepLine("sleep status repository reason=" + reason
+                                + ", latest=" + describeAllDaySleepReport(latest));
+                    }
+                } catch (Throwable throwable) {
+                    debugSleepStateLine("repository-failed", reason, null, describeThrowable(throwable));
+                    if (DebugBuild.ENABLED) {
+                        debugSleepLine("sleep status repository failed: " + describeThrowable(throwable));
+                    }
+                } finally {
+                    sleepStatusRepositoryPending.set(false);
+                }
+            }
+        });
+    }
+
+    private void requestDebugHistorySleepIds(final ClassLoader classLoader, final String did, final String reason) {
+        if (!DebugBuild.ENABLED || did == null || did.length() == 0) {
+            return;
+        }
+        if (!isWorkerProcess()) {
+            debugSleepLine("history sleep ids skipped: process=" + processName + ", reason=" + reason);
+            return;
+        }
+        WORKER.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Object pbApi = newWearFitnessPbApi(classLoader);
+                    Object callback = newDebugTodayIdsCallback(classLoader, did, "wear-history", reason);
+                    debugSleepLine("history sleep ids request api=wear, did=" + maskDid(did)
+                            + ", reason=" + reason
+                            + ", pb=" + describeObjectForDebug(pbApi));
+                    callMethod(pbApi, "getHistoryFitnessIds", did, callback);
+                } catch (Throwable wearThrowable) {
+                    debugSleepLine("history sleep ids wear request failed: " + describeThrowable(wearThrowable)
+                            + ", reason=" + reason);
+                    try {
+                        Object pbApi = newEcoFitnessPbApi(classLoader);
+                        Object callback = newDebugTodayIdsCallback(classLoader, did, "eco-history", reason);
+                        debugSleepLine("history sleep ids request api=eco, did=" + maskDid(did)
+                                + ", reason=" + reason
+                                + ", pb=" + describeObjectForDebug(pbApi));
+                        callMethod(pbApi, "getHistoryFitnessIds", did, callback);
+                    } catch (Throwable ecoThrowable) {
+                        debugSleepLine("history sleep ids eco request failed: " + describeThrowable(ecoThrowable)
+                                + ", reason=" + reason);
+                    }
+                }
+            }
+        });
+    }
+
+    private void requestDebugSleepRepositoryReports(final ClassLoader classLoader,
+                                                    final String did,
+                                                    final String reason) {
+        if (!DebugBuild.ENABLED || did == null || did.length() == 0) {
+            return;
+        }
+        if (!debugSleepRepositoryPending.compareAndSet(false, true)) {
+            debugSleepLine("sleep repository skipped: pending exists, reason=" + reason);
+            return;
+        }
+        WORKER.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Class<?> repoManagerClass = findClass("com.xiaomi.fitness.repo.RepositoryManager", classLoader);
+                    Class<?> sleepRepoClass =
+                            findClass("com.xiaomi.fit.fitness.export.api.repository.ISleepRepository", classLoader);
+                    Object repoManager = newInstance(repoManagerClass);
+                    Object sleepRepo = callMethod(repoManager, "getRepository", sleepRepoClass);
+                    long beginInSecond = todayStartSeconds();
+                    Object reports = callMethod(sleepRepo, "getDailyReportListSync",
+                            did, beginInSecond, 10, 1);
+                    Object latest = selectLatestSleepReport(reports);
+                    debugSleepLine("sleep repository result did=" + maskDid(did)
+                            + ", reason=" + reason
+                            + ", reports=" + describeSleepAllDayReports(reports)
+                            + ", latest=" + describeAllDaySleepReport(latest));
+                    if (latest != null) {
+                        writeDebugSleepStatus(debugSleepReportSummary(latest),
+                                debugSleepReportDetails("ISleepRepository.getDailyReportListSync", latest));
+                        requestDebugCandidateSleepIds(classLoader, did, "repository-latest:" + reason, latest);
+                    } else {
+                        writeDebugSleepStatus("本地暂无睡眠报告",
+                                "小米健康本地睡眠仓库最近 10 天没有可用睡眠报告。\n"
+                                        + "已同时触发小米健康同步；如果刚睡醒，请等待同步完成后再点一次。");
+                    }
+                } catch (Throwable throwable) {
+                    debugSleepLine("sleep repository failed: " + describeThrowable(throwable)
+                            + ", reason=" + reason);
+                    writeDebugSleepStatus("读取睡眠仓库失败", describeThrowable(throwable));
+                } finally {
+                    debugSleepRepositoryPending.set(false);
+                }
+            }
+        });
+    }
+
+    private void requestDebugLocalFdsSleepIds(final ClassLoader classLoader,
+                                             final String did,
+                                             final String reason) {
+        if (!DebugBuild.ENABLED || did == null || did.length() == 0) {
+            return;
+        }
+        if (!isWorkerProcess()) {
+            debugSleepLine("local fds sleep skipped: process=" + processName + ", reason=" + reason);
+            return;
+        }
+        WORKER.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Class<?> utilsClass =
+                            findClass("com.xiaomi.fit.fitness.persist.db.utils.FitnessFDSDataDaoUtils", classLoader);
+                    Object utils = getStaticObjectField(utilsClass, "INSTANCE");
+                    long since = todayStartSeconds() - 10L * 86_400L;
+                    ByteArrayOutputStream output = new ByteArrayOutputStream();
+                    for (int dailyType : new int[]{7, 8}) {
+                        Object entities = callMethod(utils, "getDailyFDSIds", did, dailyType, since);
+                        debugSleepLine("local fds sleep query did=" + maskDid(did)
+                                + ", reason=" + reason
+                                + ", dailyType=" + dailyType
+                                + ", since=" + since
+                                + ", result=" + describeFdsEntities(classLoader, entities, 20));
+                        appendFdsEntityIdBytes(output, entities);
+                    }
+                    byte[] ids = output.toByteArray();
+                    if (ids.length > 0) {
+                        debugSleepLine("local fds sleep exact ids direct request did=" + maskDid(did)
+                                + ", reason=" + reason
+                                + ", ids=" + describeFitnessDataIdBytes(classLoader, ids, 24)
+                                + ", note=local cache only; not auto-requesting device");
+                    }
+                } catch (Throwable throwable) {
+                    debugSleepLine("local fds sleep query failed: " + describeThrowable(throwable)
+                            + ", reason=" + reason);
+                }
+            }
+        });
+    }
+
+    private void requestDebugCandidateSleepIds(final ClassLoader classLoader,
+                                               final String did,
+                                               final String reason,
+                                               final Object report) {
+        if (!DebugBuild.ENABLED || did == null || did.length() == 0) {
+            return;
+        }
+        if (!isWorkerProcess()) {
+            debugSleepLine("candidate sleep ids skipped: process=" + processName + ", reason=" + reason);
+            return;
+        }
+        WORKER.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    byte[] candidates = buildDebugSleepCandidateIds(report);
+                    if (candidates == null || candidates.length == 0) {
+                        debugSleepLine("candidate sleep ids skipped: empty, reason=" + reason);
+                        return;
+                    }
+                    debugSleepLine("candidate sleep ids direct request did=" + maskDid(did)
+                            + ", reason=" + reason
+                            + ", candidates=" + describeFitnessDataIdBytes(classLoader, candidates, 24));
+                    triggerDebugSleepOnlySync(classLoader, did, candidates);
+                } catch (Throwable throwable) {
+                    debugSleepLine("candidate sleep ids request failed: " + describeThrowable(throwable)
+                            + ", reason=" + reason);
+                }
+            }
+        });
+    }
+
+    private byte[] buildDebugSleepCandidateIds(Object report) {
+        ByteArrayOutputStream output = new ByteArrayOutputStream(7 * 24);
+        List<Long> timestamps = new ArrayList<>();
+        addPositiveUniqueTimestamp(timestamps, todayStartSeconds());
+        addPositiveUniqueTimestamp(timestamps, todayStartSeconds() - 86_400L);
+        addPositiveUniqueTimestamp(timestamps, todayStartSeconds() - 172_800L);
+        Object primarySegment = report == null ? null : findPrimarySleepSegment(safeInvokeObject(report, "getSleepSegments"));
+        addPositiveUniqueTimestamp(timestamps, longInvoke(primarySegment, "getWakeupTime"));
+        addPositiveUniqueTimestamp(timestamps, longInvoke(primarySegment, "getDeviceWakeupTime"));
+        addPositiveUniqueTimestamp(timestamps, longInvoke(report, "getTime"));
+        int tzIn15Min = currentTimeZoneIn15Min();
+        for (Long timestamp : timestamps) {
+            long ts = timestamp == null ? 0L : timestamp;
+            for (int dailyType : new int[]{7, 8}) {
+                for (int version = 1; version <= 6; version++) {
+                    byte[] id = fitnessDataIdBytes(ts, tzIn15Min, version, dailyType, 0);
+                    output.write(id, 0, id.length);
+                }
+            }
+        }
+        return output.toByteArray();
+    }
+
+    private void addPositiveUniqueTimestamp(List<Long> timestamps, long value) {
+        if (value <= 0L) {
+            return;
+        }
+        for (Long existing : timestamps) {
+            if (existing != null && existing.longValue() == value) {
+                return;
+            }
+        }
+        timestamps.add(value);
+    }
+
+    private int currentTimeZoneIn15Min() {
+        Calendar calendar = Calendar.getInstance();
+        int offsetMs = calendar.get(Calendar.ZONE_OFFSET) + calendar.get(Calendar.DST_OFFSET);
+        return offsetMs / (15 * 60 * 1000);
+    }
+
+    private byte[] fitnessDataIdBytes(long timestampSeconds,
+                                      int tzIn15Min,
+                                      int version,
+                                      int dailyType,
+                                      int fileType) {
+        int ts = (int) timestampSeconds;
+        return new byte[]{
+                (byte) (ts & 0xFF),
+                (byte) ((ts >> 8) & 0xFF),
+                (byte) ((ts >> 16) & 0xFF),
+                (byte) ((ts >> 24) & 0xFF),
+                (byte) tzIn15Min,
+                (byte) version,
+                (byte) ((dailyType << 2) | (fileType & 0x03))
+        };
+    }
+
+    private Object newDebugTodayIdsCallback(final ClassLoader classLoader, final String did,
+                                           final String api, final String reason)
+            throws ClassNotFoundException {
+        Class<?> callbackClass = findClass("com.xiaomi.fit.fitness.sync.export.api.OnGetFitnessIdsCallback", classLoader);
+        return Proxy.newProxyInstance(classLoader, new Class<?>[]{callbackClass}, new InvocationHandler() {
+            @Override
+            public Object invoke(Object proxy, Method method, Object[] args) {
+                String name = method.getName();
+                if ("toString".equals(name)) {
+                    return "HeartwithTodaySleepIdsCallback";
+                }
+                if ("hashCode".equals(name)) {
+                    return System.identityHashCode(proxy);
+                }
+                if ("equals".equals(name)) {
+                    return proxy == (args == null || args.length == 0 ? null : args[0]);
+                }
+                try {
+                    if ("onSuccess".equals(name)) {
+                        byte[] rawIds = args != null && args.length > 0 && args[0] instanceof byte[]
+                                ? (byte[]) args[0]
+                                : null;
+                        byte[] sleepIds = filterSleepDataIds(classLoader, rawIds);
+                        int total = rawIds == null ? 0 : rawIds.length / 7;
+                        int trailing = rawIds == null ? 0 : rawIds.length % 7;
+                        int sleepCount = sleepIds == null ? 0 : sleepIds.length / 7;
+                        debugSleepLine("today sleep ids success api=" + api
+                                + ", did=" + maskDid(did)
+                                + ", reason=" + reason
+                                + ", rawLen=" + (rawIds == null ? 0 : rawIds.length)
+                                + ", total=" + total
+                                + ", trailing=" + trailing
+                                + ", sleep=" + sleepCount
+                                + ", ids=" + describeFitnessDataIdBytes(classLoader, rawIds, 24)
+                                + ", sleepBytes=" + hex(sleepIds));
+                        if (sleepIds != null && sleepIds.length > 0) {
+                            writeDebugSleepStatus("已找到睡眠数据", "睡眠数据块：" + sleepCount
+                                    + " 个\n正在同步并解析。");
+                            triggerDebugSleepOnlySync(classLoader, did, sleepIds);
+                        } else if (isDebugSleepSyncReason(reason)) {
+                            debugSleepLine("today sleep ids has no sleep block; waiting for direct sync parser, reason=" + reason);
+                        } else {
+                            writeDebugSleepStatus("今天没有睡眠数据", "小米健康返回 " + total
+                                    + " 个数据块，但没有 dailyType=8 的睡眠数据。\n"
+                                    + describeFitnessDataIdBytes(classLoader, rawIds, 12));
+                        }
+                    } else if ("onError".equals(name)) {
+                        debugSleepLine("today sleep ids error api=" + api
+                                + ", did=" + maskDid(did)
+                                + ", reason=" + reason
+                                + ", args=" + describeArgs(args));
+                        writeDebugSleepStatus("获取睡眠失败", "today fitness ids 返回错误：" + describeArgs(args));
+                    } else {
+                        debugSleepLine("today sleep ids callback method=" + name
+                                + ", api=" + api
+                                + ", args=" + describeArgs(args));
+                    }
+                } catch (Throwable throwable) {
+                    debugSleepLine("today sleep ids callback failed api=" + api
+                            + ", method=" + name
+                            + ": " + describeThrowable(throwable));
+                } finally {
+                    if ("onSuccess".equals(name) || "onError".equals(name)) {
+                        debugTodaySleepIdsPending.set(false);
+                    }
+                }
+                return null;
+            }
+        });
+    }
+
+    private boolean isDebugSleepSyncReason(String reason) {
+        return reason != null && reason.contains("debug-sleep");
+    }
+
+    private byte[] filterSleepDataIds(ClassLoader classLoader, byte[] rawIds) {
+        if (rawIds == null || rawIds.length < 7) {
+            return null;
+        }
+        ByteArrayOutputStream output = new ByteArrayOutputStream(rawIds.length);
+        int total = rawIds.length / 7;
+        for (int i = 0; i < total; i++) {
+            byte[] idBytes = Arrays.copyOfRange(rawIds, i * 7, i * 7 + 7);
+            try {
+                Object dataId = newFitnessDataId(classLoader, idBytes);
+                boolean sleep = isSleepFitnessDataId(dataId);
+                debugSleepLine("today fitness id[" + i + "] sleep=" + sleep
+                        + ", bytes=" + hex(idBytes)
+                        + ", dataId=" + dataId);
+                if (sleep) {
+                    output.write(idBytes, 0, idBytes.length);
+                }
+            } catch (Throwable throwable) {
+                debugSleepLine("today fitness id[" + i + "] inspect failed bytes=" + hex(idBytes)
+                        + ": " + describeThrowable(throwable));
+            }
+        }
+        return output.size() == 0 ? null : output.toByteArray();
+    }
+
+    private void appendFdsEntityIdBytes(ByteArrayOutputStream output, Object entities) {
+        if (!(entities instanceof Iterable)) {
+            return;
+        }
+        for (Object entity : (Iterable<?>) entities) {
+            try {
+                Object idBytes = callMethod(entity, "getIdBytes");
+                if (idBytes instanceof byte[]) {
+                    byte[] bytes = (byte[]) idBytes;
+                    output.write(bytes, 0, bytes.length);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private String describeFdsEntities(ClassLoader classLoader, Object entities, int maxItems) {
+        if (entities == null) {
+            return "null";
+        }
+        if (!(entities instanceof Iterable)) {
+            return shortObject(entities);
+        }
+        StringBuilder builder = new StringBuilder();
+        int total = 0;
+        int appended = 0;
+        for (Object entity : (Iterable<?>) entities) {
+            total++;
+            if (appended >= maxItems) {
+                continue;
+            }
+            if (builder.length() > 0) {
+                builder.append(" | ");
+            }
+            builder.append(appended).append(':');
+            try {
+                Object idBytesValue = callMethod(entity, "getIdBytes");
+                byte[] idBytes = idBytesValue instanceof byte[] ? (byte[]) idBytesValue : null;
+                Object dataId = idBytes == null ? null : newFitnessDataId(classLoader, idBytes);
+                builder.append("time=").append(safeInvoke(entity, "getTime"))
+                        .append(",daily=").append(safeInvoke(entity, "getDailyType"))
+                        .append(",file=").append(safeInvoke(entity, "getFileType"))
+                        .append(",upload=").append(safeInvoke(entity, "isUpload"))
+                        .append(",bytes=").append(idBytes == null ? "null" : hex(idBytes))
+                        .append(",dataId=").append(dataId);
+            } catch (Throwable throwable) {
+                builder.append("bad(").append(describeThrowable(throwable)).append(")")
+                        .append(",entity=").append(shortObject(entity));
+            }
+            appended++;
+        }
+        return "count=" + total + (builder.length() == 0 ? "" : ", items=[" + builder + "]");
+    }
+
+    private String describeFitnessDataIdBytes(ClassLoader classLoader, byte[] rawIds, int maxItems) {
+        if (rawIds == null) {
+            return "null";
+        }
+        int total = rawIds.length / 7;
+        int trailing = rawIds.length % 7;
+        int sleep = 0;
+        int daily = 0;
+        int sport = 0;
+        StringBuilder builder = new StringBuilder();
+        builder.append("len=").append(rawIds.length)
+                .append(", total=").append(total)
+                .append(", trailing=").append(trailing);
+        int limit = Math.min(total, Math.max(0, maxItems));
+        StringBuilder items = new StringBuilder();
+        for (int i = 0; i < total; i++) {
+            byte[] idBytes = Arrays.copyOfRange(rawIds, i * 7, i * 7 + 7);
+            try {
+                Object dataId = newFitnessDataId(classLoader, idBytes);
+                int dataType = intInvoke(dataId, "getDataType", -1);
+                int dailyType = intInvoke(dataId, "getDailyType", -1);
+                if (dataType == 0) {
+                    daily++;
+                } else if (dataType == 1) {
+                    sport++;
+                }
+                if (dataType == 0 && (dailyType == 7 || dailyType == 8)) {
+                    sleep++;
+                }
+                if (i < limit) {
+                    if (items.length() > 0) {
+                        items.append(" | ");
+                    }
+                    items.append(i).append(':').append(describeFitnessDataIdForDebug(dataId));
+                }
+            } catch (Throwable throwable) {
+                if (i < limit) {
+                    if (items.length() > 0) {
+                        items.append(" | ");
+                    }
+                    items.append(i).append(":bad(").append(hex(idBytes)).append(')');
+                }
+            }
+        }
+        builder.append(", daily=").append(daily)
+                .append(", sport=").append(sport)
+                .append(", sleep=").append(sleep);
+        if (items.length() > 0) {
+            builder.append(", ids=[").append(items).append(']');
+            if (total > limit) {
+                builder.append("...");
+            }
+        }
+        return builder.toString();
+    }
+
+    private String describeFitnessDataIdForDebug(Object dataId) {
+        if (dataId == null) {
+            return "null";
+        }
+        long timestamp = longInvoke(dataId, "getTimeStamp");
+        return "time=" + timestamp
+                + "(" + formatEpochSeconds(timestamp) + ")"
+                + ",dataType=" + safeInvoke(dataId, "getDataType")
+                + ",dailyType=" + safeInvoke(dataId, "getDailyType")
+                + ",fileType=" + safeInvoke(dataId, "getFileType")
+                + ",version=" + safeInvoke(dataId, "getVersion")
+                + ",raw=" + shortDebugText(String.valueOf(dataId), 90);
+    }
+
+    private Object newFitnessDataId(ClassLoader classLoader, byte[] idBytes) throws Exception {
+        Class<?> dataIdClass = findClass("com.xiaomi.fit.data.common.data.mi.FitnessDataId", classLoader);
+        Constructor<?> constructor = dataIdClass.getDeclaredConstructor(byte[].class);
+        constructor.setAccessible(true);
+        return constructor.newInstance((Object) idBytes);
+    }
+
+    private Object newWearFitnessPbApi(ClassLoader classLoader) throws Exception {
+        Class<?> apiClass = findClass("com.xiaomi.fit.fitness.device.mi.send.FitnessWearPbImpl", classLoader);
+        return newInstance(apiClass);
+    }
+
+    private Object newEcoFitnessPbApi(ClassLoader classLoader) throws Exception {
+        Class<?> apiClass = findClass("com.xiaomi.fit.fitness.eco.device.mi.send.FitnessEcoPbImpl", classLoader);
+        try {
+            Object companion = getStaticObjectField(apiClass, "INSTANCE", "Companion");
+            try {
+                return callMethod(companion, "getInstance");
+            } catch (Throwable ignored) {
+                return companion;
+            }
+        } catch (Throwable ignored) {
+            return newInstance(apiClass);
+        }
     }
 
     private void hookWearRawHandler(final ClassLoader classLoader) {
@@ -1629,12 +4584,14 @@ public final class MiHealthHookModule extends XposedModule {
                     }
                     int type = ((Number) chain.getArg(1)).intValue();
                     Object raw = chain.getArg(2);
-                    diagRawPacket(source, type, raw);
                     if (type == 8 && raw instanceof byte[]) {
                         Integer hr = extractHrFromWearRaw(classLoader, (byte[]) raw);
+                        diagRawPacket(source, type, raw, hr);
                         if (hr != null) {
                             onHeartRate(hr, source);
                         }
+                    } else {
+                        diagRawPacket(source, type, raw, null);
                     }
                     return chain.proceed();
                 }
@@ -1734,12 +4691,14 @@ public final class MiHealthHookModule extends XposedModule {
                     }
                     int type = ((Number) chain.getArg(1)).intValue();
                     Object raw = chain.getArg(2);
-                    diagRawPacket(source, type, raw);
                     if (type == 8 && raw instanceof byte[]) {
                         Integer hr = extractHrFromRaw(classLoader, (byte[]) raw);
+                        diagRawPacket(source, type, raw, hr);
                         if (hr != null) {
                             onHeartRate(hr, source);
                         }
+                    } else {
+                        diagRawPacket(source, type, raw, null);
                     }
                     return result;
                 }
@@ -1765,12 +4724,14 @@ public final class MiHealthHookModule extends XposedModule {
                     }
                     int type = ((Number) chain.getArg(0)).intValue();
                     Object raw = chain.getArg(1);
-                    diagRawPacket(source, type, raw);
                     if (type == 8 && raw instanceof byte[]) {
                         Integer hr = extractHrFromRaw(classLoader, (byte[]) raw);
+                        diagRawPacket(source, type, raw, hr);
                         if (hr != null) {
                             onHeartRate(hr, source);
                         }
+                    } else {
+                        diagRawPacket(source, type, raw, null);
                     }
                     return chain.proceed();
                 }
@@ -1797,6 +4758,69 @@ public final class MiHealthHookModule extends XposedModule {
                 }
             });
         } catch (Throwable ignored) {
+        }
+    }
+
+    private void hookSportWearDataSinks(final ClassLoader classLoader) {
+        hookWearSportDataSink(classLoader,
+                "com.xiaomi.fitness.sport_manager.receiver.FreeTrainingDataProcesser",
+                "nxs",
+                "sport-wear-data");
+        hookWearSportDataSink(classLoader,
+                "com.xiaomi.fitness.sport_manager.receiver.product.BeanDataProcesser",
+                "nxs",
+                "sport-wear-data");
+        hookWearSportDataSink(classLoader,
+                "com.xiaomi.fitness.sport_manager.server.SportDataServer",
+                "nxs",
+                "sport-wear-data");
+        hookWearSportDataSink(classLoader, "i16", "nxs", "sport-wear-data");
+        hookWearSportDataSink(classLoader, "uk6", "nxs", "sport-wear-data");
+
+        hookWearSportDataSink(classLoader,
+                "com.xiaomi.fitness.sport_eco_manager.receiver.FreeTrainingDataProcesser",
+                "oxs",
+                "eco-wear-data");
+        hookWearSportDataSink(classLoader,
+                "com.xiaomi.fitness.sport_eco_manager.server.EcoSportDataServer",
+                "oxs",
+                "eco-wear-data");
+        hookWearSportDataSink(classLoader, "j16", "oxs", "eco-wear-data");
+        hookWearSportDataSink(classLoader, "vk6", "oxs", "eco-wear-data");
+    }
+
+    private void hookWearSportDataSink(
+            final ClassLoader classLoader,
+            final String className,
+            final String dataClassName,
+            final String source) {
+        try {
+            Class<?> targetClass = findClass(className, classLoader);
+            Class<?> dataClass = findClass(dataClassName, classLoader);
+            Method method = targetClass.getDeclaredMethod("onReceiveWearData", dataClass);
+            method.setAccessible(true);
+            hook(method).intercept(new XposedInterface.Hooker() {
+                @Override
+                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    Object result = chain.proceed();
+                    if (shouldIgnoreSource(source)) {
+                        return result;
+                    }
+                    Integer hr = extractHrFromWearSportData(chain.getArg(0));
+                    if (hr != null) {
+                        onHeartRate(hr, source);
+                    }
+                    return result;
+                }
+            });
+            if (DebugBuild.ENABLED) {
+                diagLine("wear sport data hook installed: " + className + "#" + dataClassName);
+            }
+        } catch (Throwable throwable) {
+            if (DebugBuild.ENABLED) {
+                diagLine("wear sport data hook unavailable: " + className + "#" + dataClassName
+                        + ": " + throwable.getClass().getSimpleName());
+            }
         }
     }
 
@@ -2023,7 +5047,7 @@ public final class MiHealthHookModule extends XposedModule {
             }
             return;
         }
-        boolean force = reason.startsWith("watchdog:") || reason.startsWith("stop:");
+        boolean force = isForceStartReason(reason);
         if (!force && !shouldStartNow(reason)) {
             if (DebugBuild.ENABLED) {
                 diagLine("start skipped: shouldStartNow=false reason=" + reason
@@ -2049,17 +5073,22 @@ public final class MiHealthHookModule extends XposedModule {
                 try {
                     lastStartAt = SystemClock.elapsedRealtime();
                     lastStartReason = reason;
-                    final boolean force = reason.startsWith("watchdog:") || reason.startsWith("stop:");
+                    final boolean force = isForceStartReason(reason);
+                    final boolean allowAggressiveStart = shouldRunStartHelpersForReason(reason, lastStartAt);
+                    final boolean forceLaunchRegister =
+                            shouldForceLaunchModelRegister(reason, force, allowAggressiveStart);
                     boolean originalDeviceStarted = startOriginalHuamiBleDevice(classLoader);
                     boolean originalControllerStarted = startOriginalHuamiController(classLoader);
-                    boolean registered = ensureLaunchModels(classLoader, force);
-                    boolean deviceStarted = startDeviceRealtimeHr(classLoader);
+                    boolean registered = ensureLaunchModels(classLoader, forceLaunchRegister);
+                    boolean deviceStarted = startDeviceRealtimeHr(classLoader, reason, allowAggressiveStart);
                     started = originalDeviceStarted || originalControllerStarted || registered || deviceStarted;
                     if (DebugBuild.ENABLED) {
                         diagLine("start result reason=" + reason
                                 + ", bleDevice=" + originalDeviceStarted
                                 + ", controller=" + originalControllerStarted
                                 + ", launchModels=" + registered
+                                + ", forceLaunchRegister=" + forceLaunchRegister
+                                + ", allowAggressiveStart=" + allowAggressiveStart
                                 + ", deviceHr=" + deviceStarted);
                     }
                     scheduleRetryIfNeeded(classLoader, force);
@@ -2072,6 +5101,66 @@ public final class MiHealthHookModule extends XposedModule {
                 }
             }
         });
+    }
+
+    private boolean isForceStartReason(String reason) {
+        if (reason == null) {
+            return false;
+        }
+        return reason.startsWith("watchdog:") || reason.startsWith("watchdog-alarm:") ||
+                reason.startsWith("stop:") || reason.startsWith("device-changed:");
+    }
+
+    private boolean shouldForceLaunchModelRegister(
+            String reason,
+            boolean force,
+            boolean allowAggressiveStart
+    ) {
+        if (reason == null) {
+            return false;
+        }
+        if (reason.startsWith("application:") || reason.startsWith("legacy-kick:") ||
+                reason.startsWith("stop:") || reason.startsWith("sport:") ||
+                reason.startsWith("device-changed:")) {
+            return true;
+        }
+        if (force || reason.contains("no-heart-rate")) {
+            return allowAggressiveStart;
+        }
+        return false;
+    }
+
+    private boolean shouldRunStartHelpersForReason(String reason, long elapsed) {
+        if (reason == null) {
+            return lastStartHelperScanElapsedMs <= 0L ||
+                    elapsed - lastStartHelperScanElapsedMs >= START_HELPER_WATCHDOG_COOLDOWN_MS;
+        }
+        if (reason.startsWith("application:") || reason.startsWith("legacy-kick:") ||
+                reason.startsWith("stop:") || reason.startsWith("device-changed:")) {
+            return true;
+        }
+        if (reason.startsWith("sport:")) {
+            return lastSportStartHelperScanElapsedMs <= 0L ||
+                    elapsed - lastSportStartHelperScanElapsedMs >= START_HELPER_SPORT_COOLDOWN_MS;
+        }
+        if (lastStartHelperScanElapsedMs <= 0L) {
+            return true;
+        }
+        if (reason.startsWith("watchdog:") || reason.startsWith("watchdog-alarm:") ||
+                reason.startsWith("timer:")) {
+            return elapsed - lastStartHelperScanElapsedMs >= START_HELPER_WATCHDOG_COOLDOWN_MS;
+        }
+        return false;
+    }
+
+    private void markStartHelperScan(String reason, String deviceIdentity, long elapsed) {
+        lastStartHelperScanElapsedMs = elapsed;
+        if (deviceIdentity != null) {
+            lastStartHelperDeviceIdentity = deviceIdentity;
+        }
+        if (reason != null && reason.startsWith("sport:")) {
+            lastSportStartHelperScanElapsedMs = elapsed;
+        }
     }
 
     private boolean shouldStartNow(String reason) {
@@ -2139,6 +5228,12 @@ public final class MiHealthHookModule extends XposedModule {
         final String retryReason = forceRetry ? "watchdog:no-heart-rate-retry" : "timer:no-heart-rate";
         maybeScheduleColdStartRecycle();
         final long delayMs = noHeartStartAttempts <= 2 ? 9_000L : 60_000L;
+        importantLine("retry scheduled reason=" + retryReason
+                + ", delayMs=" + delayMs
+                + ", attempts=" + noHeartStartAttempts
+                + ", force=" + forceRetry
+                + ", localHr=" + lastHr
+                + ", ageMs=" + heartRateAgeForDebug());
         if (DebugBuild.ENABLED) {
             diagLine("retry scheduled reason=" + retryReason
                     + ", delayMs=" + delayMs
@@ -2186,6 +5281,9 @@ public final class MiHealthHookModule extends XposedModule {
             return;
         }
         long delayMs = Math.max(0L, COLD_START_RECYCLE_MIN_UPTIME_MS - uptime);
+        importantLine("cold-start recycle scheduled delayMs=" + delayMs
+                + ", uptime=" + uptime
+                + ", attempts=" + noHeartStartAttempts);
         if (DebugBuild.ENABLED) {
             diagLine("cold-start recycle scheduled delayMs=" + delayMs
                     + ", uptime=" + uptime
@@ -2235,6 +5333,10 @@ public final class MiHealthHookModule extends XposedModule {
         if (DebugBuild.ENABLED) {
             diagLine("cold-start heart-rate stalled, recycling device process once");
         }
+        importantLine("cold-start heart-rate stalled, recycling device process once"
+                + ", uptime=" + uptime
+                + ", attempts=" + noHeartStartAttempts
+                + ", lastHr=" + lastHr);
         android.os.Process.killProcess(android.os.Process.myPid());
         System.exit(0);
     }
@@ -2322,7 +5424,11 @@ public final class MiHealthHookModule extends XposedModule {
         }
     }
 
-    private boolean startDeviceRealtimeHr(ClassLoader classLoader) {
+    private boolean startDeviceRealtimeHr(
+            ClassLoader classLoader,
+            String reason,
+            boolean allowAggressiveStart
+    ) {
         Object device = getCurrentDeviceModel(classLoader);
         if (device == null) {
             if (DebugBuild.ENABLED) {
@@ -2334,8 +5440,36 @@ public final class MiHealthHookModule extends XposedModule {
             return false;
         }
         updateDeviceModel(device);
+        long elapsed = SystemClock.elapsedRealtime();
+        String deviceIdentity = describeDeviceIdentity(device);
+        String previousDeviceIdentity = lastStartHelperDeviceIdentity;
+        boolean hasNewDeviceIdentity = deviceIdentity != null && previousDeviceIdentity == null;
+        boolean deviceChanged = deviceIdentity != null && previousDeviceIdentity != null
+                && !deviceIdentity.equals(previousDeviceIdentity);
+        boolean shouldBypassCooldown = hasNewDeviceIdentity || deviceChanged;
+        if (!allowAggressiveStart && !shouldBypassCooldown) {
+            if (DebugBuild.ENABLED) {
+                debugLine("startDeviceRealtimeHr helper scan skipped: reason=" + reason
+                        + ", lastScanAgeMs=" + (lastStartHelperScanElapsedMs > 0L
+                        ? elapsed - lastStartHelperScanElapsedMs
+                        : -1L)
+                        + ", cooldownMs=" + START_HELPER_WATCHDOG_COOLDOWN_MS
+                        + ", device=" + describeDeviceForDebug(device));
+            }
+            return false;
+        }
         if (DebugBuild.ENABLED) {
-            debugLine("startDeviceRealtimeHr device=" + describeDeviceForDebug(device));
+            debugLine("startDeviceRealtimeHr device=" + describeDeviceForDebug(device)
+                    + ", reason=" + reason
+                    + ", allowAggressiveStart=" + allowAggressiveStart
+                    + ", previousDevice=" + previousDeviceIdentity
+                    + ", deviceChanged=" + deviceChanged);
+        }
+        if (shouldBypassCooldown) {
+            if (DebugBuild.ENABLED) {
+                debugLine("startDeviceRealtimeHr device identity initialized or changed, force launch model register");
+            }
+            ensureLaunchModels(classLoader, true);
         }
         Object callback = null;
         try {
@@ -2349,20 +5483,29 @@ public final class MiHealthHookModule extends XposedModule {
             }
         }
         boolean startedAny = false;
+        boolean attempted = false;
+        boolean exhaustiveHelperScan = shouldBypassCooldown;
         for (String helperClassName : START_HELPERS) {
+            attempted = true;
             try {
                 Class<?> helperClass = findClass(helperClassName, classLoader);
                 callStaticMethod(helperClass, "startDeviceHr", device, callback);
                 startedAny = true;
                 if (DebugBuild.ENABLED) {
-                    debugLine("startDeviceHr helper ok: " + helperClassName);
+                    debugLine("startDeviceHr helper ok: " + helperClassName
+                            + ", exhaustive=" + exhaustiveHelperScan);
                 }
-                break;
+                if (!exhaustiveHelperScan) {
+                    break;
+                }
             } catch (Throwable ignored) {
                 if (DebugBuild.ENABLED) {
                     debugLine("startDeviceHr helper failed: " + helperClassName + ": " + ignored.getClass().getSimpleName());
                 }
             }
+        }
+        if (attempted) {
+            markStartHelperScan(reason, deviceIdentity, elapsed);
         }
         return startedAny;
     }
@@ -2464,6 +5607,762 @@ public final class MiHealthHookModule extends XposedModule {
         String message = throwable.getMessage();
         return throwable.getClass().getSimpleName()
                 + (message == null || message.isEmpty() ? "" : ": " + message);
+    }
+
+    private void logFitnessParseResult(String stage, Object result) {
+        if (!DebugBuild.ENABLED || result == null) {
+            return;
+        }
+        try {
+            Object allDaySleep = callMethod(result, "getAllDaySleepReport");
+            Object nightSleep = callMethod(result, "getNightSleepReport");
+            Object daytimeSleep = callMethod(result, "getDaytimeSleepReport");
+            if (allDaySleep == null && nightSleep == null && daytimeSleep == null) {
+                return;
+            }
+            debugSleepLine(stage
+                    + ", allDay=" + describeAllDaySleep(allDaySleep)
+                    + ", night=" + describeNightSleep(nightSleep)
+                    + ", daytime=" + describeDaytimeSleep(daytimeSleep));
+        } catch (Throwable throwable) {
+            debugSleepLine(stage + " parse-result describe failed: " + describeThrowable(throwable));
+        }
+    }
+
+    private void publishDebugSleepParseResult(String stage, Object dataId, Object result) {
+        if (!DebugBuild.ENABLED || result == null) {
+            return;
+        }
+        try {
+            Object allDaySleep = allDaySleepObject(result);
+            if (allDaySleep == null) {
+                return;
+            }
+            String summary = debugSleepSummary(allDaySleep);
+            String details = debugSleepDetails(stage, dataId, allDaySleep);
+            writeDebugSleepStatus(summary, details);
+        } catch (Throwable throwable) {
+            debugSleepLine(stage + " publish sleep result failed: " + describeThrowable(throwable));
+        }
+    }
+
+    private void writeDebugSleepStatus(String summary, String details) {
+        if (!DebugBuild.ENABLED) {
+            return;
+        }
+        HeartwithSleepDebugStatus.writeRemote(appContext, summary, details, System.currentTimeMillis());
+    }
+
+    private String debugSleepSummary(Object sleep) {
+        long bed = longInvoke(sleep, "getDeviceBedTime");
+        long wake = longInvoke(sleep, "getDeviceWakeupTime");
+        long durationSeconds = longInvoke(sleep, "getLinBedDuration");
+        if (durationSeconds <= 0L && bed > 0L && wake > bed) {
+            durationSeconds = wake - bed;
+        }
+        String duration = durationSeconds > 0L ? formatDurationSeconds(durationSeconds) : "未知时长";
+        String finish = booleanInvoke(sleep, "isSleepFinish") ? "已结束" : "未结束";
+        return "睡眠 " + duration + " · " + finish;
+    }
+
+    private String debugSleepDetails(String stage, Object dataId, Object sleep) {
+        long bed = longInvoke(sleep, "getDeviceBedTime");
+        long wake = longInvoke(sleep, "getDeviceWakeupTime");
+        long goBed = longInvoke(sleep, "getGoBedTime");
+        long leaveBed = longInvoke(sleep, "getLeaveBedTime");
+        return "设备入睡：" + formatEpochSeconds(bed)
+                + "\n设备醒来：" + formatEpochSeconds(wake)
+                + "\n上床/离床：" + formatEpochSeconds(goBed) + " - " + formatEpochSeconds(leaveBed)
+                + "\n睡眠效率：" + safeInvoke(sleep, "getSleepEfficiency")
+                + "\n入睡耗时：" + formatDurationSeconds(longInvoke(sleep, "getEntrySleepDuration"))
+                + "\n源数据长度：" + safeInvoke(sleep, "getSleepSrcDataLen")
+                + "\n来源：" + stage
+                + "\nDataId：" + shortDebugText(String.valueOf(dataId), 110);
+    }
+
+    private long todayStartSeconds() {
+        Calendar calendar = Calendar.getInstance();
+        calendar.set(Calendar.HOUR_OF_DAY, 0);
+        calendar.set(Calendar.MINUTE, 0);
+        calendar.set(Calendar.SECOND, 0);
+        calendar.set(Calendar.MILLISECOND, 0);
+        return calendar.getTimeInMillis() / 1000L;
+    }
+
+    private Object selectLatestSleepReport(Object reports) {
+        if (!(reports instanceof java.util.List)) {
+            return null;
+        }
+        java.util.List<?> list = (java.util.List<?>) reports;
+        Object selected = null;
+        long selectedTime = Long.MIN_VALUE;
+        for (Object report : list) {
+            if (report == null || booleanInvoke(report, "isEmpty")) {
+                continue;
+            }
+            long time = longInvoke(report, "getTime");
+            long totalDuration = longInvoke(report, "getTotalDuration");
+            Object segments = safeInvokeObject(report, "getSleepSegments");
+            if (totalDuration <= 0L && collectionSize(segments) <= 0) {
+                continue;
+            }
+            if (selected == null || time >= selectedTime) {
+                selected = report;
+                selectedTime = time;
+            }
+        }
+        return selected;
+    }
+
+    private String debugSleepReportSummary(Object report) {
+        long totalMinutes = longInvoke(report, "getTotalDuration");
+        String duration = totalMinutes > 0L ? formatDurationMinutes(totalMinutes) : "未知时长";
+        long score = longInvoke(report, "getScore");
+        String suffix = score > 0L ? " · " + score + "分" : "";
+        return "睡眠 " + duration + suffix;
+    }
+
+    private String debugSleepReportDetails(String stage, Object report) {
+        Object segments = safeInvokeObject(report, "getSleepSegments");
+        Object primarySegment = findPrimarySleepSegment(segments);
+        StringBuilder builder = new StringBuilder();
+        builder.append("报告日期：").append(formatEpochSeconds(longInvoke(report, "getTime"))).append('\n');
+        if (primarySegment != null) {
+            builder.append("睡眠段：")
+                    .append(formatEpochSeconds(longInvoke(primarySegment, "getBedTime")))
+                    .append(" - ")
+                    .append(formatEpochSeconds(longInvoke(primarySegment, "getWakeupTime")))
+                    .append('\n');
+            builder.append("设备时间：")
+                    .append(formatEpochSeconds(longInvoke(primarySegment, "getDeviceBedTime")))
+                    .append(" - ")
+                    .append(formatEpochSeconds(longInvoke(primarySegment, "getDeviceWakeupTime")))
+                    .append('\n');
+        }
+        builder.append("总时长：").append(formatDurationMinutes(longInvoke(report, "getTotalDuration"))).append('\n')
+                .append("深/浅/REM/清醒：")
+                .append(formatDurationMinutes(longInvoke(report, "getDeepDuration"))).append(" / ")
+                .append(formatDurationMinutes(longInvoke(report, "getLightDuration"))).append(" / ")
+                .append(formatDurationMinutes(longInvoke(report, "getRemDuration"))).append(" / ")
+                .append(formatDurationMinutes(longInvoke(report, "getAwakeDuration"))).append('\n')
+                .append("评分：").append(safeInvoke(report, "getScore"))
+                .append("，平均心率：").append(safeInvoke(report, "getAvgHr"))
+                .append("，平均血氧：").append(safeInvoke(report, "getAvgSpo2")).append('\n')
+                .append("睡眠段数量：").append(collectionSize(segments)).append('\n')
+                .append("来源：").append(stage);
+        return builder.toString();
+    }
+
+    private Object findPrimarySleepSegment(Object segments) {
+        if (!(segments instanceof java.util.List)) {
+            return null;
+        }
+        java.util.List<?> list = (java.util.List<?>) segments;
+        Object selected = null;
+        long selectedDuration = Long.MIN_VALUE;
+        for (Object segment : list) {
+            if (segment == null) {
+                continue;
+            }
+            long duration = longInvoke(segment, "getSleepDuration");
+            if (duration <= 0L) {
+                long bed = longInvoke(segment, "getBedTime");
+                long wake = longInvoke(segment, "getWakeupTime");
+                if (wake > bed) {
+                    duration = (wake - bed) / 60L;
+                }
+            }
+            if (selected == null || duration > selectedDuration) {
+                selected = segment;
+                selectedDuration = duration;
+            }
+        }
+        return selected;
+    }
+
+    private int collectionSize(Object value) {
+        if (value instanceof java.util.Collection) {
+            return ((java.util.Collection<?>) value).size();
+        }
+        if (value != null && value.getClass().isArray()) {
+            return Array.getLength(value);
+        }
+        return 0;
+    }
+
+    private long longInvoke(Object target, String methodName) {
+        Object value = safeInvokeObject(target, methodName);
+        if (value instanceof Number) {
+            return ((Number) value).longValue();
+        }
+        if (value instanceof Boolean) {
+            return ((Boolean) value) ? 1L : 0L;
+        }
+        if (value == null) {
+            return 0L;
+        }
+        try {
+            return Long.parseLong(String.valueOf(value));
+        } catch (Throwable ignored) {
+            return 0L;
+        }
+    }
+
+    private boolean booleanInvoke(Object target, String methodName) {
+        Object value = safeInvokeObject(target, methodName);
+        if (value instanceof Boolean) {
+            return (Boolean) value;
+        }
+        return value != null && Boolean.parseBoolean(String.valueOf(value));
+    }
+
+    private String formatEpochSeconds(long seconds) {
+        if (seconds <= 0L) {
+            return "未知";
+        }
+        return new SimpleDateFormat("MM-dd HH:mm", Locale.getDefault())
+                .format(new Date(seconds * 1000L));
+    }
+
+    private String formatEpochMillis(long millis) {
+        if (millis <= 0L) {
+            return "未知";
+        }
+        return formatEpochSeconds(millis / 1000L);
+    }
+
+    private String formatDurationSeconds(long seconds) {
+        if (seconds <= 0L) {
+            return "未知";
+        }
+        long minutes = Math.max(1L, seconds / 60L);
+        return formatDurationMinutes(minutes);
+    }
+
+    private String formatDurationMinutes(long minutes) {
+        if (minutes <= 0L) {
+            return "未知";
+        }
+        long hours = minutes / 60L;
+        long remain = minutes % 60L;
+        if (hours > 0L) {
+            return hours + "小时" + remain + "分";
+        }
+        return minutes + "分钟";
+    }
+
+    private String shortDebugText(String value, int limit) {
+        if (value == null) {
+            return "";
+        }
+        String safe = safeString(value);
+        return safe.length() > limit ? safe.substring(0, limit) + "..." : safe;
+    }
+
+    private String describeAllDaySleep(Object sleep) {
+        if (sleep == null) {
+            return "null";
+        }
+        return "AllDay{finish=" + safeInvoke(sleep, "isSleepFinish")
+                + ", deviceBed=" + safeInvoke(sleep, "getDeviceBedTime")
+                + ", deviceWake=" + safeInvoke(sleep, "getDeviceWakeupTime")
+                + ", quality=" + safeInvoke(sleep, "getSleepQuality")
+                + ", efficiency=" + safeInvoke(sleep, "getSleepEfficiency")
+                + ", entryDuration=" + safeInvoke(sleep, "getEntrySleepDuration")
+                + ", linBedDuration=" + safeInvoke(sleep, "getLinBedDuration")
+                + ", goBed=" + safeInvoke(sleep, "getGoBedTime")
+                + ", leaveBed=" + safeInvoke(sleep, "getLeaveBedTime")
+                + ", srcLen=" + safeInvoke(sleep, "getSleepSrcDataLen")
+                + ", hrInfo=" + shortObject(safeInvokeObject(sleep, "getHrInfo"))
+                + ", spo2Info=" + shortObject(safeInvokeObject(sleep, "getSpo2Info"))
+                + "}";
+    }
+
+    private String describeAllDaySleepReport(Object report) {
+        if (report == null) {
+            return "null";
+        }
+        return "AllDayReport{sid=" + safeInvoke(report, "getSid")
+                + ", time=" + safeInvoke(report, "getTime")
+                + ", total=" + safeInvoke(report, "getTotalDuration")
+                + ", deep=" + safeInvoke(report, "getDeepDuration")
+                + ", light=" + safeInvoke(report, "getLightDuration")
+                + ", rem=" + safeInvoke(report, "getRemDuration")
+                + ", awake=" + safeInvoke(report, "getAwakeDuration")
+                + ", score=" + safeInvoke(report, "getScore")
+                + ", avgHr=" + safeInvoke(report, "getAvgHr")
+                + ", avgSpo2=" + safeInvoke(report, "getAvgSpo2")
+                + ", segments=" + describeSleepReports(safeInvokeObject(report, "getSleepSegments"))
+                + "}";
+    }
+
+    private String describeSleepAllDayReports(Object reports) {
+        if (!(reports instanceof java.util.List)) {
+            return shortObject(reports);
+        }
+        java.util.List<?> list = (java.util.List<?>) reports;
+        StringBuilder builder = new StringBuilder("List(size=").append(list.size()).append(")[");
+        int count = Math.min(list.size(), 5);
+        for (int i = 0; i < count; i++) {
+            if (i > 0) {
+                builder.append("; ");
+            }
+            builder.append(describeAllDaySleepReport(list.get(i)));
+        }
+        if (list.size() > count) {
+            builder.append("; ...");
+        }
+        return builder.append("]").toString();
+    }
+
+    private boolean isSleepHomeDataType(Object dataType) {
+        if (dataType == null) {
+            return false;
+        }
+        String text = String.valueOf(dataType);
+        return containsSleepText(text) || "8".equals(safeInvoke(dataType, "getValue"));
+    }
+
+    private boolean containsSleepRecordKey(Object map) {
+        if (!(map instanceof java.util.Map)) {
+            return false;
+        }
+        for (Object key : ((java.util.Map<?, ?>) map).keySet()) {
+            String text = String.valueOf(key);
+            if ("sleep".equals(text)
+                    || "NightSleep".equals(text)
+                    || "DaytimeSleep".equals(text)
+                    || containsSleepText(text)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String describeDailyBasicReports(Object reports, int limit) {
+        if (reports == null) {
+            return "null";
+        }
+        if (reports.getClass().isArray()) {
+            int length = Array.getLength(reports);
+            StringBuilder builder = new StringBuilder("Array(size=").append(length).append(")[");
+            int count = Math.min(length, Math.max(0, limit));
+            for (int i = 0; i < count; i++) {
+                if (i > 0) {
+                    builder.append("; ");
+                }
+                builder.append(describeAllDaySleepReport(Array.get(reports, i)));
+            }
+            if (length > count) {
+                builder.append("; ...");
+            }
+            return builder.append("]").toString();
+        }
+        if (reports instanceof java.util.List) {
+            java.util.List<?> list = (java.util.List<?>) reports;
+            StringBuilder builder = new StringBuilder("List(size=").append(list.size()).append(")[");
+            int count = Math.min(list.size(), Math.max(0, limit));
+            for (int i = 0; i < count; i++) {
+                if (i > 0) {
+                    builder.append("; ");
+                }
+                builder.append(describeAllDaySleepReport(list.get(i)));
+            }
+            if (list.size() > count) {
+                builder.append("; ...");
+            }
+            return builder.append("]").toString();
+        }
+        return shortObject(reports);
+    }
+
+    private String describeRelativeDataModel(Object model) {
+        if (model == null) {
+            return "null";
+        }
+        String value = String.valueOf(safeInvokeObject(model, "getValue"));
+        return "RelativeDataModel{key=" + safeInvoke(model, "getKey")
+                + ", time=" + safeInvoke(model, "getTime")
+                + ", value=" + shortDebugText(value, 220)
+                + "}";
+    }
+
+    private String describeMapKeys(Object map) {
+        if (!(map instanceof java.util.Map)) {
+            return shortObject(map);
+        }
+        StringBuilder builder = new StringBuilder("[");
+        int index = 0;
+        for (Object key : ((java.util.Map<?, ?>) map).keySet()) {
+            if (index > 0) {
+                builder.append(", ");
+            }
+            builder.append(String.valueOf(key));
+            index++;
+            if (index >= 12) {
+                builder.append(", ...");
+                break;
+            }
+        }
+        return builder.append("]").toString();
+    }
+
+    private String describeListShort(Object value, int limit) {
+        if (!(value instanceof java.util.List)) {
+            return shortObject(value);
+        }
+        java.util.List<?> list = (java.util.List<?>) value;
+        StringBuilder builder = new StringBuilder("List(size=").append(list.size()).append(")[");
+        int count = Math.min(list.size(), Math.max(0, limit));
+        for (int i = 0; i < count; i++) {
+            if (i > 0) {
+                builder.append("; ");
+            }
+            builder.append(shortObject(list.get(i)));
+        }
+        if (list.size() > count) {
+            builder.append("; ...");
+        }
+        return builder.append("]").toString();
+    }
+
+    private boolean looksSleepRelated(Object value) {
+        if (value == null) {
+            return false;
+        }
+        if (value instanceof java.util.List) {
+            for (Object item : (java.util.List<?>) value) {
+                if (looksSleepRelated(item)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (value instanceof java.util.Map) {
+            for (Object entry : ((java.util.Map<?, ?>) value).entrySet()) {
+                if (looksSleepRelated(entry)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        return containsSleepText(String.valueOf(value));
+    }
+
+    private boolean containsSleepText(String value) {
+        if (value == null) {
+            return false;
+        }
+        String lower = value.toLowerCase(Locale.US);
+        return lower.contains("sleep") || lower.contains("睡眠");
+    }
+
+    private String describeNightSleep(Object sleep) {
+        if (sleep == null) {
+            return "null";
+        }
+        return "Night{bed=" + safeInvoke(sleep, "getBedTime")
+                + ", wake=" + safeInvoke(sleep, "getWakeUpTime")
+                + ", duration=" + safeInvoke(sleep, "getSleepDuration")
+                + ", deep=" + safeInvoke(sleep, "getDeepDuration")
+                + ", light=" + safeInvoke(sleep, "getLightDuration")
+                + ", rem=" + safeInvoke(sleep, "getRemDuration")
+                + ", awakeDuration=" + safeInvoke(sleep, "getAwakeDuration")
+                + ", awakeCount=" + safeInvoke(sleep, "getAwakeCount")
+                + ", score=" + safeInvoke(sleep, "getTotalScore")
+                + "}";
+    }
+
+    private String describeDaytimeSleep(Object sleep) {
+        if (sleep == null) {
+            return "null";
+        }
+        return "Daytime{duration=" + safeInvoke(sleep, "getSleepDuration")
+                + ", items=" + shortObject(safeInvokeObject(sleep, "getSleepItems"))
+                + "}";
+    }
+
+    private String describeSleepReports(Object reports) {
+        if (reports == null) {
+            return "null";
+        }
+        if (reports instanceof java.util.List) {
+            java.util.List<?> list = (java.util.List<?>) reports;
+            StringBuilder builder = new StringBuilder("List(size=").append(list.size()).append(")[");
+            int count = Math.min(list.size(), 4);
+            for (int i = 0; i < count; i++) {
+                if (i > 0) {
+                    builder.append("; ");
+                }
+                builder.append(describeSleepSegmentReport(list.get(i)));
+            }
+            if (list.size() > count) {
+                builder.append("; ...");
+            }
+            return builder.append("]").toString();
+        }
+        Class<?> clazz = reports.getClass();
+        if (clazz.isArray()) {
+            int length = Array.getLength(reports);
+            StringBuilder builder = new StringBuilder("Array(size=").append(length).append(")[");
+            int count = Math.min(length, 4);
+            for (int i = 0; i < count; i++) {
+                if (i > 0) {
+                    builder.append("; ");
+                }
+                builder.append(describeSleepSegmentReport(Array.get(reports, i)));
+            }
+            if (length > count) {
+                builder.append("; ...");
+            }
+            return builder.append("]").toString();
+        }
+        return shortObject(reports);
+    }
+
+    private String describeRecordItems(Object items, int limit) {
+        if (items == null) {
+            return "null";
+        }
+        if (items instanceof java.util.List) {
+            java.util.List<?> list = (java.util.List<?>) items;
+            StringBuilder builder = new StringBuilder("List(size=").append(list.size()).append(")[");
+            int count = Math.min(list.size(), Math.max(0, limit));
+            for (int i = 0; i < count; i++) {
+                if (i > 0) {
+                    builder.append("; ");
+                }
+                builder.append(describeDailyRecordItem(list.get(i)));
+            }
+            if (list.size() > count) {
+                builder.append("; ...");
+            }
+            return builder.append("]").toString();
+        }
+        if (items.getClass().isArray()) {
+            int length = Array.getLength(items);
+            StringBuilder builder = new StringBuilder("Array(size=").append(length).append(")[");
+            int count = Math.min(length, Math.max(0, limit));
+            for (int i = 0; i < count; i++) {
+                if (i > 0) {
+                    builder.append("; ");
+                }
+                builder.append(describeDailyRecordItem(Array.get(items, i)));
+            }
+            if (length > count) {
+                builder.append("; ...");
+            }
+            return builder.append("]").toString();
+        }
+        return shortObject(items);
+    }
+
+    private String describeDailyRecordItem(Object item) {
+        if (item == null) {
+            return "null";
+        }
+        Object data = safeInvokeObject(item, "getData");
+        if (data == null) {
+            data = safeInvokeObject(item, "getValue");
+        }
+        return "DailyRecordItem{time=" + safeInvoke(item, "getTimeStamp")
+                + ", tz=" + safeInvoke(item, "getTzIn15Min")
+                + ", complete=" + safeInvoke(item, "getCompleteSleep")
+                + ", data=" + (data == null ? shortObject(item) : describeSleepSegmentReport(data))
+                + "}";
+    }
+
+    private String describeSleepSegmentReport(Object report) {
+        if (report == null) {
+            return "null";
+        }
+        return "SleepSegment{sid=" + safeInvoke(report, "getSid")
+                + ", bed=" + safeInvoke(report, "getBedTime")
+                + ", wake=" + safeInvoke(report, "getWakeupTime")
+                + ", duration=" + safeInvoke(report, "getSleepDuration")
+                + ", deep=" + safeInvoke(report, "getDeepDuration")
+                + ", light=" + safeInvoke(report, "getLightDuration")
+                + ", rem=" + safeInvoke(report, "getRemDuration")
+                + ", wakeDuration=" + safeInvoke(report, "getWakeDuration")
+                + ", wakeCount=" + safeInvoke(report, "getWakeCount")
+                + ", score=" + safeInvoke(report, "getTotalScore")
+                + ", deviceBed=" + safeInvoke(report, "getDeviceBedTime")
+                + ", deviceWake=" + safeInvoke(report, "getDeviceWakeupTime")
+                + ", hasStage=" + safeInvoke(report, "hasStageData")
+                + "}";
+    }
+
+    private String describeCoroutineResult(Object result) {
+        if (result == null) {
+            return "null";
+        }
+        if (result instanceof java.util.List || result.getClass().isArray()) {
+            return describeSleepReports(result);
+        }
+        String className = result.getClass().getName();
+        if ("kotlin.coroutines.intrinsics.CoroutineSingletons".equals(className)
+                || className.contains("COROUTINE_SUSPENDED")) {
+            return "COROUTINE_SUSPENDED";
+        }
+        return shortObject(result);
+    }
+
+    private String safeInvoke(Object target, String methodName) {
+        Object value = safeInvokeObject(target, methodName);
+        return value == null ? "null" : safeString(String.valueOf(value));
+    }
+
+    private Object safeInvokeObject(Object target, String methodName) {
+        if (target == null) {
+            return null;
+        }
+        try {
+            return callMethod(target, methodName);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private int intInvoke(Object target, String methodName, int fallback) {
+        Object value = safeInvokeObject(target, methodName);
+        return value instanceof Number ? ((Number) value).intValue() : fallback;
+    }
+
+    private String shortObject(Object object) {
+        if (object == null) {
+            return "null";
+        }
+        String value = safeString(String.valueOf(object));
+        if (value.length() > 180) {
+            value = value.substring(0, 180) + "...";
+        }
+        return object.getClass().getName() + "@" + System.identityHashCode(object) + "/" + value;
+    }
+
+    private String compactStackTrace(int limit) {
+        StackTraceElement[] stack = Thread.currentThread().getStackTrace();
+        StringBuilder builder = new StringBuilder();
+        int appended = 0;
+        for (StackTraceElement element : stack) {
+            String className = element.getClassName();
+            if (className == null
+                    || className.equals(Thread.class.getName())
+                    || className.startsWith("com.heartwith.mihealth.lsp.")
+                    || className.startsWith("io.github.libxposed.")
+                    || className.contains("Xposed")) {
+                continue;
+            }
+            if (appended > 0) {
+                builder.append(" <- ");
+            }
+            String simple = className;
+            int dot = simple.lastIndexOf('.');
+            if (dot >= 0 && dot + 1 < simple.length()) {
+                simple = simple.substring(dot + 1);
+            }
+            builder.append(simple).append('.').append(element.getMethodName())
+                    .append(':').append(element.getLineNumber());
+            appended++;
+            if (appended >= limit) {
+                break;
+            }
+        }
+        return builder.length() == 0 ? "empty" : builder.toString();
+    }
+
+    private String describeArgs(Object[] args) {
+        if (args == null || args.length == 0) {
+            return "[]";
+        }
+        StringBuilder builder = new StringBuilder("[");
+        for (int i = 0; i < args.length; i++) {
+            if (i > 0) {
+                builder.append(", ");
+            }
+            Object arg = args[i];
+            if (arg instanceof byte[]) {
+                builder.append("bytes(").append(((byte[]) arg).length).append(")=").append(hex((byte[]) arg));
+            } else {
+                builder.append(shortObject(arg));
+            }
+        }
+        builder.append(']');
+        return builder.toString();
+    }
+
+    private String hex(byte[] bytes) {
+        if (bytes == null) {
+            return "null";
+        }
+        StringBuilder builder = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) {
+            int value = b & 0xff;
+            if (value < 0x10) {
+                builder.append('0');
+            }
+            builder.append(Integer.toHexString(value));
+        }
+        return builder.toString();
+    }
+
+    private void debugSleepLine(String message) {
+        if (!DebugBuild.ENABLED) {
+            return;
+        }
+        String line = "sleep " + message;
+        diagLine(line);
+    }
+
+    private void debugSleepStateLine(String event, String reason, SleepSnapshot snapshot, String detail) {
+        if (!DebugBuild.ENABLED) {
+            return;
+        }
+        StringBuilder builder = new StringBuilder();
+        builder.append("sleep-state event=").append(event == null ? "unknown" : event)
+                .append(", reason=").append(reason == null ? "" : reason)
+                .append(", candidate=").append(sleepCandidateSeenToday)
+                .append(", finalRequested=").append(sleepFinalReportRequested)
+                .append(", trackingDay=").append(formatEpochMillis(sleepTrackingDayStartMs))
+                .append(", finalUploadedKey=")
+                .append(sleepFinalUploadedKey == null || sleepFinalUploadedKey.length() == 0
+                        ? "none"
+                        : sleepFinalUploadedKey)
+                .append(", hookEnabled=").append(heartRateHookEnabled)
+                .append(", worker=").append(isWorkerProcess());
+        if (snapshot != null) {
+            builder.append(", snapshot={").append(describeSleepSnapshot(snapshot)).append("}");
+        }
+        if (detail != null && detail.length() > 0) {
+            builder.append(", detail=").append(detail);
+        }
+        debugSleepLine(builder.toString());
+    }
+
+    private String describeSleepSnapshot(SleepSnapshot snapshot) {
+        if (snapshot == null) {
+            return "null";
+        }
+        return "state=" + snapshot.state
+                + ", source=" + snapshot.source
+                + ", stable=" + snapshot.stable
+                + ", observed=" + formatEpochMillis(snapshot.observedAtMs)
+                + ", bed=" + formatEpochMillis(snapshot.bedAtMs)
+                + ", sleep=" + formatEpochMillis(snapshot.sleepAtMs)
+                + ", wake=" + formatEpochMillis(snapshot.wakeAtMs)
+                + ", goBed=" + formatEpochMillis(snapshot.goBedAtMs)
+                + ", deviceBed=" + formatEpochMillis(snapshot.deviceBedAtMs)
+                + ", leaveBed=" + formatEpochMillis(snapshot.leaveBedAtMs)
+                + ", deviceWake=" + formatEpochMillis(snapshot.deviceWakeAtMs)
+                + ", durationMin=" + snapshot.durationMinutes
+                + ", finalKey=" + finalSleepKey(snapshot);
+    }
+
+    private void debugSyncLine(String message) {
+        if (!DebugBuild.ENABLED) {
+            return;
+        }
+        String line = "sync " + message;
+        diagLine(line);
     }
 
     private long heartRateAgeForDebug() {
@@ -2947,10 +6846,13 @@ public final class MiHealthHookModule extends XposedModule {
         try {
             Class<?> packetClass = findClass("ixs", classLoader);
             Object packet = callStaticMethod(packetClass, "L", data);
-            return extractHrFromIxs(packet);
+            Integer hr = extractHrFromIxs(packet);
+            if (hr != null) {
+                return hr;
+            }
         } catch (Throwable ignored) {
-            return null;
         }
+        return extractHrFromWearRawBytes(data);
     }
 
     private Integer extractHrFromRaw(ClassLoader classLoader, byte[] data) {
@@ -3017,12 +6919,73 @@ public final class MiHealthHookModule extends XposedModule {
         }
     }
 
-    private void diagRawPacket(String source, int type, Object raw) {
+    private Integer extractHrFromWearSportData(Object sportData) {
+        if (sportData == null) {
+            return null;
+        }
+        try {
+            int hr = ((Number) getFieldValue(sportData, "c")).intValue();
+            return hr >= 30 && hr <= 240 ? hr : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private Integer extractHrFromWearRawBytes(byte[] data) {
+        if (data == null || data.length < 4) {
+            return null;
+        }
+        for (int index = 0; index < data.length - 2; index++) {
+            if ((data[index] & 0xff) != 0x20) {
+                continue;
+            }
+            VarintResult value = readVarint(data, index + 1);
+            if (value == null || value.nextIndex >= data.length) {
+                continue;
+            }
+            if ((data[value.nextIndex] & 0xff) != 0x28) {
+                continue;
+            }
+            int hr = value.value;
+            if (hr >= 30 && hr <= 240) {
+                return hr;
+            }
+        }
+        return null;
+    }
+
+    private VarintResult readVarint(byte[] data, int start) {
+        int value = 0;
+        int shift = 0;
+        int index = start;
+        while (index < data.length && shift < 28) {
+            int b = data[index] & 0xff;
+            value |= (b & 0x7f) << shift;
+            index++;
+            if ((b & 0x80) == 0) {
+                return new VarintResult(value, index);
+            }
+            shift += 7;
+        }
+        return null;
+    }
+
+    private static final class VarintResult {
+        final int value;
+        final int nextIndex;
+
+        VarintResult(int value, int nextIndex) {
+            this.value = value;
+            this.nextIndex = nextIndex;
+        }
+    }
+
+    private void diagRawPacket(String source, int type, Object raw, Integer hr) {
         if (!VERBOSE_LOGS || type != 8 || !(raw instanceof byte[])) {
             return;
         }
         byte[] data = (byte[]) raw;
-        diagRaw(source, type, data.length, sampleHash(data), null);
+        diagRaw(source, type, data.length, sampleHash(data), hr);
     }
 
     private void diagPacket(String source, int type, Object packet, Integer hr) {
@@ -3157,15 +7120,11 @@ public final class MiHealthHookModule extends XposedModule {
         final boolean handleHeartRate = context != null && shouldHandleAcceptedHeartRate(source);
         if (!firstHeartRateLogged && handleHeartRate) {
             firstHeartRateLogged = true;
-            if (DebugBuild.ENABLED) {
-                diagLine("heart_rate=" + hr + ", source=" + source);
-            }
-        }
-        if (handleHeartRate && elapsed - lastAcceptedLogMs >= ACCEPTED_LOG_INTERVAL_MS) {
             lastAcceptedLogMs = elapsed;
-            if (DebugBuild.ENABLED) {
-                logLine("heart_rate=" + hr + ", source=" + source);
-            }
+            importantLine("heart_rate first bpm=" + hr + ", source=" + source);
+        } else if (handleHeartRate && elapsed - lastAcceptedLogMs >= ACCEPTED_LOG_INTERVAL_MS) {
+            lastAcceptedLogMs = elapsed;
+            importantLine("heart_rate bpm=" + hr + ", source=" + source);
         }
         if (!handleHeartRate) {
             return;
@@ -3174,6 +7133,7 @@ public final class MiHealthHookModule extends XposedModule {
         clearLegacyKickNeededOnce();
         if (isWorkerProcess()) {
             scheduleHeartRateAlarmWatchdog("heart-rate");
+            maybeFetchSleepStatusAfterHeartRate(context, elapsed, source);
         }
         final boolean updateNotification = shouldUpdateStatus(hr, elapsed);
         final boolean uploadHeartRate = shouldUploadAcceptedHeartRate(source);
@@ -3278,36 +7238,11 @@ public final class MiHealthHookModule extends XposedModule {
         if (DebugBuild.ENABLED) {
             diagLine("heart-rate source reset: " + reason);
         }
+        importantLine("heart-rate source reset: " + reason);
     }
 
     private boolean shouldIgnoreSource(String source) {
-        if (isDeprecatedHeartRateSource(source)) {
-            return true;
-        }
-        String selected = activeSource;
-        if (isDeprecatedHeartRateSource(selected)) {
-            synchronized (this) {
-                if (isDeprecatedHeartRateSource(activeSource)) {
-                    activeSource = null;
-                    activeSourceRestored = false;
-                    persistActiveSource(null);
-                }
-            }
-            selected = activeSource;
-        }
-        if (selected == null || selected.equals(source)) {
-            return false;
-        }
-        if (isMainProcess() && isSportHeartRateSource(source) && !isSportHeartRateSource(selected)) {
-            return false;
-        }
-        if (activeSourceRestored && lastHr <= 0) {
-            return false;
-        }
-        if (isActiveSourceStale(SystemClock.elapsedRealtime())) {
-            return false;
-        }
-        return true;
+        return isDeprecatedHeartRateSource(source);
     }
 
     private boolean lockOrAcceptSource(String source) {
@@ -3331,12 +7266,18 @@ public final class MiHealthHookModule extends XposedModule {
                 maybePersistActiveSource(source);
                 return true;
             }
-            if (isMainProcess() && isSportHeartRateSource(source) && !isSportHeartRateSource(selected)) {
+            if (shouldSwitchHeartRateSource(selected, source, SystemClock.elapsedRealtime())) {
                 synchronized (this) {
-                    activeSource = null;
+                    activeSource = source;
+                    activeSourceElapsedMs = SystemClock.elapsedRealtime();
                     activeSourceRestored = false;
+                    maybePersistActiveSource(source);
+                    importantLine("heart-rate source switched: " + selected + " -> " + source);
+                    if (DebugBuild.ENABLED) {
+                        diagLine("heart-rate source switched: " + selected + " -> " + source);
+                    }
                 }
-                selected = null;
+                return true;
             }
         }
         if (selected != null) {
@@ -3357,6 +7298,7 @@ public final class MiHealthHookModule extends XposedModule {
                 activeSourceElapsedMs = SystemClock.elapsedRealtime();
                 activeSourceRestored = false;
                 maybePersistActiveSource(source);
+                importantLine("heart-rate source locked: " + source);
                 if (DebugBuild.ENABLED) {
                     diagLine("heart-rate source locked: " + source);
                 }
@@ -3364,6 +7306,50 @@ public final class MiHealthHookModule extends XposedModule {
             }
             return activeSource.equals(source);
         }
+    }
+
+    private boolean shouldSwitchHeartRateSource(String selected, String candidate, long elapsed) {
+        if (selected == null || candidate == null || selected.equals(candidate)) {
+            return false;
+        }
+        if (isDeprecatedHeartRateSource(candidate)) {
+            return false;
+        }
+        if (isDeprecatedHeartRateSource(selected)) {
+            return true;
+        }
+        if (activeSourceRestored && lastHr <= 0) {
+            return true;
+        }
+        if (isActiveSourceStale(elapsed)) {
+            return true;
+        }
+        if (isMainProcess() && isSportHeartRateSource(candidate) && !isSportHeartRateSource(selected)) {
+            return true;
+        }
+        return sourcePriority(candidate) > sourcePriority(selected);
+    }
+
+    private int sourcePriority(String source) {
+        if (source == null || isDeprecatedHeartRateSource(source)) {
+            return -1;
+        }
+        if ("huami".equals(source) || source.startsWith("huami-")) {
+            return 100;
+        }
+        if ("wear-raw".equals(source) || "eco-raw".equals(source) || "eco-remote-raw".equals(source)) {
+            return 90;
+        }
+        if ("sport-packet".equals(source) || "eco-packet".equals(source) || "eco-remote-packet".equals(source)) {
+            return 85;
+        }
+        if ("sport-wear-data".equals(source) || "eco-wear-data".equals(source)) {
+            return 80;
+        }
+        if (source.startsWith("twu.")) {
+            return 75;
+        }
+        return 50;
     }
 
     private boolean isActiveSourceStale(long elapsed) {
@@ -3435,6 +7421,39 @@ public final class MiHealthHookModule extends XposedModule {
             intent.putExtra(EXTRA_SPORT_MODE_UNTIL_MS, untilMs);
             context.sendBroadcast(intent);
         } catch (Throwable ignored) {
+        }
+    }
+
+    private void notifyDeviceChangedFromSync(Object device) {
+        Context context = appContext;
+        if (context == null || device == null) {
+            return;
+        }
+        Object didObject = safeInvokeObject(device, "getDid");
+        String did = didObject == null ? null : String.valueOf(didObject);
+        if (did == null || did.length() == 0) {
+            return;
+        }
+        String name = null;
+        Object nameObject = safeInvokeObject(device, "getName");
+        if (nameObject != null) {
+            name = String.valueOf(nameObject);
+        }
+        try {
+            Intent intent = new Intent(ACTION_DEVICE_CHANGED);
+            intent.setPackage(targetPackage);
+            intent.putExtra(EXTRA_DEVICE_DID, did);
+            if (name != null) {
+                intent.putExtra(EXTRA_DEVICE_NAME, name);
+            }
+            context.sendBroadcast(intent);
+            if (DebugBuild.ENABLED) {
+                debugLine("device change broadcast sent did=" + maskDid(did) + ", name=" + name);
+            }
+        } catch (Throwable ignored) {
+            if (DebugBuild.ENABLED) {
+                debugLine("device change broadcast failed: " + describeThrowable(ignored));
+            }
         }
     }
 
@@ -3541,6 +7560,9 @@ public final class MiHealthHookModule extends XposedModule {
         if (!heartRateHookEnabled) {
             return;
         }
+        final long delayMs = reason != null && reason.startsWith("device-changed:")
+                ? 250L
+                : 1_500L;
         try {
             new Handler(context.getMainLooper()).postDelayed(new Runnable() {
                 @Override
@@ -3548,7 +7570,7 @@ public final class MiHealthHookModule extends XposedModule {
                     resetHeartRateSource(reason);
                     ensureRealtimeHrStarted(classLoader, reason);
                 }
-            }, 1_500L);
+            }, delayMs);
         } catch (Throwable ignored) {
         }
     }
@@ -3670,6 +7692,9 @@ public final class MiHealthHookModule extends XposedModule {
         if (DebugBuild.ENABLED) {
             diagLine("hr alarm watchdog stale, restarting realtime heart rate");
         }
+        importantLine("hr alarm watchdog stale, restarting realtime heart rate"
+                + ", lastHr=" + lastHr
+                + ", ageMs=" + heartRateAgeForDebug());
         resetHeartRateSource("watchdog-alarm:no-heart-rate");
         ensureRealtimeHrStarted(classLoader, "watchdog-alarm:no-heart-rate");
         lastHeartRateWatchdogAlarmElapsedMs = 0L;
@@ -3693,7 +7718,14 @@ public final class MiHealthHookModule extends XposedModule {
                 @Override
                 public Object intercept(XposedInterface.Chain chain) throws Throwable {
                     Object result = chain.proceed();
-                    afterHook.after(chain, result);
+                    try {
+                        afterHook.after(chain, result);
+                    } catch (Throwable throwable) {
+                        if (DebugBuild.ENABLED) {
+                            logLine("after hook failed " + target.getName() + "." + methodName
+                                    + ": " + throwable.getClass().getSimpleName());
+                        }
+                    }
                     return result;
                 }
             });
@@ -3891,15 +7923,68 @@ public final class MiHealthHookModule extends XposedModule {
         }
     }
 
+    private void importantLine(String message) {
+        if (message == null || message.length() == 0) {
+            return;
+        }
+        Log.i(TAG, message);
+        log(Log.INFO, TAG, message);
+        DebugSleepLog.line(appContext, processName, message);
+    }
+
     private void diagLine(String message) {
         if (!VERBOSE_LOGS) {
             return;
         }
         Log.i(TAG, message);
         log(Log.INFO, TAG, message);
+        if (DebugBuild.ENABLED) {
+            DebugSleepLog.line(appContext, processName, message);
+        }
     }
 
     private interface AfterHook {
         void after(XposedInterface.Chain chain, Object result) throws Throwable;
+    }
+
+    private static final class SleepSnapshot {
+        final String state;
+        final long observedAtMs;
+        final long bedAtMs;
+        final long sleepAtMs;
+        final long wakeAtMs;
+        final long goBedAtMs;
+        final long deviceBedAtMs;
+        final long leaveBedAtMs;
+        final long deviceWakeAtMs;
+        final String source;
+        final boolean stable;
+        final long durationMinutes;
+
+        SleepSnapshot(String state,
+                      long observedAtMs,
+                      long bedAtMs,
+                      long sleepAtMs,
+                      long wakeAtMs,
+                      long goBedAtMs,
+                      long deviceBedAtMs,
+                      long leaveBedAtMs,
+                      long deviceWakeAtMs,
+                      String source,
+                      boolean stable,
+                      long durationMinutes) {
+            this.state = state;
+            this.observedAtMs = observedAtMs;
+            this.bedAtMs = bedAtMs;
+            this.sleepAtMs = sleepAtMs;
+            this.wakeAtMs = wakeAtMs;
+            this.goBedAtMs = goBedAtMs;
+            this.deviceBedAtMs = deviceBedAtMs;
+            this.leaveBedAtMs = leaveBedAtMs;
+            this.deviceWakeAtMs = deviceWakeAtMs;
+            this.source = source;
+            this.stable = stable;
+            this.durationMinutes = durationMinutes;
+        }
     }
 }

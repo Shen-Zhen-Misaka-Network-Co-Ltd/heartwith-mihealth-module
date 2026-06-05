@@ -6,6 +6,7 @@ import android.util.Log;
 
 import com.heartwith.uploader.HeartwithUploadConfig;
 import com.heartwith.uploader.HeartwithUploadStatusListener;
+import com.heartwith.uploader.HeartwithSleepStatus;
 import com.heartwith.uploader.UrlConnectionHeartwithHttpClient;
 
 import java.util.concurrent.Executor;
@@ -31,6 +32,7 @@ final class HeartwithUploader {
     private long lastFailureLogElapsedMs;
     private long lastSettingsLogElapsedMs;
     private long lastStatusLogElapsedMs;
+    private Context logContext;
 
     HeartwithUploader(Executor worker) {
         delegate = new com.heartwith.uploader.HeartwithUploader(
@@ -55,6 +57,7 @@ final class HeartwithUploader {
     }
 
     synchronized void warmUp(Context context) {
+        rememberContext(context);
         refreshSettingsIfNeeded(context, true);
         configureDelegate();
         logSettings("warmup");
@@ -64,6 +67,7 @@ final class HeartwithUploader {
         if (next == null) {
             return;
         }
+        rememberContext(context);
         settings = next;
         settingsLoaded = true;
         runtimeCacheLoaded = true;
@@ -77,6 +81,7 @@ final class HeartwithUploader {
     }
 
     synchronized boolean setDeviceModel(Context context, String model) {
+        rememberContext(context);
         String next = sanitizeDeviceModel(model);
         if (next.equals(deviceModel)) {
             return false;
@@ -94,6 +99,7 @@ final class HeartwithUploader {
         if (bpm < 30 || bpm > 240) {
             return;
         }
+        rememberContext(context);
         refreshSettingsIfNeeded(context, false);
         if (!settingsLoaded) {
             logState("settings unavailable; keep samples cached in uploader sdk");
@@ -104,6 +110,19 @@ final class HeartwithUploader {
                 System.currentTimeMillis(),
                 null,
                 source == null || source.trim().isEmpty() ? "mi_health_hook" : "mi_health_hook:" + source.trim());
+    }
+
+    synchronized void onSleepStatus(Context context, HeartwithSleepStatus status) {
+        if (status == null) {
+            return;
+        }
+        rememberContext(context);
+        refreshSettingsIfNeeded(context, false);
+        if (!settingsLoaded) {
+            logState("settings unavailable; keep sleep status cached in uploader sdk");
+            configureDelegate();
+        }
+        delegate.submitSleepStatus(status);
     }
 
     private void configureDelegate() {
@@ -234,7 +253,7 @@ final class HeartwithUploader {
     }
 
     private void logUploadStatus(String status) {
-        if (!DebugBuild.ENABLED || status == null || status.trim().isEmpty()) {
+        if (status == null || status.trim().isEmpty()) {
             return;
         }
         long elapsed = SystemClock.elapsedRealtime();
@@ -242,35 +261,47 @@ final class HeartwithUploader {
             return;
         }
         lastStatusLogElapsedMs = elapsed;
-        Log.i(TAG, "upload status: " + status);
+        logImportant("upload status: " + status);
     }
 
     private void logState(String message) {
-        if (DebugBuild.ENABLED) {
-            long elapsed = SystemClock.elapsedRealtime();
-            if (lastFailureLogElapsedMs > 0L && elapsed - lastFailureLogElapsedMs < 60_000L) {
-                return;
-            }
-            lastFailureLogElapsedMs = elapsed;
-            Log.i(TAG, message);
+        long elapsed = SystemClock.elapsedRealtime();
+        if (lastFailureLogElapsedMs > 0L && elapsed - lastFailureLogElapsedMs < 60_000L) {
+            return;
         }
+        lastFailureLogElapsedMs = elapsed;
+        logImportant(message);
     }
 
     private void logSettings(String prefix) {
-        if (DebugBuild.ENABLED) {
-            long elapsed = SystemClock.elapsedRealtime();
-            if (lastSettingsLogElapsedMs > 0L && elapsed - lastSettingsLogElapsedMs < 60_000L) {
-                return;
-            }
-            lastSettingsLogElapsedMs = elapsed;
-            Log.i(TAG, prefix + ": loaded=" + settingsLoaded
-                    + ", enabled=" + settings.enabled
-                    + ", sync=" + settings.syncEnabled
-                    + ", syncIntervalHours=" + settings.syncIntervalHours
-                    + ", server=" + settings.serverUrl
-                    + ", display=" + settings.displayName
-                    + ", device=" + deviceModel);
+        long elapsed = SystemClock.elapsedRealtime();
+        if (lastSettingsLogElapsedMs > 0L && elapsed - lastSettingsLogElapsedMs < 60_000L) {
+            return;
         }
+        lastSettingsLogElapsedMs = elapsed;
+        logImportant(prefix + ": loaded=" + settingsLoaded
+                + ", enabled=" + settings.enabled
+                + ", sync=" + settings.syncEnabled
+                + ", syncIntervalHours=" + settings.syncIntervalHours
+                + ", server=" + settings.serverUrl
+                + ", display=" + settings.displayName
+                + ", device=" + deviceModel);
+    }
+
+    private void rememberContext(Context context) {
+        if (context == null) {
+            return;
+        }
+        Context appContext = context.getApplicationContext();
+        logContext = appContext == null ? context : appContext;
+    }
+
+    private void logImportant(String message) {
+        if (message == null || message.length() == 0) {
+            return;
+        }
+        Log.i(TAG, message);
+        DebugSleepLog.line(logContext, "uploader", message);
     }
 
     private String sanitizeDeviceModel(String value) {
