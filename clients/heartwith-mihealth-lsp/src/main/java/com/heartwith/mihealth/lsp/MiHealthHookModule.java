@@ -2249,7 +2249,7 @@ public final class MiHealthHookModule extends XposedModule {
         String key = snapshot.state + "|" + snapshot.bedAtMs + "|" + snapshot.sleepAtMs + "|"
                 + snapshot.wakeAtMs + "|" + snapshot.goBedAtMs + "|" + snapshot.deviceBedAtMs + "|"
                 + snapshot.leaveBedAtMs + "|" + snapshot.deviceWakeAtMs + "|"
-                + snapshot.durationMinutes + "|" + snapshot.source;
+                + snapshot.durationMinutes + "|" + snapshot.source + "|" + snapshot.segments.size();
         if (key.equals(lastSleepStatusKey)
                 && elapsed - lastSleepStatusUploadElapsedMs < SLEEP_STATUS_POLL_INTERVAL_MS) {
             debugSleepStateLine("upload-skip", "duplicate-window", snapshot,
@@ -2270,14 +2270,16 @@ public final class MiHealthHookModule extends XposedModule {
                 snapshot.deviceWakeAtMs,
                 snapshot.source,
                 snapshot.stable,
-                snapshot.durationMinutes));
+                snapshot.durationMinutes,
+                snapshot.segments));
         debugSleepStateLine("upload-submit", "sdk", snapshot, "key=" + key);
         importantLine("sleep status uploaded state=" + snapshot.state
                 + ", source=" + snapshot.source
                 + ", bed=" + formatEpochMillis(snapshot.bedAtMs)
                 + ", sleep=" + formatEpochMillis(snapshot.sleepAtMs)
                 + ", wake=" + formatEpochMillis(snapshot.wakeAtMs)
-                + ", durationMin=" + snapshot.durationMinutes);
+                + ", durationMin=" + snapshot.durationMinutes
+                + ", segments=" + snapshot.segments.size());
         if (DebugBuild.ENABLED) {
             debugSleepLine("sleep status uploaded state=" + snapshot.state
                     + ", source=" + snapshot.source
@@ -2288,7 +2290,8 @@ public final class MiHealthHookModule extends XposedModule {
                     + ", deviceBed=" + formatEpochMillis(snapshot.deviceBedAtMs)
                     + ", leaveBed=" + formatEpochMillis(snapshot.leaveBedAtMs)
                     + ", deviceWake=" + formatEpochMillis(snapshot.deviceWakeAtMs)
-                    + ", durationMin=" + snapshot.durationMinutes);
+                    + ", durationMin=" + snapshot.durationMinutes
+                    + ", segments=" + snapshot.segments.size());
         }
     }
 
@@ -2305,7 +2308,7 @@ public final class MiHealthHookModule extends XposedModule {
         long bedAtMs = goBedMs > 0L ? goBedMs : deviceBedMs;
         long wakeAtMs = deviceWakeMs > 0L ? deviceWakeMs : leaveBedMs;
         return buildSleepSnapshot(source, bedAtMs, deviceBedMs, wakeAtMs, durationMs,
-                goBedMs, deviceBedMs, leaveBedMs, deviceWakeMs);
+                goBedMs, deviceBedMs, leaveBedMs, deviceWakeMs, null);
     }
 
     private Object allDaySleepObject(Object value) {
@@ -2346,26 +2349,28 @@ public final class MiHealthHookModule extends XposedModule {
         if (report == null) {
             return null;
         }
-        Object primarySegment = findPrimarySleepSegment(safeInvokeObject(report, "getSleepSegments"));
-        long bedMs = secondsToMillis(longInvoke(primarySegment, "getBedTime"));
-        long deviceBedMs = secondsToMillis(longInvoke(primarySegment, "getDeviceBedTime"));
+        Object rawSegments = safeInvokeObject(report, "getSleepSegments");
+        SegmentSleepBounds bounds = segmentSleepBounds(rawSegments);
+        List<HeartwithSleepStatus.Segment> segments = sleepStatusSegments(rawSegments);
+        long bedMs = bounds.bedMs;
+        long deviceBedMs = bounds.deviceBedMs;
         long goBedMs = firstPositiveMillis(
-                secondsToMillis(longInvoke(primarySegment, "getGoBedTime")),
                 secondsToMillis(longInvoke(report, "getGoBedTime")),
+                bounds.goBedMs,
                 bedMs);
-        long wakeMs = secondsToMillis(longInvoke(primarySegment, "getWakeupTime"));
-        long deviceWakeMs = secondsToMillis(longInvoke(primarySegment, "getDeviceWakeupTime"));
+        long wakeMs = bounds.wakeMs;
+        long deviceWakeMs = bounds.deviceWakeMs;
         long leaveBedMs = firstPositiveMillis(
-                secondsToMillis(longInvoke(primarySegment, "getLeaveBedTime")),
                 secondsToMillis(longInvoke(report, "getLeaveBedTime")),
+                bounds.leaveBedMs,
                 wakeMs);
-        long durationMs = Math.max(
-                Math.max(0L, longInvoke(primarySegment, "getSleepDuration")),
-                Math.max(0L, longInvoke(report, "getTotalDuration"))) * 60L * 1000L;
-        long bedAtMs = goBedMs > 0L ? goBedMs : bedMs;
+        long reportDurationMinutes = Math.max(0L, longInvoke(report, "getTotalDuration"));
+        long durationMinutes = reportDurationMinutes > 0L ? reportDurationMinutes : bounds.durationMinutes;
+        long durationMs = durationMinutes * 60L * 1000L;
+        long bedAtMs = earliestPositiveMillis(goBedMs, bedMs, deviceBedMs);
         long wakeAtMs = deviceWakeMs > 0L ? deviceWakeMs : leaveBedMs;
         return buildSleepSnapshot(source, bedAtMs, deviceBedMs, wakeAtMs, durationMs,
-                goBedMs, deviceBedMs, leaveBedMs, deviceWakeMs);
+                goBedMs, deviceBedMs, leaveBedMs, deviceWakeMs, segments);
     }
 
     private SleepSnapshot buildSleepSnapshot(String source,
@@ -2376,7 +2381,8 @@ public final class MiHealthHookModule extends XposedModule {
                                              long goBedAtMs,
                                              long deviceBedAtMs,
                                              long leaveBedAtMs,
-                                             long deviceWakeAtMs) {
+                                             long deviceWakeAtMs,
+                                             List<HeartwithSleepStatus.Segment> segments) {
         long nowMs = System.currentTimeMillis();
         long latestMs = Math.max(bedAtMs, Math.max(sleepAtMs, wakeAtMs));
         if (latestMs <= 0L || nowMs - latestMs > SLEEP_STATUS_MAX_AGE_MS) {
@@ -2407,7 +2413,8 @@ public final class MiHealthHookModule extends XposedModule {
                 deviceWakeAtMs,
                 source == null ? "mi_health_sleep" : source,
                 stable,
-                Math.max(0L, durationMs / 60_000L));
+                Math.max(0L, durationMs / 60_000L),
+                segments == null ? new ArrayList<>() : segments);
     }
 
     private long firstPositiveMillis(long... values) {
@@ -2420,6 +2427,19 @@ public final class MiHealthHookModule extends XposedModule {
             }
         }
         return 0L;
+    }
+
+    private long earliestPositiveMillis(long... values) {
+        long selected = 0L;
+        if (values == null) {
+            return selected;
+        }
+        for (long value : values) {
+            if (value > 0L && (selected == 0L || value < selected)) {
+                selected = value;
+            }
+        }
+        return selected;
     }
 
     private void markSleepCandidateFromRaw(SleepSnapshot snapshot) {
@@ -5780,6 +5800,98 @@ public final class MiHealthHookModule extends XposedModule {
         return selected;
     }
 
+    private SegmentSleepBounds segmentSleepBounds(Object segments) {
+        SegmentSleepBounds bounds = new SegmentSleepBounds();
+        if (!(segments instanceof java.util.List)) {
+            return bounds;
+        }
+        java.util.List<?> list = (java.util.List<?>) segments;
+        for (Object segment : list) {
+            if (segment == null) {
+                continue;
+            }
+            long bedMs = secondsToMillis(longInvoke(segment, "getBedTime"));
+            long wakeMs = secondsToMillis(longInvoke(segment, "getWakeupTime"));
+            long deviceBedMs = secondsToMillis(longInvoke(segment, "getDeviceBedTime"));
+            long deviceWakeMs = secondsToMillis(longInvoke(segment, "getDeviceWakeupTime"));
+            long goBedMs = secondsToMillis(longInvoke(segment, "getGoBedTime"));
+            long leaveBedMs = secondsToMillis(longInvoke(segment, "getLeaveBedTime"));
+            long durationMinutes = longInvoke(segment, "getSleepDuration");
+            if (durationMinutes <= 0L && wakeMs > bedMs) {
+                durationMinutes = (wakeMs - bedMs) / 60_000L;
+            }
+            bounds.bedMs = earliestPositiveMillis(bounds.bedMs, bedMs);
+            bounds.wakeMs = Math.max(bounds.wakeMs, wakeMs);
+            bounds.deviceBedMs = earliestPositiveMillis(bounds.deviceBedMs, deviceBedMs);
+            bounds.deviceWakeMs = Math.max(bounds.deviceWakeMs, deviceWakeMs);
+            bounds.goBedMs = earliestPositiveMillis(bounds.goBedMs, goBedMs);
+            bounds.leaveBedMs = Math.max(bounds.leaveBedMs, leaveBedMs);
+            bounds.durationMinutes += Math.max(0L, durationMinutes);
+        }
+        if (bounds.deviceBedMs == 0L) {
+            bounds.deviceBedMs = bounds.bedMs;
+        }
+        if (bounds.deviceWakeMs == 0L) {
+            bounds.deviceWakeMs = bounds.wakeMs;
+        }
+        return bounds;
+    }
+
+    private List<HeartwithSleepStatus.Segment> sleepStatusSegments(Object segments) {
+        List<HeartwithSleepStatus.Segment> result = new ArrayList<>();
+        if (!(segments instanceof java.util.List)) {
+            return result;
+        }
+        java.util.List<?> list = (java.util.List<?>) segments;
+        for (Object segment : list) {
+            if (segment == null) {
+                continue;
+            }
+            long bedMs = secondsToMillis(longInvoke(segment, "getBedTime"));
+            long wakeMs = secondsToMillis(longInvoke(segment, "getWakeupTime"));
+            long deviceBedMs = secondsToMillis(longInvoke(segment, "getDeviceBedTime"));
+            long deviceWakeMs = secondsToMillis(longInvoke(segment, "getDeviceWakeupTime"));
+            long durationMinutes = longInvoke(segment, "getSleepDuration");
+            if (durationMinutes <= 0L && wakeMs > bedMs) {
+                durationMinutes = (wakeMs - bedMs) / 60_000L;
+            }
+            if (bedMs <= 0L && deviceBedMs > 0L) {
+                bedMs = deviceBedMs;
+            }
+            if (wakeMs <= 0L && deviceWakeMs > 0L) {
+                wakeMs = deviceWakeMs;
+            }
+            if (bedMs <= 0L && wakeMs <= 0L && durationMinutes <= 0L) {
+                continue;
+            }
+            long awakeMinutes = longInvoke(segment, "getWakeDuration");
+            if (awakeMinutes <= 0L) {
+                awakeMinutes = longInvoke(segment, "getAwakeDuration");
+            }
+            long awakeCount = longInvoke(segment, "getWakeCount");
+            if (awakeCount <= 0L) {
+                awakeCount = longInvoke(segment, "getAwakeCount");
+            }
+            long score = longInvoke(segment, "getTotalScore");
+            if (score <= 0L) {
+                score = longInvoke(segment, "getScore");
+            }
+            result.add(new HeartwithSleepStatus.Segment(
+                    bedMs,
+                    wakeMs,
+                    deviceBedMs,
+                    deviceWakeMs,
+                    durationMinutes,
+                    longInvoke(segment, "getDeepDuration"),
+                    longInvoke(segment, "getLightDuration"),
+                    longInvoke(segment, "getRemDuration"),
+                    awakeMinutes,
+                    awakeCount,
+                    score));
+        }
+        return result;
+    }
+
     private int collectionSize(Object value) {
         if (value instanceof java.util.Collection) {
             return ((java.util.Collection<?>) value).size();
@@ -7947,6 +8059,16 @@ public final class MiHealthHookModule extends XposedModule {
         void after(XposedInterface.Chain chain, Object result) throws Throwable;
     }
 
+    private static final class SegmentSleepBounds {
+        long bedMs;
+        long wakeMs;
+        long deviceBedMs;
+        long deviceWakeMs;
+        long goBedMs;
+        long leaveBedMs;
+        long durationMinutes;
+    }
+
     private static final class SleepSnapshot {
         final String state;
         final long observedAtMs;
@@ -7960,6 +8082,7 @@ public final class MiHealthHookModule extends XposedModule {
         final String source;
         final boolean stable;
         final long durationMinutes;
+        final List<HeartwithSleepStatus.Segment> segments;
 
         SleepSnapshot(String state,
                       long observedAtMs,
@@ -7972,7 +8095,8 @@ public final class MiHealthHookModule extends XposedModule {
                       long deviceWakeAtMs,
                       String source,
                       boolean stable,
-                      long durationMinutes) {
+                      long durationMinutes,
+                      List<HeartwithSleepStatus.Segment> segments) {
             this.state = state;
             this.observedAtMs = observedAtMs;
             this.bedAtMs = bedAtMs;
@@ -7985,6 +8109,7 @@ public final class MiHealthHookModule extends XposedModule {
             this.source = source;
             this.stable = stable;
             this.durationMinutes = durationMinutes;
+            this.segments = segments == null ? new ArrayList<>() : segments;
         }
     }
 }
