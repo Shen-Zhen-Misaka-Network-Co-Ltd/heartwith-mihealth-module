@@ -7,14 +7,21 @@ import android.app.Application;
 import android.app.PendingIntent;
 import android.app.job.JobParameters;
 import android.content.BroadcastReceiver;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.ServiceConnection;
 import android.content.pm.PackageManager;
 import android.content.SharedPreferences;
 import android.os.Handler;
 import android.os.Build;
+import android.os.Binder;
 import android.os.Bundle;
+import android.os.IBinder;
+import android.os.IInterface;
+import android.os.Parcel;
+import android.os.RemoteException;
 import android.security.NetworkSecurityPolicy;
 import android.os.SystemClock;
 import android.util.Log;
@@ -49,6 +56,10 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
 import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
@@ -57,6 +68,11 @@ public final class MiHealthHookModule extends XposedModule {
     private static final String TAG = "HeartwithMiHealth";
     private static final String TARGET_PACKAGE = "com.mi.health";
     private static final String PATCHED_TARGET_PACKAGE = "com.mi.health.heartwith";
+    private static final String MI_CONNECT_PACKAGE = "com.xiaomi.mi_connect_service";
+    private static final int MIWEAR_SLEEP_TYPE = 112;
+    private static final int MIWEAR_SLEEP_PIID = 1016;
+    private static final int MIWEAR_DISCOVERY_MIN_SIID = 2;
+    private static final int MIWEAR_DISCOVERY_MAX_SIID = 16;
     private static final String RUNTIME_PREFS = "heartwith_mihealth_runtime";
     private static final String KEY_CACHED_SERVER_URL = "cached_server_url";
     private static final String KEY_SLEEP_FINAL_UPLOADED_KEY = "sleep_final_uploaded_key";
@@ -198,6 +214,10 @@ public final class MiHealthHookModule extends XposedModule {
     private final AtomicBoolean debugSleepRepositoryPending = new AtomicBoolean(false);
     private final AtomicBoolean debugSleepMechanismHooksInstalled = new AtomicBoolean(false);
     private final AtomicBoolean debugXmsSleepStatusHooksInstalled = new AtomicBoolean(false);
+    private final AtomicBoolean miWearSleepHooksInstalled = new AtomicBoolean(false);
+    private final AtomicBoolean miWearReadSent = new AtomicBoolean(false);
+    private final AtomicBoolean miWearNetworkingBound = new AtomicBoolean(false);
+    private final List<Long> miWearDiscoveryRequestIds = new ArrayList<>();
     private final HeartwithUploader uploader = new HeartwithUploader(UPLOAD_WORKER);
     private final List<Object> launchModels = new ArrayList<>();
     private volatile Context appContext;
@@ -273,6 +293,9 @@ public final class MiHealthHookModule extends XposedModule {
     private volatile long lastHeartRateWatchdogAlarmElapsedMs;
     private volatile long lastSyncTriggerElapsedMs;
     private volatile long lastSyncSuccessElapsedMs;
+    private volatile long lastSyncRecoveryElapsedMs;
+    private volatile boolean syncRecoveryScheduled;
+    private volatile boolean deviceSyncInProgress;
     private volatile long lastDebugSleepOnlySyncElapsedMs;
     private volatile int lastDebugSleepOnlySyncHash;
     private volatile long lastXiaomiAutoSyncScheduleElapsedMs;
@@ -283,6 +306,22 @@ public final class MiHealthHookModule extends XposedModule {
     private volatile long lastRuntimeSettingsRefreshElapsedMs;
     private volatile WeakReference<View> syncButtonView = new WeakReference<>(null);
     private volatile WeakReference<View.OnClickListener> syncButtonListener = new WeakReference<>(null);
+    private volatile Object miWearCoreClient;
+    private volatile Object miWearRemoteCore;
+    private volatile String miWearRemoteDid;
+    private volatile Object miWearDataHandler;
+    private volatile String miWearDeviceDid;
+    private volatile String miWearLocalDeviceId;
+    private volatile String miWearPropertyDid;
+    private volatile int miWearPropertySiid = -1;
+    private volatile long miWearRequestSequence;
+    private volatile long miWearSubscribeRequestId = -1L;
+    private volatile Object miWearCallback;
+    private volatile String miWearState;
+    private volatile String miWearLastPropertyEventKey;
+    private volatile int miWearStateGeneration;
+    private volatile long miWearEarliestPropertyRequestElapsedMs;
+    private volatile boolean miWearPropertyRequestScheduled;
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
@@ -906,6 +945,11 @@ public final class MiHealthHookModule extends XposedModule {
         if (context == null || !isWorkerProcess() || !heartRateHookEnabled) {
             return;
         }
+        if (miWearPropertySiid > 0) {
+            sleepStatusPollScheduled.set(false);
+            sleepStatusPollScheduledElapsedMs = 0L;
+            return;
+        }
         long elapsed = SystemClock.elapsedRealtime();
         if (sleepStatusPollScheduled.get()) {
             long ageMs = sleepStatusPollScheduledElapsedMs > 0L
@@ -1015,6 +1059,10 @@ public final class MiHealthHookModule extends XposedModule {
                     "context=" + (context != null) + ", worker=" + isWorkerProcess());
             return;
         }
+        if (deviceSyncInProgress) {
+            debugSleepStateLine("fetch-skip", reason, null, "deviceSyncInProgress=true");
+            return;
+        }
         if (shouldAvoidForcedSleepDirectSync()) {
             debugSleepStateLine("fetch-skip", reason, null, "activeSleepCandidate=true");
             return;
@@ -1054,6 +1102,13 @@ public final class MiHealthHookModule extends XposedModule {
                                                      long elapsedMs,
                                                      final String source) {
         if (context == null || !isWorkerProcess()) {
+            return;
+        }
+        if (deviceSyncInProgress) {
+            if (shouldLogSleepPiggybackSkip(elapsedMs)) {
+                debugSleepStateLine("piggyback-skip", "heart-rate:" + source, null,
+                        "deviceSyncInProgress=true");
+            }
             return;
         }
         if (shouldAvoidForcedSleepDirectSync()) {
@@ -1115,6 +1170,11 @@ public final class MiHealthHookModule extends XposedModule {
         if (context == null || !isWorkerProcess()) {
             debugSleepStateLine("active-raw-only-skip", reason, null,
                     "context=" + (context != null) + ", worker=" + isWorkerProcess());
+            return;
+        }
+        if (deviceSyncInProgress) {
+            debugSleepStateLine("active-raw-only-skip", reason, null,
+                    "deviceSyncInProgress=true");
             return;
         }
         final byte[] dataIdBytes = activeSleepDataIdBytes == null ? null : activeSleepDataIdBytes.clone();
@@ -2321,6 +2381,474 @@ public final class MiHealthHookModule extends XposedModule {
         hookHuamiCallback(classLoader, "com.xiaomi.hm.health.bt.sdk.HuamiDevice$y");
         hookHuamiCallback(classLoader, "com.xiaomi.fit.device.huami.HuaMiApiCallerImpl$startRealtimeMeasureHr$1");
         hookHuamiCallback(classLoader, "com.xiaomi.wearable.HuamiApiImpl$startRealtimeMeasureHr$1");
+    }
+
+    private void hookMiWearSleepChannel(final ClassLoader classLoader) {
+        if (!miWearSleepHooksInstalled.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            Class<?> client = findClass("com.xiaomi.wearable.core.client.MiWearCoreClient", classLoader);
+            int current = hookAllMethodsAround(client, "setCurrentDevice", (chain, method) -> {
+                Object result = chain.proceed();
+                Object device = chain.getArg(0);
+                String did = device == null ? null : String.valueOf(safeInvokeObject(device, "getDid"));
+                if (did == null || "null".equals(did)) {
+                    did = chain.getArg(0) == null ? null : String.valueOf(chain.getArg(0));
+                }
+                if (did != null && !"null".equals(did)) {
+                    miWearCoreClient = chain.getThisObject();
+                    registerMiWearSleepChannel(classLoader, miWearCoreClient, did, "setCurrentDevice");
+                }
+                return result;
+            });
+            int added = hookAllMethodsAround(client, "addDeviceInfo", (chain, method) -> {
+                Object result = chain.proceed();
+                Object device = chain.getArg(0);
+                Object did = device == null ? null : safeInvokeObject(device, "getDid");
+                if (did != null) {
+                    miWearCoreClient = chain.getThisObject();
+                    registerMiWearSleepChannel(classLoader, miWearCoreClient, String.valueOf(did), "addDeviceInfo");
+                }
+                return result;
+            });
+            try {
+                Class<?> lyra = findClass("com.xiaomi.wearable.core.client.LyraService", classLoader);
+                int remote = hookAllMethodsAround(lyra, "setMiWearCore", (chain, method) -> {
+                    Object result = chain.proceed();
+                    if (miWearCoreClient != null && miWearDeviceDid != null) {
+                        registerMiWearRemoteChannel(miWearCoreClient, miWearDeviceDid, "setMiWearCore");
+                    }
+                    return result;
+                });
+                debugSleepLine("miwear-channel-hooks-installed current=" + current
+                        + ", addDevice=" + added + ", remote=" + remote);
+            } catch (Throwable ignored) {
+                debugSleepLine("miwear-channel-hooks-installed current=" + current
+                        + ", addDevice=" + added + ", remote=0");
+            }
+        } catch (Throwable throwable) {
+            miWearSleepHooksInstalled.set(false);
+            debugSleepLine("miwear-channel-hooks-failed error=" + describeThrowable(throwable));
+        }
+    }
+
+    private synchronized void registerMiWearSleepChannel(final ClassLoader classLoader,
+                                                          Object client, String did, String reason) {
+        if (client == null || did == null || did.isEmpty()) {
+            return;
+        }
+        if (did.equals(miWearDeviceDid) && miWearDataHandler != null) {
+            try {
+                registerMiWearRemoteChannel(client, did, reason + ":existing");
+            } catch (Throwable throwable) {
+                debugSleepLine("miwear-channel-existing-failed reason=" + reason
+                        + " error=" + describeThrowable(throwable));
+            }
+            return;
+        }
+        try {
+            Object core = getFieldValue(client, "clientCoreService");
+            if (core == null) {
+                debugSleepLine("miwear-channel-wait reason=" + reason + " did=" + maskDid(did)
+                        + " detail=clientCoreService-null");
+                return;
+            }
+            Class<?> handlerClass = findClass("com.xiaomi.wearable.core.client.IDataHandler", classLoader);
+            Object handler = Proxy.newProxyInstance(classLoader, new Class<?>[]{handlerClass},
+                    (proxy, method, args) -> {
+                        if ("toString".equals(method.getName())) return "HeartwithWearSpecDataHandler";
+                        if (!"handleData".equals(method.getName())) return defaultValue(method.getReturnType());
+                        String packetDid = args != null && args.length > 0 && args[0] != null
+                                ? String.valueOf(args[0]) : null;
+                        int type = args != null && args.length > 1 && args[1] instanceof Number
+                                ? ((Number) args[1]).intValue() : -1;
+                        byte[] payload = args != null && args.length > 2 && args[2] instanceof byte[]
+                                ? (byte[]) args[2] : null;
+                        if (type == MIWEAR_SLEEP_TYPE && did.equals(packetDid)) {
+                            handleMiWearPayload(payload);
+                        }
+                        return method.getReturnType() == Boolean.TYPE ? true : defaultValue(method.getReturnType());
+                    });
+            callMethod(client, "addDeviceDataHandler", did, MIWEAR_SLEEP_TYPE, handler);
+            miWearCoreClient = client;
+            miWearDataHandler = handler;
+            miWearDeviceDid = did;
+            resetMiWearProperty(did);
+            debugSleepLine("miwear-channel-registered reason=" + reason + " did=" + maskDid(did));
+            registerMiWearRemoteChannel(client, did, "client-channel-ready");
+        } catch (Throwable throwable) {
+            debugSleepLine("miwear-channel-register-failed reason=" + reason + " did=" + maskDid(did)
+                    + " error=" + describeThrowable(throwable));
+        }
+    }
+
+    private synchronized void registerMiWearRemoteChannel(Object core, String did, String reason) {
+        if (core == null || did == null || miWearDataHandler == null) return;
+        if (core == miWearRemoteCore && did.equals(miWearRemoteDid)) {
+            return;
+        }
+        try {
+            callMethod(core, "addDeviceDataHandler", did, MIWEAR_SLEEP_TYPE, miWearDataHandler);
+            miWearRemoteCore = core;
+            miWearRemoteDid = did;
+            miWearReadSent.set(false);
+            debugSleepLine("miwear-remote-registered reason=" + reason + " did=" + maskDid(did));
+        } catch (Throwable throwable) {
+            debugSleepLine("miwear-remote-register-failed reason=" + reason + " error=" + describeThrowable(throwable));
+        }
+    }
+
+    private void lookupMiWearLocalDeviceId(final String did) {
+        Context context = appContext;
+        if (context == null || !miWearNetworkingBound.compareAndSet(false, true)) return;
+        final Context bindContext = context.getApplicationContext() == null ? context : context.getApplicationContext();
+        final ServiceConnection connection = new ServiceConnection() {
+            @Override public void onServiceConnected(ComponentName name, IBinder service) {
+                Parcel data = Parcel.obtain();
+                Parcel reply = Parcel.obtain();
+                try {
+                    data.writeInterfaceToken("com.xiaomi.continuity.networking.INetworkingManager");
+                    service.transact(4, data, reply, 0);
+                    reply.readException();
+                    if (reply.readInt() != 0) {
+                        miWearLocalDeviceId = reply.readString();
+                        debugSleepLine("networking-local-device id=" + miWearLocalDeviceId);
+                    }
+                    if (miWearLocalDeviceId != null && miWearRemoteCore != null) {
+                        requestMiWearSleepProperty(miWearRemoteCore, miWearLocalDeviceId, did);
+                    }
+                } catch (Throwable throwable) {
+                    debugSleepLine("networking-local-device-failed error=" + describeThrowable(throwable));
+                } finally {
+                    reply.recycle();
+                    data.recycle();
+                    try { bindContext.unbindService(this); } catch (Throwable ignored) { }
+                    miWearNetworkingBound.set(false);
+                }
+            }
+            @Override public void onServiceDisconnected(ComponentName name) {
+                miWearNetworkingBound.set(false);
+            }
+        };
+        try {
+            Intent intent = new Intent().setClassName(MI_CONNECT_PACKAGE,
+                    "com.xiaomi.continuity.networking.service.NetworkingService");
+            bindContext.bindService(intent, connection, Context.BIND_AUTO_CREATE);
+        } catch (Throwable throwable) {
+            miWearNetworkingBound.set(false);
+            debugSleepLine("networking-bind-failed error=" + describeThrowable(throwable));
+        }
+    }
+
+    private synchronized void resetMiWearProperty(String did) {
+        miWearPropertyDid = did;
+        miWearPropertySiid = -1;
+        miWearLastPropertyEventKey = null;
+        miWearReadSent.set(false);
+        synchronized (miWearDiscoveryRequestIds) { miWearDiscoveryRequestIds.clear(); }
+    }
+
+    private void handleMiWearPayload(byte[] payload) {
+        if (payload == null || payload.length == 0) return;
+        String text = new String(payload, StandardCharsets.UTF_8);
+        int idStart = text.indexOf("{\"id\"");
+        int methodStart = text.indexOf("{\"method\"");
+        int start = idStart >= 0 && methodStart >= 0
+                ? Math.min(idStart, methodStart) : Math.max(idStart, methodStart);
+        int end = text.lastIndexOf('}');
+        if (start < 0) {
+            int idField = text.indexOf("\"id\"");
+            int methodField = text.indexOf("\"method\"");
+            int field = idField >= 0 && methodField >= 0
+                    ? Math.min(idField, methodField) : Math.max(idField, methodField);
+            start = field < 0 ? -1 : text.lastIndexOf('{', field);
+        }
+        if (start < 0 || end <= start || !text.contains("WearSpec4IoT")) return;
+        try {
+            String json = text.substring(start, end + 1);
+            while (json.startsWith("{{")) json = json.substring(1);
+            while (json.endsWith("}}")) json = json.substring(0, json.length() - 1);
+            JSONObject root = new JSONObject(json);
+            long id = root.optLong("id", -1L);
+            String method = root.optString("method", "");
+            JSONArray values = "properties_changed".equals(method)
+                    ? root.optJSONArray("params") : root.optJSONArray("result");
+            if (values == null) return;
+            for (int i = 0; i < values.length(); i++) {
+                JSONObject item = values.optJSONObject(i);
+                if (item == null || item.optInt("piid", -1) != MIWEAR_SLEEP_PIID
+                        || item.optInt("code", 0) != 0) continue;
+                int siid = item.optInt("siid", -1);
+                if (!acceptMiWearProperty(siid, id, method)) continue;
+                if (!item.has("value")) continue;
+                int value = item.optInt("value", -1);
+                if (value != 0 && value != 1) continue;
+                String eventKey = id + "|" + siid + "|" + value;
+                if (eventKey.equals(miWearLastPropertyEventKey)) continue;
+                miWearLastPropertyEventKey = eventKey;
+                miWearPropertySiid = siid;
+                synchronized (miWearDiscoveryRequestIds) { miWearDiscoveryRequestIds.clear(); }
+                String state = value == 0 ? HeartwithSleepStatus.STATE_ASLEEP : "awake";
+                debugSleepLine("miwear-sleep-property siid=" + siid + " piid=" + MIWEAR_SLEEP_PIID
+                        + " kind=" + ("properties_changed".equals(method) ? "push" : "read-response")
+                        + " state=" + state + " value=" + value + " requestId=" + id);
+                cancelSleepStatusPoll(appContext);
+                handleMiWearState(state);
+            }
+        } catch (Throwable throwable) {
+            debugSleepLine("miwear-payload-parse-failed error=" + describeThrowable(throwable));
+        }
+    }
+
+    private synchronized void handleMiWearState(String state) {
+        String previous = miWearState;
+        miWearState = state;
+        final int generation = ++miWearStateGeneration;
+        debugSleepStateLine("miwear-property-state", "property", null,
+                "previous=" + previous + ", current=" + state + ", generation=" + generation);
+        Context context = appContext;
+        if (context == null) return;
+        long delay = HeartwithSleepStatus.STATE_ASLEEP.equals(state)
+                ? 120000L : 300000L;
+        if ("awake".equals(state) && !HeartwithSleepStatus.STATE_ASLEEP.equals(previous)) return;
+        new Handler(context.getMainLooper()).postDelayed(() -> {
+            synchronized (MiHealthHookModule.this) {
+                if (generation != miWearStateGeneration || !state.equals(miWearState)) return;
+            }
+            ClassLoader loader = targetClassLoader;
+            if (HeartwithSleepStatus.STATE_ASLEEP.equals(state)) {
+                SleepSnapshot snapshot = new SleepSnapshot(state, System.currentTimeMillis(), 0L,
+                        System.currentTimeMillis(), 0L, 0L, 0L, 0L, 0L,
+                        "miwear-property", false, 0L, new ArrayList<HeartwithSleepStatus.Segment>());
+                setSleepTrackingState(SLEEP_TRACK_ACTIVE, "miwear-property");
+                publishSleepSnapshot(snapshot);
+                if (loader != null) triggerMiWearTransitionSync(loader, "miwear-asleep");
+            } else if (loader != null) {
+                setSleepTrackingState(SLEEP_TRACK_FINALIZING, "miwear-property");
+                triggerMiWearTransitionSync(loader, "miwear-awake");
+            }
+        }, delay);
+    }
+
+    /**
+     * MiWear callbacks arrive in the device worker process. The normal sync
+     * entry is intentionally main-process-only, so transition sync must call
+     * the device contacts directly here.
+     */
+    private void triggerMiWearTransitionSync(final ClassLoader classLoader, final String reason) {
+        if (classLoader == null || !isWorkerProcess()) {
+            debugSyncLine("miwear transition sync skipped reason=" + reason
+                    + ", worker=" + isWorkerProcess());
+            return;
+        }
+        WORKER.execute(new Runnable() {
+            @Override
+            public void run() {
+                Object device = getCurrentDeviceModel(classLoader);
+                if (device == null) {
+                    debugSyncLine("miwear transition sync skipped: device null, reason=" + reason);
+                    return;
+                }
+                updateDeviceModel(device);
+                String did = getCurrentDeviceId(device);
+                if (did == null || did.length() == 0) {
+                    debugSyncLine("miwear transition sync skipped: did null, reason=" + reason);
+                    return;
+                }
+                lastSleepStatusFetchElapsedMs = SystemClock.elapsedRealtime();
+                boolean wearable = triggerWearableDeviceSync(
+                        classLoader, did, "sleep-transition:" + reason + ":wearable", false);
+                boolean eco = triggerEcoDeviceSync(
+                        classLoader, did, "sleep-transition:" + reason + ":eco", false);
+                debugSyncLine("miwear transition sync reason=" + reason
+                        + ", wearable=" + wearable + ", eco=" + eco);
+                if (!wearable && !eco) {
+                    requestTodaySleepIds(classLoader, did, "sleep-transition:" + reason);
+                }
+            }
+        });
+    }
+
+    private synchronized void scheduleSyncRecovery(final ClassLoader classLoader,
+                                                    final String did,
+                                                    final int type,
+                                                    final Object device) {
+        if (classLoader == null || did == null || did.length() == 0
+                || (!isWorkerProcess() && !isMainProcess())) {
+            return;
+        }
+        long now = SystemClock.elapsedRealtime();
+        if (syncRecoveryScheduled
+                || (lastSyncRecoveryElapsedMs > 0L
+                && now - lastSyncRecoveryElapsedMs < 10L * 60L * 1000L)) {
+            return;
+        }
+        syncRecoveryScheduled = true;
+        debugSyncLine("sync recovery scheduled type=" + type
+                + ", did=" + maskDid(did)
+                + ", device=" + describeDirectSyncDevice(device));
+        Handler handler = appContext == null ? null : new Handler(appContext.getMainLooper());
+        if (handler == null) {
+            syncRecoveryScheduled = false;
+            return;
+        }
+        handler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                synchronized (MiHealthHookModule.this) {
+                    syncRecoveryScheduled = false;
+                    lastSyncRecoveryElapsedMs = SystemClock.elapsedRealtime();
+                }
+                WORKER.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        boolean wearable = triggerWearableDeviceSync(
+                                classLoader, did, "sync-recovery:type" + type + ":wearable", false);
+                        boolean eco = triggerEcoDeviceSync(
+                                classLoader, did, "sync-recovery:type" + type + ":eco", false);
+                        debugSyncLine("sync recovery executed type=" + type
+                                + ", wearable=" + wearable + ", eco=" + eco);
+                    }
+                });
+            }
+        }, 30_000L);
+    }
+
+    private boolean acceptMiWearProperty(int siid, long requestId, String method) {
+        if (siid < MIWEAR_DISCOVERY_MIN_SIID || siid > MIWEAR_DISCOVERY_MAX_SIID) return false;
+        if (miWearDataHandler == null) return true;
+        if (siid == miWearPropertySiid) return true;
+        if ("properties_changed".equals(method)) return false;
+        synchronized (miWearDiscoveryRequestIds) {
+            return miWearDiscoveryRequestIds.contains(requestId);
+        }
+    }
+
+    private synchronized void requestMiWearSleepProperty(Object core, String localId, String did) {
+        if (core == null || localId == null || did == null || miWearReadSent.get()) return;
+        long delay = miWearEarliestPropertyRequestElapsedMs - SystemClock.elapsedRealtime();
+        if (delay > 0L) {
+            if (miWearPropertyRequestScheduled) return;
+            miWearPropertyRequestScheduled = true;
+            Handler handler = appContext == null ? null : new Handler(appContext.getMainLooper());
+            if (handler == null) {
+                miWearPropertyRequestScheduled = false;
+                return;
+            }
+            handler.postDelayed(() -> {
+                synchronized (MiHealthHookModule.this) {
+                    miWearPropertyRequestScheduled = false;
+                }
+                requestMiWearSleepProperty(core, localId, did);
+            }, delay);
+            debugSleepLine("miwear-property-request delayed reason=initial-sync delayMs=" + delay);
+            return;
+        }
+        if (!miWearReadSent.compareAndSet(false, true)) return;
+        if (miWearPropertySiid > 0) {
+            sendMiWearPropertyRequest(core, localId, did, miWearPropertySiid, "get_properties");
+            subscribeMiWearProperty(core, localId, did, miWearPropertySiid, MIWEAR_SLEEP_PIID);
+            return;
+        }
+        sendMiWearDiscovery(core, localId, did, 2);
+        sendMiWearDiscovery(core, localId, did, 6);
+        Handler handler = appContext == null ? null : new Handler(appContext.getMainLooper());
+        if (handler != null) handler.postDelayed(() -> {
+            if (miWearPropertySiid <= 0 && did.equals(miWearDeviceDid)) {
+                for (int siid = MIWEAR_DISCOVERY_MIN_SIID; siid <= MIWEAR_DISCOVERY_MAX_SIID; siid++) {
+                    if (siid != 2 && siid != 6) sendMiWearDiscovery(core, localId, did, siid);
+                }
+            }
+        }, 3000L);
+    }
+
+    private void sendMiWearDiscovery(Object core, String localId, String did, int siid) {
+        long id = nextMiWearRequestId();
+        synchronized (miWearDiscoveryRequestIds) { miWearDiscoveryRequestIds.add(id); }
+        sendMiWearPropertyRequest(core, localId, did, siid, "get_properties", id);
+    }
+
+    private void sendMiWearPropertyRequest(Object core, String localId, String did, int siid, String method) {
+        sendMiWearPropertyRequest(core, localId, did, siid, method, nextMiWearRequestId());
+    }
+
+    private void sendMiWearPropertyRequest(Object core, String localId, String did, int siid,
+                                           String method, long id) {
+        try {
+            JSONObject request = new JSONObject().put("id", id).put("method", method)
+                    .put("params", new JSONArray().put(new JSONObject().put("did", did)
+                            .put("siid", siid).put("piid", MIWEAR_SLEEP_PIID)));
+            byte[] frame = buildMiWearFrame(localId, did, request.toString());
+            debugSleepLine("own-" + ("get_properties".equals(method) ? "read" : "subscribe")
+                    + "-request property=" + siid + "." + MIWEAR_SLEEP_PIID + " requestId=" + id);
+            callMethod(core, "call", MIWEAR_SLEEP_TYPE, did, frame, false,
+                    getMiWearCallback(), 10000);
+        } catch (Throwable throwable) {
+            debugSleepLine("own-request-failed property=" + siid + "." + MIWEAR_SLEEP_PIID
+                    + " error=" + describeThrowable(throwable));
+        }
+    }
+
+    private void subscribeMiWearProperty(Object core, String localId, String did, int siid, int piid) {
+        if (core == null || localId == null || did == null) return;
+        sendMiWearPropertyRequest(core, localId, did, siid, "subscribe_properties");
+    }
+
+    private synchronized long nextMiWearRequestId() {
+        miWearRequestSequence = Math.max(miWearRequestSequence + 1,
+                SystemClock.elapsedRealtime() & 0x7fffffffL);
+        return miWearRequestSequence;
+    }
+
+    private synchronized Object getMiWearCallback() throws Exception {
+        if (miWearCallback != null) return miWearCallback;
+        final Binder binder = new Binder() {
+            @Override protected boolean onTransact(int code, Parcel data, Parcel reply, int flags)
+                    throws RemoteException {
+                if (code == INTERFACE_TRANSACTION) {
+                    if (reply != null) reply.writeString("com.xiaomi.wearable.core.ICallback");
+                    return true;
+                }
+                if (code == 1) {
+                    if (reply != null) reply.writeNoException();
+                    return true;
+                }
+                return super.onTransact(code, data, reply, flags);
+            }
+        };
+        Class<?> callbackClass = findClass("com.xiaomi.wearable.core.ICallback", targetClassLoader);
+        Object callback = Proxy.newProxyInstance(targetClassLoader, new Class<?>[]{callbackClass},
+                (proxy, method, args) -> "asBinder".equals(method.getName())
+                        ? binder : defaultValue(method.getReturnType()));
+        binder.attachInterface((IInterface) callback, "com.xiaomi.wearable.core.ICallback");
+        miWearCallback = callback;
+        return callback;
+    }
+
+    private byte[] buildMiWearFrame(String localId, String did, String json) {
+        int sequence = (int) (SystemClock.elapsedRealtime() & 15L);
+        byte[] topic = "WearSpec4IoT".getBytes(StandardCharsets.UTF_8);
+        byte[] source = localId.getBytes(StandardCharsets.UTF_8);
+        byte[] destination = did.getBytes(StandardCharsets.UTF_8);
+        byte[] body = json.getBytes(StandardCharsets.UTF_8);
+        ByteArrayOutputStream out = new ByteArrayOutputStream(body.length + 64);
+        out.write(25); out.write(4); out.write(0); out.write(0); out.write(0);
+        out.write(255); out.write(sequence); out.write(36); out.write(0); out.write(2);
+        out.write(topic.length); out.write(topic, 0, topic.length);
+        out.write(source.length); out.write(source, 0, source.length); out.write(1);
+        out.write(destination.length); out.write(destination, 0, destination.length);
+        out.write(254); out.write((sequence + 16) & 255); out.write(1);
+        writeMiWearVarInt(out, body.length); out.write(body, 0, body.length);
+        byte[] frame = out.toByteArray();
+        frame[2] = 0; frame[3] = (byte) (frame.length & 255);
+        frame[4] = (byte) ((frame.length >>> 8) & 255);
+        return frame;
+    }
+
+    private void writeMiWearVarInt(ByteArrayOutputStream out, int value) {
+        while ((value & ~127) != 0) { out.write((value & 127) | 128); value >>>= 7; }
+        out.write(value);
     }
 
     private void hookSleepDiagnostics(final ClassLoader classLoader) {
@@ -3806,9 +4334,12 @@ public final class MiHealthHookModule extends XposedModule {
             hookAfter(observersClass, "dispatchResult", new Class<?>[]{String.class, int.class, boolean.class, Object.class}, new AfterHook() {
                 @Override
                 public void after(XposedInterface.Chain chain, Object result) {
+                    String did = String.valueOf(chain.getArg(0));
+                    int type = ((Number) chain.getArg(1)).intValue();
+                    boolean success = Boolean.TRUE.equals(chain.getArg(2));
                     debugSleepLine("direct sync SyncObservers.dispatchResult did=" + maskDid(String.valueOf(chain.getArg(0)))
-                            + ", type=" + chain.getArg(1)
-                            + ", success=" + chain.getArg(2)
+                            + ", type=" + type
+                            + ", success=" + success
                             + ", obj=" + shortObject(chain.getArg(3)));
                 }
             });
@@ -3816,6 +4347,7 @@ public final class MiHealthHookModule extends XposedModule {
                 @Override
                 public void after(XposedInterface.Chain chain, Object result) {
                     Object model = chain.getArg(0);
+                    deviceSyncInProgress = true;
                     debugSleepLine("direct sync SyncObservers.onStart model=" + describeDirectSyncDevice(model));
                     notifyDeviceChangedFromSync(model);
                 }
@@ -3823,6 +4355,7 @@ public final class MiHealthHookModule extends XposedModule {
             hookAfter(observersClass, "onFinish", new Class<?>[]{modelClass, int.class}, new AfterHook() {
                 @Override
                 public void after(XposedInterface.Chain chain, Object result) {
+                    deviceSyncInProgress = false;
                     debugSleepLine("direct sync SyncObservers.onFinish model=" + describeDirectSyncDevice(chain.getArg(0))
                             + ", code=" + chain.getArg(1));
                 }
@@ -3890,10 +4423,15 @@ public final class MiHealthHookModule extends XposedModule {
             hookAfter(adapterClass, "handleDataInternal", new Class<?>[]{String.class, int.class, byte[].class}, new AfterHook() {
                 @Override
                 public void after(XposedInterface.Chain chain, Object result) {
+                    int type = ((Number) chain.getArg(1)).intValue();
+                    byte[] data = (byte[]) chain.getArg(2);
                     debugSleepLine("direct sync adapter.handleData did=" + maskDid(String.valueOf(chain.getArg(0)))
-                            + ", type=" + chain.getArg(1)
-                            + ", data=" + describeBytes((byte[]) chain.getArg(2), 32)
+                            + ", type=" + type
+                            + ", data=" + describeBytes(data, 32)
                             + ", handled=" + result);
+                    if (type == MIWEAR_SLEEP_TYPE && isWorkerProcess()) {
+                        handleMiWearPayload(data);
+                    }
                 }
             });
             hookAfter(adapterClass, "handlePacketInternal", new Class<?>[]{String.class, int.class, byte[].class}, new AfterHook() {
