@@ -1,6 +1,6 @@
 # Heartwith Mi Health LSPosed Client
 
-`clients/heartwith-mihealth-lsp` 是 Heartwith 的分支采集端。它不直接连接 BLE，而是作为 LSPosed / libxposed API 101 模块注入 `com.mi.health`，从小米运动健康的实时心率链路读取心率，再沿用 Heartwith 服务端上传协议。
+`clients/heartwith-mihealth-lsp` 是 Heartwith 的分支采集端。它不直接连接 BLE，而是作为 LSPosed / libxposed API 102 模块注入 `com.mi.health`，从小米运动健康的实时心率链路读取心率，再沿用 Heartwith 服务端上传协议。
 
 ## 数据来源
 
@@ -27,6 +27,12 @@
 LSPosed 分支的 `client_platform` 为 `android-lsposed`，`device_model` 为 `Xiaomi Health Hook`。批量窗口最多 `8s`，离线最多缓存最近 `5min`。
 
 因为上传发生在小米运动健康进程内，`http://` 明文地址不会依赖模块 App 的网络安全配置；模块对 HTTP 使用轻量 HTTP/1.1 POST，对 HTTPS 使用系统 `HttpURLConnection`。
+
+## API 102 与热重载
+
+现代入口声明为 libxposed API 102，`module.prop` 同时开启 `autoHotReload=true`。NPatch/LSPosed 更新模块时，旧模块 generation 会先取消 Alarm、广播、ContentObserver、Activity 回调、MiWear type 112 监听和上传 SDK 定时器，再由新 generation 重新安装 hook。睡眠状态机的必要字符串和 byte 数组通过 API 102 的 classloader-neutral saved state 传递，不携带旧模块对象。
+
+`META-INF/xposed/java_init.list` 保持单一现代入口 `MiHealthHookModule`，因此满足 API 102 热重载的单入口要求；`assets/xposed_init` 中的 Legacy 入口仅用于旧式加载器兼容，NPatch 选择现代管线时不会与现代入口重复执行。
 
 ## 配置同步、状态显示和通知
 

@@ -80,6 +80,10 @@ final class HeartwithUploader {
         return settings;
     }
 
+    synchronized void close() {
+        delegate.close();
+    }
+
     synchronized boolean setDeviceModel(Context context, String model) {
         rememberContext(context);
         String next = sanitizeDeviceModel(model);
