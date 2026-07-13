@@ -38,9 +38,9 @@ android {
     buildTypes {
         getByName("release") {
             signingConfig = signingConfigs.getByName("debug")
-            // Xposed/NPatch discovers entry points and hooks through reflection.
-            // Keep release bytecode unminified; debug-only diagnostics are separated by source set.
-            isMinifyEnabled = false
+            // R8 runs as an optimizer only. Rules keep Xposed/NPatch entry points and names intact
+            // while removing debug-only call sites and their eager string construction.
+            isMinifyEnabled = true
             isShrinkResources = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -52,7 +52,7 @@ android {
 
 dependencies {
     implementation("com.heartwith:heartwith-android-uploader")
-    compileOnly("io.github.libxposed:api:101.0.0")
+    compileOnly("io.github.libxposed:api:102.0.0")
     compileOnly(project(":xposed-api-stub"))
 }
 
