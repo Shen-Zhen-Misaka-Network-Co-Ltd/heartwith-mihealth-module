@@ -20,13 +20,21 @@ public final class SettingsActivity extends Activity {
             if (intent == null) {
                 return;
             }
-            if (HeartwithSleepDebugStatus.ACTION_SLEEP_CHANGED.equals(intent.getAction())) {
+            if (DebugBuild.ENABLED
+                    && HeartwithSleepDebugStatus.ACTION_SLEEP_CHANGED.equals(intent.getAction())) {
                 String summary = intent.getStringExtra(HeartwithSleepDebugStatus.EXTRA_SUMMARY);
                 String details = intent.getStringExtra(HeartwithSleepDebugStatus.EXTRA_DETAILS);
                 long seenMs = intent.getLongExtra(HeartwithSleepDebugStatus.EXTRA_SEEN_MS, System.currentTimeMillis());
                 HeartwithSleepDebugStatus.writeLocal(SettingsActivity.this, summary, details, seenMs);
                 if (controller != null) {
                     controller.refreshSleepDebug();
+                }
+                return;
+            }
+            if (DebugBuild.ENABLED
+                    && HeartwithSleepChannelStatus.ACTION_CHANGED.equals(intent.getAction())) {
+                if (controller != null) {
+                    controller.refreshSleepChannel();
                 }
                 return;
             }
@@ -86,7 +94,10 @@ public final class SettingsActivity extends Activity {
             return;
         }
         IntentFilter filter = new IntentFilter(HeartwithStatus.ACTION_STATUS_CHANGED);
-        filter.addAction(HeartwithSleepDebugStatus.ACTION_SLEEP_CHANGED);
+        if (DebugBuild.ENABLED) {
+            filter.addAction(HeartwithSleepDebugStatus.ACTION_SLEEP_CHANGED);
+            filter.addAction(HeartwithSleepChannelStatus.ACTION_CHANGED);
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(statusReceiver, filter, Context.RECEIVER_EXPORTED);
         } else {

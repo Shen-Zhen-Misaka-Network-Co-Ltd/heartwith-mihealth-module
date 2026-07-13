@@ -12,7 +12,6 @@ public final class SettingsProvider extends ContentProvider {
     public static final String AUTHORITY = "com.heartwith.mihealth.lsp.settings";
     public static final Uri URI = Uri.parse("content://" + AUTHORITY + "/config");
     public static final Uri STATUS_URI = Uri.parse("content://" + AUTHORITY + "/status");
-    public static final Uri SLEEP_URI = Uri.parse("content://" + AUTHORITY + "/sleep");
 
     @Override
     public boolean onCreate() {
@@ -35,7 +34,7 @@ public final class SettingsProvider extends ContentProvider {
             cursor.addRow(new Object[]{status.bpm, status.source, status.seenMs, viewerActiveUntilMs});
             return cursor;
         }
-        if ("sleep".equals(uri.getLastPathSegment())) {
+        if (DebugBuild.ENABLED && "sleep".equals(uri.getLastPathSegment())) {
             HeartwithSleepDebugStatus status = HeartwithSleepDebugStatus.readLocal(getContext());
             MatrixCursor cursor = new MatrixCursor(new String[]{
                     HeartwithSleepDebugStatus.KEY_SLEEP_SUMMARY,
@@ -43,6 +42,26 @@ public final class SettingsProvider extends ContentProvider {
                     HeartwithSleepDebugStatus.KEY_SLEEP_SEEN_MS,
             });
             cursor.addRow(new Object[]{status.summary, status.details, status.seenMs});
+            return cursor;
+        }
+        if (DebugBuild.ENABLED && "sleep-channel".equals(uri.getLastPathSegment())) {
+            HeartwithSleepChannelStatus status = HeartwithSleepChannelStatus.readLocal(getContext());
+            SharedPreferences prefs = getContext()
+                    .getSharedPreferences(HeartwithSettings.PREFS, Context.MODE_PRIVATE);
+            MatrixCursor cursor = new MatrixCursor(new String[]{
+                    HeartwithSleepChannelStatus.KEY_SUMMARY,
+                    HeartwithSleepChannelStatus.KEY_DETAILS,
+                    HeartwithSleepChannelStatus.KEY_SEEN_MS,
+                    HeartwithSleepChannelStatus.KEY_REQUEST_ID,
+                    HeartwithSleepChannelStatus.KEY_REQUESTED_MS,
+            });
+            cursor.addRow(new Object[]{
+                    status.summary,
+                    status.details,
+                    status.seenMs,
+                    prefs.getLong(HeartwithSleepChannelStatus.KEY_REQUEST_ID, 0L),
+                    prefs.getLong(HeartwithSleepChannelStatus.KEY_REQUESTED_MS, 0L),
+            });
             return cursor;
         }
         HeartwithSettings settings = HeartwithSettings.readLocal(getContext());
@@ -89,7 +108,7 @@ public final class SettingsProvider extends ContentProvider {
         if (context == null) {
             return 0;
         }
-        if ("sleep".equals(uri.getLastPathSegment())) {
+        if (DebugBuild.ENABLED && "sleep".equals(uri.getLastPathSegment())) {
             String summary = values.getAsString(HeartwithSleepDebugStatus.KEY_SLEEP_SUMMARY);
             String details = values.getAsString(HeartwithSleepDebugStatus.KEY_SLEEP_DETAILS);
             Long seenMs = values.getAsLong(HeartwithSleepDebugStatus.KEY_SLEEP_SEEN_MS);
@@ -100,8 +119,30 @@ public final class SettingsProvider extends ContentProvider {
                     seenMs == null ? System.currentTimeMillis() : seenMs);
             return 1;
         }
+        if (DebugBuild.ENABLED && "sleep-channel".equals(uri.getLastPathSegment())) {
+            String summary = values.getAsString(HeartwithSleepChannelStatus.KEY_SUMMARY);
+            String details = values.getAsString(HeartwithSleepChannelStatus.KEY_DETAILS);
+            Long seenMs = values.getAsLong(HeartwithSleepChannelStatus.KEY_SEEN_MS);
+            SharedPreferences prefs = context.getSharedPreferences(HeartwithSettings.PREFS, Context.MODE_PRIVATE);
+            SharedPreferences.Editor editor = prefs.edit()
+                    .putString(HeartwithSleepChannelStatus.KEY_SUMMARY, summary == null ? "" : summary)
+                    .putString(HeartwithSleepChannelStatus.KEY_DETAILS, details == null ? "" : details)
+                    .putLong(HeartwithSleepChannelStatus.KEY_SEEN_MS,
+                            seenMs == null ? System.currentTimeMillis() : seenMs);
+            Long requestId = values.getAsLong(HeartwithSleepChannelStatus.KEY_REQUEST_ID);
+            Long requestedMs = values.getAsLong(HeartwithSleepChannelStatus.KEY_REQUESTED_MS);
+            if (requestId != null) {
+                editor.putLong(HeartwithSleepChannelStatus.KEY_REQUEST_ID, requestId);
+            }
+            if (requestedMs != null) {
+                editor.putLong(HeartwithSleepChannelStatus.KEY_REQUESTED_MS, requestedMs);
+            }
+            editor.apply();
+            context.getContentResolver().notifyChange(HeartwithSleepChannelStatus.URI, null);
+            return 1;
+        }
         if (!"status".equals(uri.getLastPathSegment())) {
-            throw new UnsupportedOperationException("status/sleep only");
+            throw new UnsupportedOperationException("status only");
         }
         int bpm = values.getAsInteger(HeartwithStatus.KEY_LAST_BPM) != null
                 ? values.getAsInteger(HeartwithStatus.KEY_LAST_BPM)

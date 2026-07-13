@@ -118,8 +118,11 @@ final class HeartwithSettingsPanel {
     }
 
     static void sendDebugSleepNowBroadcast(Context context) {
+        if (!DebugBuild.ENABLED) {
+            return;
+        }
         for (String packageName : TARGET_PACKAGES) {
-            Intent intent = new Intent(HeartwithSettings.ACTION_DEBUG_SLEEP_NOW);
+            Intent intent = new Intent(HeartwithSleepDebugStatus.ACTION_REQUEST);
             intent.setPackage(packageName);
             intent.addFlags(Intent.FLAG_RECEIVER_FOREGROUND);
             try {
@@ -128,7 +131,28 @@ final class HeartwithSettingsPanel {
             }
         }
         try {
-            Intent intent = new Intent(HeartwithSettings.ACTION_DEBUG_SLEEP_NOW);
+            Intent intent = new Intent(HeartwithSleepDebugStatus.ACTION_REQUEST);
+            intent.addFlags(Intent.FLAG_RECEIVER_FOREGROUND);
+            context.sendBroadcast(intent);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    static void sendSleepChannelNowBroadcast(Context context) {
+        if (!DebugBuild.ENABLED) {
+            return;
+        }
+        for (String packageName : TARGET_PACKAGES) {
+            Intent intent = new Intent(HeartwithSleepChannelStatus.ACTION_REQUEST);
+            intent.setPackage(packageName);
+            intent.addFlags(Intent.FLAG_RECEIVER_FOREGROUND);
+            try {
+                context.sendBroadcast(intent);
+            } catch (Throwable ignored) {
+            }
+        }
+        try {
+            Intent intent = new Intent(HeartwithSleepChannelStatus.ACTION_REQUEST);
             intent.addFlags(Intent.FLAG_RECEIVER_FOREGROUND);
             context.sendBroadcast(intent);
         } catch (Throwable ignored) {
@@ -136,20 +160,23 @@ final class HeartwithSettingsPanel {
     }
 
     static void sendDebugSleepProbeBroadcast(Context context, boolean enabled) {
+        if (!DebugBuild.ENABLED) {
+            return;
+        }
         for (String packageName : TARGET_PACKAGES) {
-            Intent intent = new Intent(HeartwithSettings.ACTION_DEBUG_SLEEP_PROBE);
+            Intent intent = new Intent(HeartwithSleepDebugStatus.ACTION_PROBE);
             intent.setPackage(packageName);
             intent.addFlags(Intent.FLAG_RECEIVER_FOREGROUND);
-            intent.putExtra(HeartwithSettings.EXTRA_DEBUG_SLEEP_PROBE_ENABLED, enabled);
+            intent.putExtra(HeartwithSleepDebugStatus.EXTRA_PROBE_ENABLED, enabled);
             try {
                 context.sendBroadcast(intent);
             } catch (Throwable ignored) {
             }
         }
         try {
-            Intent intent = new Intent(HeartwithSettings.ACTION_DEBUG_SLEEP_PROBE);
+            Intent intent = new Intent(HeartwithSleepDebugStatus.ACTION_PROBE);
             intent.addFlags(Intent.FLAG_RECEIVER_FOREGROUND);
-            intent.putExtra(HeartwithSettings.EXTRA_DEBUG_SLEEP_PROBE_ENABLED, enabled);
+            intent.putExtra(HeartwithSleepDebugStatus.EXTRA_PROBE_ENABLED, enabled);
             context.sendBroadcast(intent);
         } catch (Throwable ignored) {
         }
@@ -285,6 +312,8 @@ final class HeartwithSettingsPanel {
         private final TextView bpmText;
         private final TextView statusText;
         private final TextView sourceText;
+        private TextView sleepChannelSummaryText;
+        private TextView sleepChannelDetailsText;
         private TextView sleepSummaryText;
         private TextView sleepDetailsText;
 
@@ -331,6 +360,63 @@ final class HeartwithSettingsPanel {
             content.addView(statusCard, matchWrap());
 
             if (DebugBuild.ENABLED) {
+                LinearLayout channelCard = card(activity);
+                channelCard.addView(label(activity, "睡眠状态通道", 18, COLOR_TEXT, true), matchWrap());
+                TextView channelHelp = label(activity,
+                        "订阅小米健康官方 type 112 睡眠状态变化；订阅可用时不再定时同步。",
+                        14, COLOR_MUTED, false);
+                channelHelp.setPadding(0, dp(activity, 8), 0, 0);
+                channelCard.addView(channelHelp, matchWrap());
+                sleepChannelSummaryText = label(activity, "尚未收到数据", 20, COLOR_TEXT, true);
+                sleepChannelSummaryText.setPadding(0, dp(activity, 14), 0, 0);
+                channelCard.addView(sleepChannelSummaryText, matchWrap());
+                sleepChannelDetailsText = label(activity,
+                        "等待小米健康产生睡眠状态数据。收到后会显示解析是否成功。",
+                        13, COLOR_MUTED, false);
+                sleepChannelDetailsText.setPadding(0, dp(activity, 8), 0, 0);
+                channelCard.addView(sleepChannelDetailsText, matchWrap());
+                Button fetchChannel = new Button(activity);
+                fetchChannel.setText("主动获取状态");
+                fetchChannel.setAllCaps(false);
+                fetchChannel.setTextSize(15);
+                fetchChannel.setTextColor(COLOR_TEXT);
+                fetchChannel.setBackground(rounded(activity, COLOR_INPUT, 18));
+                fetchChannel.setPadding(dp(activity, 18), dp(activity, 8), dp(activity, 18), dp(activity, 8));
+                fetchChannel.setOnClickListener(v -> {
+                    long now = System.currentTimeMillis();
+                    long requestId = HeartwithSleepChannelStatus.requestNowLocal(activity,
+                            "正在读取当前睡眠状态",
+                            "正在向小米健康请求 type 112 属性；未订阅时会同时建立 properties_changed 监听。",
+                            now);
+                    refreshSleepChannel();
+                    sendSleepChannelNowBroadcast(activity);
+                    new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                        HeartwithSleepChannelStatus status = HeartwithSleepChannelStatus.readLocal(activity);
+                        HeartwithSleepChannelStatus.Request request =
+                                HeartwithSleepChannelStatus.readLocalRequest(activity);
+                        if (request.id != requestId || status.seenMs != now) {
+                            return;
+                        }
+                        HeartwithSleepChannelStatus.writeLocal(activity,
+                                "未收到小米健康响应",
+                                "12 秒内没有收到 type 112 回应。请确认心率 Hook 已启用、小米健康正在运行且手环已连接。",
+                                System.currentTimeMillis());
+                        refreshSleepChannel();
+                    }, 12_000L);
+                    Toast.makeText(activity, "已请求读取当前状态", Toast.LENGTH_SHORT).show();
+                });
+                channelCard.addView(fetchChannel, matchWrapWithTop(activity, 12));
+                Button refreshChannel = new Button(activity);
+                refreshChannel.setText("刷新状态");
+                refreshChannel.setAllCaps(false);
+                refreshChannel.setTextSize(15);
+                refreshChannel.setTextColor(COLOR_TEXT);
+                refreshChannel.setBackground(rounded(activity, COLOR_INPUT, 18));
+                refreshChannel.setPadding(dp(activity, 18), dp(activity, 8), dp(activity, 18), dp(activity, 8));
+                refreshChannel.setOnClickListener(v -> refreshSleepChannel());
+                channelCard.addView(refreshChannel, matchWrapWithTop(activity, 12));
+                content.addView(channelCard, matchWrapWithTop(activity, 18));
+
                 LinearLayout debugCard = card(activity);
                 debugCard.addView(label(activity, "Debug 悬浮红点", 18, COLOR_TEXT, true), matchWrap());
                 TextView debugText = label(activity, "前台调试时显示最近捕获的 BPM、source 和时间；后台仍看通知。", 14, COLOR_MUTED, false);
@@ -523,7 +609,26 @@ final class HeartwithSettingsPanel {
                 statusText.setText("打开小米运动健康的运动页后开始采集");
                 sourceText.setText("来源：尚未采集");
             }
-            refreshSleepDebug();
+            if (DebugBuild.ENABLED) {
+                refreshSleepDebug();
+                refreshSleepChannel();
+            }
+        }
+
+        void refreshSleepChannel() {
+            if (!DebugBuild.ENABLED || sleepChannelSummaryText == null || sleepChannelDetailsText == null) {
+                return;
+            }
+            HeartwithSleepChannelStatus status = HeartwithSleepChannelStatus.readLocal(activity);
+            if (status.summary.isEmpty()) {
+                sleepChannelSummaryText.setText("尚未收到数据");
+                sleepChannelDetailsText.setText("等待小米健康建立 type 112 睡眠状态订阅。");
+                return;
+            }
+            sleepChannelSummaryText.setText(status.summary);
+            String relative = HeartwithStatus.relativeTime(System.currentTimeMillis(), status.seenMs);
+            String details = status.details.isEmpty() ? "" : status.details + "\n";
+            sleepChannelDetailsText.setText(details + "更新时间：" + relative);
         }
 
         void refreshSleepDebug() {

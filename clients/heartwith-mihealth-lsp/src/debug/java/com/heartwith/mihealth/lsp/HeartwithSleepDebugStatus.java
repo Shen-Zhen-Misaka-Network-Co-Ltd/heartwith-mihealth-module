@@ -4,12 +4,17 @@ import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.net.Uri;
 
 final class HeartwithSleepDebugStatus {
     private static final String MODULE_PACKAGE = "com.heartwith.mihealth.lsp";
+    static final Uri URI = Uri.parse("content://" + SettingsProvider.AUTHORITY + "/sleep");
     static final String KEY_SLEEP_SUMMARY = "debug_sleep_summary";
     static final String KEY_SLEEP_DETAILS = "debug_sleep_details";
     static final String KEY_SLEEP_SEEN_MS = "debug_sleep_seen_ms";
+    static final String ACTION_REQUEST = "com.heartwith.mihealth.lsp.DEBUG_SLEEP_NOW";
+    static final String ACTION_PROBE = "com.heartwith.mihealth.lsp.DEBUG_SLEEP_PROBE";
+    static final String EXTRA_PROBE_ENABLED = "debug_sleep_probe_enabled";
     static final String ACTION_SLEEP_CHANGED = "com.heartwith.mihealth.lsp.DEBUG_SLEEP_CHANGED";
     static final String EXTRA_SUMMARY = "summary";
     static final String EXTRA_DETAILS = "details";
@@ -41,7 +46,7 @@ final class HeartwithSleepDebugStatus {
                 .putLong(KEY_SLEEP_SEEN_MS, seenMs)
                 .apply();
         if (MODULE_PACKAGE.equals(context.getPackageName())) {
-            context.getContentResolver().notifyChange(SettingsProvider.SLEEP_URI, null);
+            context.getContentResolver().notifyChange(URI, null);
         }
     }
 
@@ -54,7 +59,7 @@ final class HeartwithSleepDebugStatus {
         values.put(KEY_SLEEP_DETAILS, details == null ? "" : details);
         values.put(KEY_SLEEP_SEEN_MS, seenMs);
         try {
-            context.getContentResolver().update(SettingsProvider.SLEEP_URI, values, null, null);
+            context.getContentResolver().update(URI, values, null, null);
         } catch (Throwable ignored) {
         }
         sendRegisteredStatus(context, summary, details, seenMs);
