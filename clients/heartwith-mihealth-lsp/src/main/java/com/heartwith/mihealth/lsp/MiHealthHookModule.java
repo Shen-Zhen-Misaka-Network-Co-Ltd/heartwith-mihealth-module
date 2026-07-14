@@ -49,7 +49,9 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.Date;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -57,6 +59,7 @@ import java.util.zip.ZipFile;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.json.JSONArray;
@@ -104,6 +107,7 @@ public final class MiHealthHookModule extends XposedModule {
     private static final long LAST_HR_SEEN_PERSIST_MS = 8_000L;
     private static final long DEVICE_MODEL_REFRESH_MS = 30_000L;
     private static final long DEVICE_MODEL_UNRESOLVED_RETRY_MS = 180_000L;
+    private static final long TYPED_HEART_RATE_FALLBACK_STALE_MS = 30_000L;
     private static final long HEART_RATE_WATCHDOG_MS =
             (DebugBuild.ENABLED ? 12L : 60L) * 1000L;
     private static final long HEART_RATE_ALARM_WATCHDOG_MS =
@@ -134,6 +138,8 @@ public final class MiHealthHookModule extends XposedModule {
     private static final long MIWEAR_ACTIVE_REQUEST_MIN_GAP_MS = 1_000L;
     private static final long MIWEAR_ASLEEP_STABLE_MS = 2L * 60L * 1000L;
     private static final long MIWEAR_AWAKE_STABLE_MS = 5L * 60L * 1000L;
+    private static final long MIWEAR_PUSH_PRECEDENCE_MS = 60_000L;
+    private static final long DYNAMIC_HEART_RATE_RETRY_MS = 5L * 60L * 1000L;
     private static final long[] MIWEAR_WAKE_RECHECK_DELAYS_MS =
             new long[]{10L * 60L * 1000L, 30L * 60L * 1000L, 60L * 60L * 1000L};
     private static final long SLEEP_STATUS_MIN_SLEEP_MS = 5L * 60L * 1000L;
@@ -229,6 +235,10 @@ public final class MiHealthHookModule extends XposedModule {
     private final AtomicBoolean miWearReadSent = new AtomicBoolean(false);
     private final AtomicBoolean miWearNetworkingBound = new AtomicBoolean(false);
     private final List<Long> miWearDiscoveryRequestIds = new ArrayList<>();
+    private final ConcurrentHashMap<Class<?>, HeartRateAccessor> heartRateAccessorCache =
+            new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Class<?>, Long> heartRateAccessorMissCache =
+            new ConcurrentHashMap<>();
     private final HeartwithUploader uploader = new HeartwithUploader(UPLOAD_WORKER);
     private final List<Object> launchModels = new ArrayList<>();
     private volatile Context appContext;
@@ -295,7 +305,6 @@ public final class MiHealthHookModule extends XposedModule {
     private volatile long sleepStatusPollScheduledElapsedMs;
     private volatile long lastSleepStatusFetchElapsedMs;
     private volatile String lastSleepStatusKey;
-    private volatile long lastSleepStatusUploadElapsedMs;
     private volatile long sleepTrackingDayStartMs;
     private volatile boolean sleepCandidateSeenToday;
     private volatile boolean sleepFinalReportRequested;
@@ -349,6 +358,8 @@ public final class MiHealthHookModule extends XposedModule {
     private volatile Object miWearCallback;
     private volatile String miWearState;
     private volatile String miWearLastPropertyEventKey;
+    private volatile long lastMiWearPushElapsedMs;
+    private volatile long miWearAwakeObservedAtMs;
     private volatile int miWearStateGeneration;
     private volatile int miWearWakeConfirmationGeneration;
     private volatile long miWearEarliestPropertyRequestElapsedMs;
@@ -357,6 +368,14 @@ public final class MiHealthHookModule extends XposedModule {
     private volatile long lastMiWearActiveRequestElapsedMs;
     private final AtomicBoolean sleepChannelRequestObserverRegistered = new AtomicBoolean();
     private volatile long lastMiWearSleepChannelRequestId;
+    private volatile long lastWearRawDecodeElapsedMs;
+    private volatile long lastEcoRawDecodeElapsedMs;
+    private volatile Class<?> wearablePacketClass;
+    private volatile Method wearablePacketParser;
+    private volatile boolean wearablePacketParserResolved;
+    private volatile Class<?> ecoPacketClass;
+    private volatile Method ecoPacketParser;
+    private volatile boolean ecoPacketParserResolved;
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
@@ -1470,7 +1489,8 @@ public final class MiHealthHookModule extends XposedModule {
         lastSleepStatusFetchElapsedMs = SystemClock.elapsedRealtime();
         String syncReason = "sleep-status:" + reason;
         boolean wearable = triggerWearableDeviceSync(classLoader, did, syncReason + ":wearable", false);
-        boolean eco = triggerEcoDeviceSync(classLoader, did, syncReason + ":eco", false);
+        boolean eco = !wearable
+                && triggerEcoDeviceSync(classLoader, did, syncReason + ":eco", false);
         debugSleepStateLine("direct-sync-request", reason, null,
                 "wearable=" + wearable + ", eco=" + eco + ", waitParser=true");
         if (!wearable && !eco) {
@@ -2292,6 +2312,12 @@ public final class MiHealthHookModule extends XposedModule {
     private void hookLocalWearCore(ClassLoader classLoader) {
         try {
             Class<?> coreExt = findClass("com.xiaomi.wearable.core.CoreExtKt", classLoader);
+            if (hasModernWearCoreApi(coreExt)) {
+                if (DebugBuild.ENABLED) {
+                    diagLine("modern MiWear Core detected; preserve official remote/local selection");
+                }
+                return;
+            }
             hookBooleanNoArg(coreExt, "useLyra", false);
             hookBooleanNoArg(coreExt, "getSupportLyra", false);
             hookBooleanNoArg(coreExt, "getHasLyra", false);
@@ -2304,6 +2330,21 @@ public final class MiHealthHookModule extends XposedModule {
             if (DebugBuild.ENABLED) {
                 diagLine("local wear core hook unavailable: " + throwable.getClass().getSimpleName());
             }
+        }
+    }
+
+    private boolean hasModernWearCoreApi(Class<?> coreExt) {
+        return hasNoArgMethod(coreExt, "useRemoteService")
+                || hasNoArgMethod(coreExt, "getRemoteServiceSupport")
+                || hasNoArgMethod(coreExt, "getUseRemoteConnection");
+    }
+
+    private boolean hasNoArgMethod(Class<?> target, String name) {
+        try {
+            target.getDeclaredMethod(name);
+            return true;
+        } catch (Throwable ignored) {
+            return false;
         }
     }
 
@@ -2978,6 +3019,7 @@ public final class MiHealthHookModule extends XposedModule {
     }
 
     private void hookHeartRateSinks(final ClassLoader classLoader) {
+        hookStableTypedPacketHandlers(classLoader);
         hookWearRawHandler(classLoader);
         hookSportPacketHandler(classLoader, "com.xiaomi.fitness.sport.model.LaunchSportModel$DataHandlerImpl");
         hookSportPacketHandler(classLoader, "com.xiaomi.fitness.sport_manager.model.LaunchSportModel$DataHandlerImpl");
@@ -3146,11 +3188,15 @@ public final class MiHealthHookModule extends XposedModule {
     }
 
     private Object resolveMiWearCoreService(Object client, String did) throws Exception {
-        boolean inLyra = false;
+        Boolean runningOnRemoteService = null;
+        Boolean useRemoteConnection = null;
         try {
             Class<?> coreExt = findClass("com.xiaomi.wearable.core.CoreExtKt", targetClassLoader);
-            Object value = callStaticMethod(coreExt, "getInLyra");
-            inLyra = value instanceof Boolean && (Boolean) value;
+            runningOnRemoteService = callStaticBooleanQuietly(coreExt, "runningOnRemoteService");
+            if (runningOnRemoteService == null) {
+                runningOnRemoteService = callStaticBooleanQuietly(coreExt, "getInLyra");
+            }
+            useRemoteConnection = callStaticBooleanQuietly(coreExt, "getUseRemoteConnection");
         } catch (Throwable throwable) {
             debugSleepLine("miwear-core-mode-unavailable error=" + describeThrowable(throwable));
         }
@@ -3160,8 +3206,32 @@ public final class MiHealthHookModule extends XposedModule {
         if (mapValue instanceof Map<?, ?>) {
             service = ((Map<?, ?>) mapValue).get(did);
         }
-        return inLyra ? (clientService != null ? clientService : service)
+        Object remoteService = getFieldValueQuietly(client, "remoteCoreService");
+        boolean inRemoteProcess = Boolean.TRUE.equals(runningOnRemoteService);
+        Object selected = inRemoteProcess
+                ? (clientService != null ? clientService : service)
                 : (service != null ? service : clientService);
+        if (selected == null) {
+            selected = remoteService;
+        }
+        debugSleepLine("miwear-core-service-selected did=" + maskDid(did)
+                + ", runningOnRemoteService=" + runningOnRemoteService
+                + ", useRemoteConnection=" + useRemoteConnection
+                + ", source=" + (selected == clientService ? "client"
+                : selected == service ? "device-map" : selected == remoteService ? "remote" : "none")
+                + ", client=" + (clientService != null)
+                + ", map=" + (service != null)
+                + ", remote=" + (remoteService != null));
+        return selected;
+    }
+
+    private Boolean callStaticBooleanQuietly(Class<?> target, String name) {
+        try {
+            Object value = callStaticMethod(target, name);
+            return value instanceof Boolean ? (Boolean) value : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 
     private Object findOfficialMiWearAdapter(Object client, String did) {
@@ -3172,6 +3242,14 @@ public final class MiHealthHookModule extends XposedModule {
 
     private void callMiWearCoreHandlerMethod(Object service, String methodName,
                                              String did, Object adapter) throws Exception {
+        Object[] args = new Object[]{did, MIWEAR_SLEEP_TYPE, adapter};
+        try {
+            Method method = findCompatibleMethod(service.getClass(), methodName, false, args);
+            method.invoke(service, args);
+            return;
+        } catch (NoSuchMethodException ignored) {
+            // Older binder proxies do not expose the interface method via reflection.
+        }
         if (!(service instanceof IInterface) || !(adapter instanceof IInterface)) {
             throw new IllegalStateException("MiWear core or handler is not an IInterface");
         }
@@ -3302,6 +3380,8 @@ public final class MiHealthHookModule extends XposedModule {
         miWearPropertySiid = -1;
         miWearLastPropertyEventKey = null;
         miWearState = null;
+        lastMiWearPushElapsedMs = 0L;
+        miWearAwakeObservedAtMs = 0L;
         ++miWearStateGeneration;
         ++miWearWakeConfirmationGeneration;
         miWearSubscriptionActive = false;
@@ -3359,9 +3439,10 @@ public final class MiHealthHookModule extends XposedModule {
                 miWearLastPropertyEventKey = eventKey;
                 miWearPropertySiid = siid;
                 synchronized (miWearDiscoveryRequestIds) { miWearDiscoveryRequestIds.clear(); }
+                boolean pushed = "properties_changed".equals(method);
                 String state = value == 0 ? HeartwithSleepStatus.STATE_ASLEEP : "awake";
                 debugSleepLine("miwear-sleep-property siid=" + siid + " piid=" + MIWEAR_SLEEP_PIID
-                        + " kind=" + ("properties_changed".equals(method) ? "push" : "read-response")
+                        + " kind=" + (pushed ? "push" : "read-response")
                         + " state=" + state + " value=" + value + " requestId=" + id);
                 if (DebugBuild.ENABLED) {
                     HeartwithSleepChannelStatus.writeRemote(appContext,
@@ -3374,10 +3455,10 @@ public final class MiHealthHookModule extends XposedModule {
                 if (miWearMonitorRequested && !miWearSubscriptionActive) {
                     ensureMiWearPropertySubscription();
                 }
-                if ("properties_changed".equals(method)) {
+                if (pushed) {
                     markMiWearSubscriptionActive("properties-changed", id, siid);
                 }
-                handleMiWearState(state);
+                handleMiWearState(state, pushed);
             }
         } catch (Throwable throwable) {
             if (DebugBuild.ENABLED) {
@@ -3430,11 +3511,23 @@ public final class MiHealthHookModule extends XposedModule {
                 + ", requestId=" + requestId + ", property=" + siid + "." + MIWEAR_SLEEP_PIID);
     }
 
-    private synchronized void handleMiWearState(String state) {
+    private synchronized void handleMiWearState(String state, boolean pushed) {
         if (!lifecycleActive || state == null) {
             return;
         }
+        long elapsed = SystemClock.elapsedRealtime();
         String previous = miWearState;
+        if (!pushed && previous != null && !state.equals(previous)
+                && lastMiWearPushElapsedMs > 0L
+                && elapsed - lastMiWearPushElapsedMs < MIWEAR_PUSH_PRECEDENCE_MS) {
+            debugSleepStateLine("miwear-property-state-skip", "read-after-push", null,
+                    "previous=" + previous + ", read=" + state
+                            + ", pushAgeMs=" + (elapsed - lastMiWearPushElapsedMs));
+            return;
+        }
+        if (pushed) {
+            lastMiWearPushElapsedMs = elapsed;
+        }
         if (state.equals(previous)) {
             debugSleepStateLine("miwear-property-state-skip", "unchanged", null,
                     "state=" + state + ", generation=" + miWearStateGeneration);
@@ -3442,39 +3535,66 @@ public final class MiHealthHookModule extends XposedModule {
         }
         miWearState = state;
         final int generation = ++miWearStateGeneration;
+        if (HeartwithSleepStatus.STATE_ASLEEP.equals(state)) {
+            miWearAwakeObservedAtMs = 0L;
+            ++miWearWakeConfirmationGeneration;
+        } else {
+            miWearAwakeObservedAtMs = System.currentTimeMillis();
+        }
         debugSleepStateLine("miwear-property-state", "property", null,
-                "previous=" + previous + ", current=" + state + ", generation=" + generation);
+                "previous=" + previous + ", current=" + state
+                        + ", kind=" + (pushed ? "push" : "read-response")
+                        + ", generation=" + generation);
         Context context = appContext;
         if (context == null) return;
         long delay = HeartwithSleepStatus.STATE_ASLEEP.equals(state)
                 ? MIWEAR_ASLEEP_STABLE_MS : MIWEAR_AWAKE_STABLE_MS;
-        if ("awake".equals(state) && !HeartwithSleepStatus.STATE_ASLEEP.equals(previous)) return;
+        if ("awake".equals(state)
+                && !HeartwithSleepStatus.STATE_ASLEEP.equals(previous)
+                && SLEEP_TRACK_AWAKE.equals(sleepTrackingState)) {
+            return;
+        }
         mainHandler(context).postDelayed(() -> {
             if (!lifecycleActive) {
                 return;
             }
+            boolean confirmWake = false;
             synchronized (MiHealthHookModule.this) {
                 if (generation != miWearStateGeneration || !state.equals(miWearState)) return;
-            }
-            ClassLoader loader = targetClassLoader;
-            if (HeartwithSleepStatus.STATE_ASLEEP.equals(state)) {
-                if (!SLEEP_TRACK_AWAKE.equals(sleepTrackingState)) {
-                    setSleepTrackingState(SLEEP_TRACK_ACTIVE, "miwear-property-resumed");
-                    debugSleepStateLine("miwear-transition-skip", "already-tracking", null,
-                            "state=asleep, generation=" + generation);
-                    return;
+                if (HeartwithSleepStatus.STATE_ASLEEP.equals(state)) {
+                    sleepFinalRecheckScheduledKey = null;
+                    if (SLEEP_TRACK_ACTIVE.equals(sleepTrackingState)) {
+                        sleepFinalReportRequested = false;
+                        pendingRawWakeWindowKey = null;
+                        pendingRawWakeAtMs = 0L;
+                        setSleepTrackingState(SLEEP_TRACK_ACTIVE, "miwear-property-resumed");
+                        debugSleepStateLine("miwear-transition-skip", "already-tracking", null,
+                                "state=asleep, generation=" + generation
+                                        + ", finalizationCancelled=true");
+                        return;
+                    }
+                    if (SLEEP_TRACK_FINALIZING.equals(sleepTrackingState)) {
+                        sleepFinalReportRequested = false;
+                        pendingRawWakeWindowKey = null;
+                        pendingRawWakeAtMs = 0L;
+                    }
+                    long observedAtMs = System.currentTimeMillis();
+                    SleepSnapshot snapshot = new SleepSnapshot(state, observedAtMs, 0L,
+                            0L, 0L, 0L, 0L, 0L, 0L,
+                            "miwear-property", false, 0L,
+                            Collections.<HeartwithSleepStatus.Segment>emptyList());
+                    setSleepTrackingState(SLEEP_TRACK_ACTIVE, "miwear-property");
+                    publishSleepSnapshot(snapshot);
+                    debugSleepStateLine("miwear-transition", "asleep", snapshot,
+                            "status-only=true, directSync=false");
+                } else if (targetClassLoader != null
+                        && !SLEEP_TRACK_AWAKE.equals(sleepTrackingState)) {
+                    setSleepTrackingState(SLEEP_TRACK_FINALIZING, "miwear-property");
+                    confirmWake = true;
                 }
-                SleepSnapshot snapshot = new SleepSnapshot(state, System.currentTimeMillis(), 0L,
-                        System.currentTimeMillis(), 0L, 0L, 0L, 0L, 0L,
-                        "miwear-property", false, 0L,
-                        Collections.<HeartwithSleepStatus.Segment>emptyList());
-                setSleepTrackingState(SLEEP_TRACK_ACTIVE, "miwear-property");
-                publishSleepSnapshot(snapshot);
-                debugSleepStateLine("miwear-transition", "asleep", snapshot,
-                        "status-only=true, directSync=false");
-            } else if (loader != null && !SLEEP_TRACK_AWAKE.equals(sleepTrackingState)) {
-                setSleepTrackingState(SLEEP_TRACK_FINALIZING, "miwear-property");
-                confirmMiWearWake(loader, generation);
+            }
+            if (confirmWake) {
+                confirmMiWearWake(targetClassLoader, generation);
             }
         }, delay);
     }
@@ -3489,6 +3609,7 @@ public final class MiHealthHookModule extends XposedModule {
                 return;
             }
             confirmationGeneration = ++miWearWakeConfirmationGeneration;
+            markSleepFinalReportRequested("miwear-awake");
         }
         boolean existingSync = deviceSyncInProgress;
         boolean rawOnly = !existingSync && enqueueActiveSleepRawOnly(
@@ -3499,7 +3620,8 @@ public final class MiHealthHookModule extends XposedModule {
         String path = existingSync ? "existing-sync" : rawOnly ? "raw-only" : "direct-sync";
         debugSleepStateLine("miwear-wake-confirm", path, null,
                 "stateGeneration=" + stateGeneration
-                        + ", confirmationGeneration=" + confirmationGeneration);
+                        + ", confirmationGeneration=" + confirmationGeneration
+                        + ", observedWake=" + formatEpochMillis(miWearAwakeObservedAtMs));
         scheduleMiWearWakeRechecks(confirmationGeneration);
     }
 
@@ -3565,7 +3687,7 @@ public final class MiHealthHookModule extends XposedModule {
                 lastSleepStatusFetchElapsedMs = SystemClock.elapsedRealtime();
                 boolean wearable = triggerWearableDeviceSync(
                         classLoader, did, "sleep-transition:" + reason + ":wearable", false);
-                boolean eco = triggerEcoDeviceSync(
+                boolean eco = !wearable && triggerEcoDeviceSync(
                         classLoader, did, "sleep-transition:" + reason + ":eco", false);
                 debugSyncLine("miwear transition sync reason=" + reason
                         + ", wearable=" + wearable + ", eco=" + eco);
@@ -3670,7 +3792,7 @@ public final class MiHealthHookModule extends XposedModule {
                         }
                         boolean wearable = triggerWearableDeviceSync(
                                 classLoader, did, "sync-recovery:type" + type + ":wearable", false);
-                        boolean eco = triggerEcoDeviceSync(
+                        boolean eco = !wearable && triggerEcoDeviceSync(
                                 classLoader, did, "sync-recovery:type" + type + ":eco", false);
                         debugSyncLine("sync recovery executed type=" + type
                                 + ", wearable=" + wearable + ", eco=" + eco);
@@ -3682,7 +3804,6 @@ public final class MiHealthHookModule extends XposedModule {
 
     private boolean acceptMiWearProperty(int siid, long requestId, String method) {
         if (siid < MIWEAR_DISCOVERY_MIN_SIID || siid > MIWEAR_DISCOVERY_MAX_SIID) return false;
-        if (miWearDataHandler == null) return true;
         if (siid == miWearPropertySiid) return true;
         if ("properties_changed".equals(method)) return false;
         synchronized (miWearDiscoveryRequestIds) {
@@ -3896,7 +4017,12 @@ public final class MiHealthHookModule extends XposedModule {
         }
     }
 
-    private void publishSleepStatusFromAllDay(String source, Object dataId, Object sleep) {
+    private synchronized void publishSleepStatusFromAllDay(String source, Object dataId, Object sleep) {
+        if (!isWorkerProcess()) {
+            debugSleepStateLine("raw-parse-skip", source, null,
+                    "stateOwner=worker, process=" + processName);
+            return;
+        }
         SleepSnapshot snapshot = sleepSnapshotFromAllDay(source, sleep);
         if (snapshot == null) {
             debugSleepStateLine("raw-parse-empty", source, null, "object=" + shortObject(sleep));
@@ -3917,6 +4043,12 @@ public final class MiHealthHookModule extends XposedModule {
             }
             return;
         }
+        if (!HeartwithSleepStatus.STATE_AWAKE.equals(snapshot.state)
+                && shouldIgnoreActiveRawAfterWake(snapshot, source)) {
+            debugSleepStateLine("raw-active-skip", source, snapshot,
+                    "finalizationInProgress=true");
+            return;
+        }
         markSleepCandidateFromRaw(snapshot);
         cacheActiveSleepDataId(dataId, snapshot);
         if (HeartwithSleepStatus.STATE_AWAKE.equals(snapshot.state)) {
@@ -3933,6 +4065,7 @@ public final class MiHealthHookModule extends XposedModule {
                 return;
             }
             setSleepTrackingState(SLEEP_TRACK_FINALIZING, "raw-wake");
+            markSleepFinalReportRequested("raw-wake:" + source);
             markPendingRawWake(snapshot);
             debugSleepStateLine("raw-wake", source, snapshot, "submit-raw-and-request-final-report");
             publishSleepSnapshot(snapshot);
@@ -3945,7 +4078,12 @@ public final class MiHealthHookModule extends XposedModule {
         publishSleepSnapshot(snapshot);
     }
 
-    private void publishSleepStatusFromReport(String source, Object report) {
+    private synchronized void publishSleepStatusFromReport(String source, Object report) {
+        if (!isWorkerProcess()) {
+            debugSleepStateLine("report-parse-skip", source, null,
+                    "stateOwner=worker, process=" + processName);
+            return;
+        }
         SleepSnapshot snapshot = sleepSnapshotFromReport(source, report);
         debugSleepStateLine("report-parse", source, snapshot, "object=" + shortObject(report));
         if (!shouldPublishFinalSleepReport(snapshot, source)) {
@@ -3956,25 +4094,18 @@ public final class MiHealthHookModule extends XposedModule {
         markFinalSleepUploaded(snapshot);
     }
 
-    private void publishSleepSnapshot(SleepSnapshot snapshot) {
+    private synchronized void publishSleepSnapshot(SleepSnapshot snapshot) {
         if (!lifecycleActive || snapshot == null || !heartRateHookEnabled) {
             debugSleepStateLine("upload-skip", "invalid", snapshot,
                     "hookEnabled=" + heartRateHookEnabled);
             return;
         }
-        long elapsed = SystemClock.elapsedRealtime();
-        String key = snapshot.state + "|" + snapshot.bedAtMs + "|" + snapshot.sleepAtMs + "|"
-                + snapshot.wakeAtMs + "|" + snapshot.goBedAtMs + "|" + snapshot.deviceBedAtMs + "|"
-                + snapshot.leaveBedAtMs + "|" + snapshot.deviceWakeAtMs + "|"
-                + snapshot.durationMinutes + "|" + snapshot.source + "|" + snapshot.segments.size();
-        if (key.equals(lastSleepStatusKey)
-                && elapsed - lastSleepStatusUploadElapsedMs < SLEEP_STATUS_POLL_INTERVAL_MS) {
-            debugSleepStateLine("upload-skip", "duplicate-window", snapshot,
-                    "ageMs=" + (elapsed - lastSleepStatusUploadElapsedMs));
+        String key = sleepSnapshotContentKey(snapshot);
+        if (key.equals(lastSleepStatusKey)) {
+            debugSleepStateLine("upload-skip", "duplicate-content", snapshot, "key=" + key);
             return;
         }
         lastSleepStatusKey = key;
-        lastSleepStatusUploadElapsedMs = elapsed;
         uploader.onSleepStatus(appContext, new HeartwithSleepStatus(
                 snapshot.state,
                 snapshot.observedAtMs,
@@ -4010,6 +4141,34 @@ public final class MiHealthHookModule extends XposedModule {
                     + ", durationMin=" + snapshot.durationMinutes
                     + ", segments=" + snapshot.segments.size());
         }
+    }
+
+    private String sleepSnapshotContentKey(SleepSnapshot snapshot) {
+        StringBuilder key = new StringBuilder(192)
+                .append(snapshot.state).append('|')
+                .append(snapshot.bedAtMs).append('|')
+                .append(snapshot.sleepAtMs).append('|')
+                .append(snapshot.wakeAtMs).append('|')
+                .append(snapshot.goBedAtMs).append('|')
+                .append(snapshot.deviceBedAtMs).append('|')
+                .append(snapshot.leaveBedAtMs).append('|')
+                .append(snapshot.deviceWakeAtMs).append('|')
+                .append(snapshot.durationMinutes).append('|')
+                .append(snapshot.stable ? 1 : 0);
+        for (HeartwithSleepStatus.Segment segment : snapshot.segments) {
+            key.append('|').append(segment.bedAtMs)
+                    .append(',').append(segment.wakeAtMs)
+                    .append(',').append(segment.deviceBedAtMs)
+                    .append(',').append(segment.deviceWakeAtMs)
+                    .append(',').append(segment.durationMinutes)
+                    .append(',').append(segment.deepMinutes)
+                    .append(',').append(segment.lightMinutes)
+                    .append(',').append(segment.remMinutes)
+                    .append(',').append(segment.awakeMinutes)
+                    .append(',').append(segment.awakeCount)
+                    .append(',').append(segment.score);
+        }
+        return key.toString();
     }
 
     private SleepSnapshot sleepSnapshotFromAllDay(String source, Object sleep) {
@@ -4085,21 +4244,11 @@ public final class MiHealthHookModule extends XposedModule {
         long reportDurationMinutes = Math.max(0L, longInvoke(report, "getTotalDuration"));
         long durationMinutes = reportDurationMinutes > 0L ? reportDurationMinutes : bounds.durationMinutes;
         long durationMs = durationMinutes * 60L * 1000L;
-        boolean sleepFinished = isSleepFinished(report)
-                || isRequestedRepositoryFinalReport(source, bounds);
+        boolean sleepFinished = isSleepFinished(report);
         long bedAtMs = earliestPositiveMillis(goBedMs, bedMs, deviceBedMs);
         long wakeAtMs = sleepFinished ? firstPositiveMillis(deviceWakeMs, leaveBedMs) : 0L;
         return buildSleepSnapshot(source, bedAtMs, deviceBedMs, wakeAtMs, durationMs,
                 goBedMs, deviceBedMs, leaveBedMs, deviceWakeMs, sleepFinished, segments);
-    }
-
-    private boolean isRequestedRepositoryFinalReport(String source, SegmentSleepBounds bounds) {
-        return sleepFinalReportRequested
-                && "sleep-repository".equals(source)
-                && bounds != null
-                && firstPositiveMillis(bounds.deviceWakeMs, bounds.wakeMs, bounds.leaveBedMs) > 0L
-                && firstPositiveMillis(bounds.deviceBedMs, bounds.bedMs, bounds.goBedMs) > 0L
-                && bounds.durationMinutes > 0L;
     }
 
     private SleepSnapshot buildSleepSnapshot(String source,
@@ -4198,6 +4347,14 @@ public final class MiHealthHookModule extends XposedModule {
 
     private boolean shouldPublishFinalSleepReport(SleepSnapshot snapshot, String source) {
         if (snapshot == null || !HeartwithSleepStatus.STATE_AWAKE.equals(snapshot.state)) {
+            return false;
+        }
+        if (isMiWearSleepMonitorActive()
+                && HeartwithSleepStatus.STATE_ASLEEP.equals(miWearState)
+                && SLEEP_TRACK_ACTIVE.equals(sleepTrackingState)
+                && !sleepFinalReportRequested) {
+            debugSleepStateLine("report-final-skip", source, snapshot,
+                    "currentMiWearState=asleep");
             return false;
         }
         if (isOlderThanPendingRawWake(snapshot, source)) {
@@ -4312,6 +4469,7 @@ public final class MiHealthHookModule extends XposedModule {
         activeRawSleepWindowKey = key;
         activeRawSleepElapsedMs = SystemClock.elapsedRealtime();
         activeRawSleepDayStartMs = sleepDayStartMillis(snapshot);
+        sleepFinalRecheckScheduledKey = null;
         debugSleepStateLine("active-raw-marked", snapshot.source, snapshot,
                 "window=" + key + ", day=" + formatEpochMillis(activeRawSleepDayStartMs));
     }
@@ -4369,30 +4527,94 @@ public final class MiHealthHookModule extends XposedModule {
     }
 
     private boolean shouldDeferFinalReportForActiveRawSleep(SleepSnapshot snapshot, String source) {
-        if (!hasFreshActiveRawSleep()) {
-            return false;
-        }
-        if (SLEEP_TRACK_ACTIVE.equals(sleepTrackingState)
+        boolean currentlyTrackingActiveWindow = SLEEP_TRACK_ACTIVE.equals(sleepTrackingState)
                 && !sleepFinalReportRequested
-                && !"sleep-repository".equals(source)) {
-            debugSleepStateLine("report-final-skip", source, snapshot,
-                    "waitForRawWake window=" + activeRawSleepWindowKey
-                            + ", ageMs=" + (SystemClock.elapsedRealtime() - activeRawSleepElapsedMs));
-            return true;
+                && activeRawSleepWindowKey != null
+                && activeRawSleepWindowKey.length() > 0;
+        if (!currentlyTrackingActiveWindow && !hasFreshActiveRawSleep()) {
+            return false;
         }
         String reportWindow = sleepWindowKey(snapshot);
         if (reportWindow.length() > 0 && reportWindow.equals(activeRawSleepWindowKey)) {
-            return false;
-        }
-        long reportDayStartMs = sleepDayStartMillis(snapshot);
-        if (activeRawSleepDayStartMs > 0L && reportDayStartMs != activeRawSleepDayStartMs) {
+            if (isStableFinalSleepReport(snapshot)) {
+                debugSleepStateLine("report-final-allow", source, snapshot,
+                        "stableFinalMatchesActiveWindow");
+            }
             return false;
         }
         debugSleepStateLine("report-final-skip", source, snapshot,
-                "activeRawSleep window=" + activeRawSleepWindowKey
+                "differentFromActiveRaw window=" + activeRawSleepWindowKey
                         + ", reportWindow=" + reportWindow
                         + ", ageMs=" + (SystemClock.elapsedRealtime() - activeRawSleepElapsedMs));
         return true;
+    }
+
+    private boolean isStableFinalSleepReport(SleepSnapshot snapshot) {
+        return snapshot != null
+                && snapshot.stable
+                && HeartwithSleepStatus.STATE_AWAKE.equals(snapshot.state)
+                && snapshot.wakeAtMs > 0L;
+    }
+
+    private synchronized void markSleepFinalReportRequested(String reason) {
+        boolean changed = !sleepFinalReportRequested;
+        sleepFinalReportRequested = true;
+        if (changed) {
+            debugSleepStateLine("final-requested", reason, null,
+                    "trackingState=" + sleepTrackingState
+                            + ", candidate=" + sleepCandidateSeenToday);
+        }
+    }
+
+    private boolean shouldIgnoreActiveRawAfterWake(SleepSnapshot snapshot, String source) {
+        if (snapshot == null
+                || HeartwithSleepStatus.STATE_AWAKE.equals(snapshot.state)
+                || "sleep-repository".equals(source)) {
+            return false;
+        }
+        boolean finalizationInProgress = sleepFinalReportRequested
+                || SLEEP_TRACK_FINALIZING.equals(sleepTrackingState);
+        if (!finalizationInProgress) {
+            return false;
+        }
+        String window = sleepWindowKey(snapshot);
+        boolean samePendingWindow = pendingRawWakeWindowKey != null
+                && pendingRawWakeWindowKey.length() > 0
+                && pendingRawWakeWindowKey.equals(window);
+        boolean sameActiveWindow = activeRawSleepWindowKey != null
+                && activeRawSleepWindowKey.length() > 0
+                && activeRawSleepWindowKey.equals(window);
+        boolean alreadyFinalizedWindow = isFinalSleepUploadedForWindow(snapshot);
+        long sleepStartMs = firstPositiveMillis(snapshot.sleepAtMs, snapshot.bedAtMs);
+        long previousWakeMs = Math.max(pendingRawWakeAtMs, currentFinalWakeAtMs());
+        boolean startsAfterPreviousWake = sleepStartMs > 0L
+                && previousWakeMs > 0L
+                && sleepStartMs > previousWakeMs;
+        if (!samePendingWindow && !sameActiveWindow && !alreadyFinalizedWindow
+                && window.length() > 0 && startsAfterPreviousWake) {
+            debugSleepStateLine("raw-active-allow", source, snapshot,
+                    "newWindowAfterWake previousWake=" + formatEpochMillis(previousWakeMs));
+            return false;
+        }
+        debugSleepStateLine("raw-active-skip", source, snapshot,
+                "staleRawDuringFinalization window=" + window
+                        + ", pendingWindow=" + pendingRawWakeWindowKey
+                        + ", activeWindow=" + activeRawSleepWindowKey
+                        + ", finalRequested=" + sleepFinalReportRequested);
+        return true;
+    }
+
+    private long currentFinalWakeAtMs() {
+        String key = currentFinalUploadedKey();
+        int separator = key.lastIndexOf('|');
+        if (separator < 0 || separator + 1 >= key.length()) {
+            return 0L;
+        }
+        try {
+            return Long.parseLong(key.substring(separator + 1));
+        } catch (NumberFormatException ignored) {
+            return 0L;
+        }
     }
 
     private boolean isFinalSleepUploaded(SleepSnapshot snapshot) {
@@ -4514,6 +4736,15 @@ public final class MiHealthHookModule extends XposedModule {
                 handler.postDelayed(new Runnable() {
                     @Override
                     public void run() {
+                        synchronized (MiHealthHookModule.this) {
+                            if (!lifecycleActive
+                                    || !key.equals(sleepFinalRecheckScheduledKey)
+                                    || (isMiWearSleepMonitorActive()
+                                    && HeartwithSleepStatus.STATE_ASLEEP.equals(miWearState)
+                                    && SLEEP_TRACK_ACTIVE.equals(sleepTrackingState))) {
+                                return;
+                            }
+                        }
                         debugSleepStateLine("final-recheck", "delayMs=" + delayMs, snapshot,
                                 "key=" + key + ", did=" + maskDid(did));
                         requestSleepRepositoryReports(classLoader, did, "final-recheck:" + delayMs);
@@ -4589,7 +4820,7 @@ public final class MiHealthHookModule extends XposedModule {
             debugSleepStateLine("final-request-skip", reason, null, "did=null");
             return;
         }
-        sleepFinalReportRequested = true;
+        markSleepFinalReportRequested(reason);
         debugSleepStateLine("final-request", reason, null, "did=" + maskDid(did));
         requestSleepRepositoryReports(classLoader, did, reason);
     }
@@ -5219,7 +5450,12 @@ public final class MiHealthHookModule extends XposedModule {
             Class<?> modelClass = findClass("com.xiaomi.fitness.device.manager.export.WearableDeviceModel", classLoader);
             Class<?> callbackClass = findClass("com.xiaomi.fitness.device.contact.export.DeviceSyncCallback", classLoader);
             Class<?> handlerClass = findClass("com.xiaomi.fitness.device.contact.export.DataHandlerWrapper", classLoader);
-            Class<?> packetClass = findClass("ixs", classLoader);
+            Class<?> packetClass = findFirstClass(
+                    classLoader,
+                    "vit",
+                    "defpackage.vit",
+                    "ixs",
+                    "defpackage.ixs");
             Class<?> onSyncCallbackClass = findClass("com.xiaomi.fitness.device.contact.export.OnSyncCallback", classLoader);
             Class<?> stateListenerClass = findClass("com.xiaomi.fitness.device.contact.export.SyncStateListener", classLoader);
 
@@ -5444,7 +5680,12 @@ public final class MiHealthHookModule extends XposedModule {
 
         try {
             Class<?> bleHandlerClass = findClass("com.xiaomi.fitness.sync.BleDataHandler", classLoader);
-            Class<?> packetClass = findFirstClass(classLoader, "ixs", "defpackage.ixs");
+            Class<?> packetClass = findFirstClass(
+                    classLoader,
+                    "vit",
+                    "defpackage.vit",
+                    "ixs",
+                    "defpackage.ixs");
             hookAfter(bleHandlerClass, "handlePacket", new Class<?>[]{String.class, int.class, packetClass}, new AfterHook() {
                 @Override
                 public void after(XposedInterface.Chain chain, Object result) {
@@ -5605,6 +5846,96 @@ public final class MiHealthHookModule extends XposedModule {
             return;
         }
         debugSleepLine("xms diagnostics installing process=" + processName);
+
+        try {
+            Class<?> serviceClass = findFirstClass(classLoader, "defpackage.gjt", "gjt");
+            Class<?> dataItemClass = findClass("com.xiaomi.xms.wearable.node.DataItem", classLoader);
+            Class<?> queryCallbackClass = findFirstClass(classLoader, "defpackage.ywd", "ywd");
+            Class<?> listenerClass = findFirstClass(classLoader, "defpackage.zwd", "zwd");
+
+            hookAfter(serviceClass, "f1", new Class<?>[]{String.class, dataItemClass, queryCallbackClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            if (!isXmsSleepDataItem(chain.getArg(1))) {
+                                return;
+                            }
+                            debugSleepLine("xms-query gjt.f1 sleep did="
+                                    + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", item=" + describeXmsDataItem(chain.getArg(1))
+                                    + ", callback=" + shortObject(chain.getArg(2)));
+                        }
+                    });
+            hookAfter(serviceClass, "n1", new Class<?>[]{String.class, dataItemClass, listenerClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            if (!isXmsSleepDataItem(chain.getArg(1))) {
+                                return;
+                            }
+                            debugSleepLine("xms-subscribe gjt.n1 sleep did="
+                                    + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", item=" + describeXmsDataItem(chain.getArg(1))
+                                    + ", listener=" + shortObject(chain.getArg(2)));
+                        }
+                    });
+            hookAfter(serviceClass, "R", new Class<?>[]{String.class, dataItemClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            if (!isXmsSleepDataItem(chain.getArg(1))) {
+                                return;
+                            }
+                            debugSleepLine("xms-unsubscribe gjt.R sleep did="
+                                    + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", item=" + describeXmsDataItem(chain.getArg(1)));
+                        }
+                    });
+            hookAfter(serviceClass, "z5", new Class<?>[]{String.class, dataItemClass, Bundle.class},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            if (!isXmsSleepDataItem(chain.getArg(1))) {
+                                return;
+                            }
+                            debugSleepLine("xms-broadcast gjt.z5 sleep did="
+                                    + maskDid(String.valueOf(chain.getArg(0)))
+                                    + ", item=" + describeXmsDataItem(chain.getArg(1))
+                                    + ", bundle=" + describeBundle((Bundle) chain.getArg(2)));
+                        }
+                    });
+            debugSleepLine("xms gjt service hooks installed");
+        } catch (Throwable throwable) {
+            debugSleepLine("xms gjt service hooks unavailable: " + describeThrowable(throwable));
+        }
+
+        try {
+            Class<?> callbackClass = findFirstClass(classLoader, "defpackage.gjt$c", "gjt$c");
+            Class<?> queryStatusClass = findFirstClass(classLoader, "defpackage.a2r", "a2r");
+            hookAfter(callbackClass, "onResult", new Class<?>[]{queryStatusClass},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("xms-query gjt.c.onResult status="
+                                    + describeXmsQueryStatus(chain.getArg(0))
+                                    + ", callback=" + shortObject(chain.getThisObject()));
+                        }
+                    });
+            hookAfter(callbackClass, "onError", new Class<?>[]{int.class},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            debugSleepLine("xms-query gjt.c.onError code=" + chain.getArg(0)
+                                    + ", callback=" + shortObject(chain.getThisObject()));
+                        }
+                    });
+            debugSleepLine("xms gjt query callback hooks installed");
+        } catch (Throwable throwable) {
+            debugSleepLine("xms gjt query callback hooks unavailable: "
+                    + describeThrowable(throwable));
+        }
+
+        // Older releases exposed the same path through a differently obfuscated helper.
         try {
             Class<?> serviceClass = findClass("com.xiaomi.xms.wearable.WearableXmsService", classLoader);
             Class<?> modelClass = findClass("com.xiaomi.fitness.device.manager.export.WearableDeviceModel", classLoader);
@@ -5690,7 +6021,12 @@ public final class MiHealthHookModule extends XposedModule {
         try {
             Class<?> extClass = findClass("com.xiaomi.xms.wearable.extensions.DeviceModelExtKt", classLoader);
             Class<?> modelClass = findClass("com.xiaomi.fitness.device.manager.export.WearableDeviceModel", classLoader);
-            Class<?> callbackClass = findFirstClass(classLoader, "defpackage.oc7", "oc7");
+            Class<?> callbackClass = findFirstClass(
+                    classLoader,
+                    "defpackage.ti7",
+                    "ti7",
+                    "defpackage.oc7",
+                    "oc7");
             hookAfter(extClass, "queryStatus", new Class<?>[]{modelClass, callbackClass},
                     new AfterHook() {
                         @Override
@@ -6503,7 +6839,7 @@ public final class MiHealthHookModule extends XposedModule {
                                     "fallback=repository");
                             requestSleepRepositoryReports(classLoader, did, "raw-ids-empty:" + api + ":" + reason);
                         }
-                    } else if ("onError".equals(name)) {
+                    } else if (isSleepSyncErrorCallback(name)) {
                         debugSleepStateLine("raw-ids-error", api + ":" + reason, null,
                                 "args=" + describeArgs(args));
                         requestSleepRepositoryReports(classLoader, did, "raw-ids-error:" + api + ":" + reason);
@@ -6519,7 +6855,7 @@ public final class MiHealthHookModule extends XposedModule {
                         debugSleepLine("sleep status ids callback failed: " + describeThrowable(throwable));
                     }
                 } finally {
-                    if ("onSuccess".equals(name) || "onError".equals(name)) {
+                    if ("onSuccess".equals(name) || isSleepSyncErrorCallback(name)) {
                         sleepStatusTodayIdsPending.set(false);
                     }
                 }
@@ -6571,12 +6907,14 @@ public final class MiHealthHookModule extends XposedModule {
                 if ("equals".equals(method.getName())) {
                     return proxy == (args == null || args.length == 0 ? null : args[0]);
                 }
-                if ("onError".equals(method.getName())) {
+                if (isSleepSyncErrorCallback(method.getName())) {
                     debugSleepStateLine("raw-sync-error", reason, null,
                             "did=" + maskDid(did) + ", args=" + describeArgs(args));
-                    if (reason != null && reason.startsWith("active-raw-only:")) {
+                    if (isActiveSleepRawOnlyReason(reason)
+                            && !sleepFinalReportRequested
+                            && !SLEEP_TRACK_FINALIZING.equals(sleepTrackingState)) {
                         debugSleepStateLine("raw-sync-error-skip-repository", reason, null,
-                                "activeRawOnly=true");
+                                "activeRawOnly=true, finalization=false");
                     } else {
                         requestSleepRepositoryReports(classLoader, did, "raw-sync-error:" + reason);
                     }
@@ -6584,6 +6922,14 @@ public final class MiHealthHookModule extends XposedModule {
                 return null;
             }
         });
+    }
+
+    private boolean isSleepSyncErrorCallback(String methodName) {
+        return "onError".equals(methodName) || "onSyncError".equals(methodName);
+    }
+
+    private boolean isActiveSleepRawOnlyReason(String reason) {
+        return reason != null && reason.startsWith("active-raw-only:");
     }
 
     private void requestSleepRepositoryReports(final ClassLoader classLoader,
@@ -7100,10 +7446,154 @@ public final class MiHealthHookModule extends XposedModule {
         }
     }
 
+    /**
+     * These wrappers receive the packet after Xiaomi's decoder has run. Keep them as the
+     * primary compatibility path so a packet class rename does not require a module update.
+     */
+    private void hookStableTypedPacketHandlers(final ClassLoader classLoader) {
+        hookTypedPacketHandler(
+                classLoader,
+                "com.xiaomi.fitness.device.contact.export.DataHandlerWrapper",
+                "handlePacket",
+                3,
+                0,
+                1,
+                "wear-typed",
+                false);
+        hookTypedPacketHandler(
+                classLoader,
+                "com.xiaomi.fitness.sync.BleDataHandler",
+                "handlePacket",
+                3,
+                0,
+                1,
+                "wear-typed",
+                false);
+        hookTypedPacketHandler(
+                classLoader,
+                "com.xiaomi.fitness.eco.device.contact.export.EcoDataHandlerWrapper",
+                "handleEcoPacket",
+                3,
+                0,
+                1,
+                "eco-typed",
+                true);
+        hookTypedPacketHandler(
+                classLoader,
+                "com.xiaomi.fitness.connect.export.EcoDeviceHandlerImpl",
+                "handlePacket",
+                2,
+                -1,
+                0,
+                "eco-typed",
+                true);
+    }
+
+    private void hookTypedPacketHandler(
+            final ClassLoader classLoader,
+            String className,
+            String methodName,
+            int parameterCount,
+            int stringParameterIndex,
+            int intParameterIndex,
+            final String source,
+            boolean eco) {
+        try {
+            Class<?> handlerClass = findClass(className, classLoader);
+            final Method method = findMethodWithParameterShape(
+                    handlerClass,
+                    methodName,
+                    parameterCount,
+                    stringParameterIndex,
+                    intParameterIndex);
+            int packetIndex = findReferenceParameterIndex(method.getParameterTypes(), stringParameterIndex, intParameterIndex);
+            if (packetIndex < 0) {
+                throw new NoSuchMethodException(className + "#" + methodName + " packet parameter");
+            }
+            registerPacketClass(method.getParameterTypes()[packetIndex], eco);
+            hookAfter(method, className + "#" + methodName, new AfterHook() {
+                @Override
+                public void after(XposedInterface.Chain chain, Object result) {
+                    int type = ((Number) chain.getArg(intParameterIndex)).intValue();
+                    if (type != 8 || shouldIgnoreSource(source)) {
+                        return;
+                    }
+                    if (!shouldUseTypedHeartRateFallback(eco)) {
+                        return;
+                    }
+                    Object packet = chain.getArg(packetIndex);
+                    Integer hr = extractHrFromPacket(packet);
+                    if (hr != null) {
+                        onHeartRate(hr, source);
+                    } else if (DebugBuild.ENABLED) {
+                        diagPacketShape(source, packet);
+                    }
+                }
+            });
+            if (DebugBuild.ENABLED) {
+                diagLine("typed packet hook installed: " + className
+                        + "#" + method.getName()
+                        + ", packet=" + method.getParameterTypes()[packetIndex].getName());
+            }
+        } catch (Throwable throwable) {
+            if (DebugBuild.ENABLED) {
+                diagLine("typed packet hook unavailable: " + className
+                        + "#" + methodName + ": " + throwable.getClass().getSimpleName());
+            }
+        }
+    }
+
+    private int findReferenceParameterIndex(
+            Class<?>[] parameterTypes,
+            int stringParameterIndex,
+            int intParameterIndex) {
+        for (int i = parameterTypes.length - 1; i >= 0; i--) {
+            if (i == stringParameterIndex || i == intParameterIndex) {
+                continue;
+            }
+            Class<?> type = parameterTypes[i];
+            if (!type.isPrimitive() && type != String.class && type != byte[].class) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private void registerPacketClass(Class<?> packetClass, boolean eco) {
+        if (packetClass == null
+                || packetClass == Object.class
+                || packetClass.isPrimitive()
+                || packetClass == String.class
+                || packetClass == byte[].class) {
+            return;
+        }
+        if (eco) {
+            if (ecoPacketClass == null || ecoPacketClass == Object.class) {
+                ecoPacketClass = packetClass;
+                ecoPacketParserResolved = false;
+            }
+        } else if (wearablePacketClass == null || wearablePacketClass == Object.class) {
+            wearablePacketClass = packetClass;
+            wearablePacketParserResolved = false;
+        }
+    }
+
+    private boolean shouldUseTypedHeartRateFallback(boolean eco) {
+        long lastRaw = eco ? lastEcoRawDecodeElapsedMs : lastWearRawDecodeElapsedMs;
+        return lastRaw <= 0L
+                || SystemClock.elapsedRealtime() - lastRaw >= TYPED_HEART_RATE_FALLBACK_STALE_MS;
+    }
+
     private void hookWearRawHandler(final ClassLoader classLoader) {
         try {
             Class<?> adapterClass = findClass("com.xiaomi.fitness.device.contact.DeviceDataHandlerAdapter", classLoader);
-            Method method = adapterClass.getDeclaredMethod("handlePacketInternal", String.class, int.class, byte[].class);
+            Method method = findByteArrayHandlerMethod(
+                    adapterClass,
+                    "handlePacketInternal",
+                    3,
+                    0,
+                    1,
+                    2);
             method.setAccessible(true);
             hook(method).intercept(new XposedInterface.Hooker() {
                 @Override
@@ -7118,6 +7608,7 @@ public final class MiHealthHookModule extends XposedModule {
                         Integer hr = extractHrFromWearRaw(classLoader, (byte[]) raw);
                         diagRawPacket(source, type, raw, hr);
                         if (hr != null) {
+                            lastWearRawDecodeElapsedMs = SystemClock.elapsedRealtime();
                             onHeartRate(hr, source);
                         }
                     } else {
@@ -7133,8 +7624,8 @@ public final class MiHealthHookModule extends XposedModule {
     private void hookEcoPacketHandler(final ClassLoader classLoader, final String className) {
         try {
             Class<?> handlerClass = findClass(className, classLoader);
-            Class<?> packetClass = findClass("kxs", classLoader);
-            Method method = handlerClass.getDeclaredMethod("handleEcoPacket", String.class, int.class, packetClass);
+            Method method = findMethodWithParameterShape(handlerClass, "handleEcoPacket", 3, 0, 1);
+            registerPacketClass(method.getParameterTypes()[2], true);
             method.setAccessible(true);
             hook(method).intercept(new XposedInterface.Hooker() {
                 @Override
@@ -7146,9 +7637,10 @@ public final class MiHealthHookModule extends XposedModule {
                     }
                     int type = ((Number) chain.getArg(1)).intValue();
                     if (type == 8) {
-                        Integer hr = extractHrFromKxs(chain.getArg(2));
+                        Integer hr = extractHrFromPacket(chain.getArg(2));
                         diagPacket(source, type, chain.getArg(2), hr);
                         if (hr != null) {
+                            lastEcoRawDecodeElapsedMs = SystemClock.elapsedRealtime();
                             onHeartRate(hr, source);
                         }
                     }
@@ -7156,7 +7648,8 @@ public final class MiHealthHookModule extends XposedModule {
                 }
             });
             if (DebugBuild.ENABLED) {
-                diagLine("eco packet hook installed: " + className);
+                diagLine("eco packet hook installed: " + className
+                        + "#" + method.getParameterTypes()[2].getName());
             }
         } catch (Throwable throwable) {
             if (DebugBuild.ENABLED) {
@@ -7168,8 +7661,8 @@ public final class MiHealthHookModule extends XposedModule {
     private void hookSportPacketHandler(final ClassLoader classLoader, final String className) {
         try {
             Class<?> handlerClass = findClass(className, classLoader);
-            Class<?> packetClass = findClass("ixs", classLoader);
-            Method method = handlerClass.getDeclaredMethod("handlePacket", String.class, int.class, packetClass);
+            Method method = findMethodWithParameterShape(handlerClass, "handlePacket", 3, 0, 1);
+            registerPacketClass(method.getParameterTypes()[2], false);
             method.setAccessible(true);
             hook(method).intercept(new XposedInterface.Hooker() {
                 @Override
@@ -7182,13 +7675,14 @@ public final class MiHealthHookModule extends XposedModule {
                     int type = ((Number) chain.getArg(1)).intValue();
                     if (type == 8) {
                         Object packet = chain.getArg(2);
-                        Integer hr = extractHrFromIxs(packet);
+                        Integer hr = extractHrFromPacket(packet);
                         if (hr == null) {
                             diagPacketShape(source, packet);
                         } else {
                             diagPacket(source, type, packet, hr);
                         }
                         if (hr != null) {
+                            lastWearRawDecodeElapsedMs = SystemClock.elapsedRealtime();
                             onHeartRate(hr, source);
                         }
                     }
@@ -7196,7 +7690,8 @@ public final class MiHealthHookModule extends XposedModule {
                 }
             });
             if (DebugBuild.ENABLED) {
-                diagLine("sport packet hook installed: " + className);
+                diagLine("sport packet hook installed: " + className
+                        + "#" + method.getParameterTypes()[2].getName());
             }
         } catch (Throwable throwable) {
             if (DebugBuild.ENABLED) {
@@ -7209,7 +7704,13 @@ public final class MiHealthHookModule extends XposedModule {
         try {
             Class<?> wrapperClass = findClass(
                     "com.xiaomi.fitness.eco.device.contact.export.EcoDataHandlerWrapper", classLoader);
-            Method method = wrapperClass.getDeclaredMethod("handleDataInternal", String.class, int.class, byte[].class);
+            Method method = findByteArrayHandlerMethod(
+                    wrapperClass,
+                    "handleDataInternal",
+                    3,
+                    0,
+                    1,
+                    2);
             method.setAccessible(true);
             hook(method).intercept(new XposedInterface.Hooker() {
                 @Override
@@ -7225,6 +7726,7 @@ public final class MiHealthHookModule extends XposedModule {
                         Integer hr = extractHrFromRaw(classLoader, (byte[]) raw);
                         diagRawPacket(source, type, raw, hr);
                         if (hr != null) {
+                            lastEcoRawDecodeElapsedMs = SystemClock.elapsedRealtime();
                             onHeartRate(hr, source);
                         }
                     } else {
@@ -7239,11 +7741,16 @@ public final class MiHealthHookModule extends XposedModule {
 
     private void hookEcoRemoteDataHandler(final ClassLoader classLoader) {
         try {
-            final Class<?> packetClass = findClass("kxs", classLoader);
             Class<?> handlerClass = findClass(
                     "com.xiaomi.fitness.eco.device.contact.remote.EcoDeviceDataHandler", classLoader);
 
-            Method handleData = handlerClass.getDeclaredMethod("handleData", int.class, byte[].class);
+            Method handleData = findByteArrayHandlerMethod(
+                    handlerClass,
+                    "handleData",
+                    2,
+                    -1,
+                    0,
+                    1);
             handleData.setAccessible(true);
             hook(handleData).intercept(new XposedInterface.Hooker() {
                 @Override
@@ -7258,6 +7765,7 @@ public final class MiHealthHookModule extends XposedModule {
                         Integer hr = extractHrFromRaw(classLoader, (byte[]) raw);
                         diagRawPacket(source, type, raw, hr);
                         if (hr != null) {
+                            lastEcoRawDecodeElapsedMs = SystemClock.elapsedRealtime();
                             onHeartRate(hr, source);
                         }
                     } else {
@@ -7267,7 +7775,8 @@ public final class MiHealthHookModule extends XposedModule {
                 }
             });
 
-            Method handlePacket = handlerClass.getDeclaredMethod("handlePacket", int.class, packetClass);
+            Method handlePacket = findMethodWithParameterShape(handlerClass, "handlePacket", 2, -1, 0);
+            registerPacketClass(handlePacket.getParameterTypes()[1], true);
             handlePacket.setAccessible(true);
             hook(handlePacket).intercept(new XposedInterface.Hooker() {
                 @Override
@@ -7278,9 +7787,10 @@ public final class MiHealthHookModule extends XposedModule {
                     }
                     int type = ((Number) chain.getArg(0)).intValue();
                     if (type == 8) {
-                        Integer hr = extractHrFromKxs(chain.getArg(1));
+                        Integer hr = extractHrFromPacket(chain.getArg(1));
                         diagPacket(source, type, chain.getArg(1), hr);
                         if (hr != null) {
+                            lastEcoRawDecodeElapsedMs = SystemClock.elapsedRealtime();
                             onHeartRate(hr, source);
                         }
                     }
@@ -7326,8 +7836,23 @@ public final class MiHealthHookModule extends XposedModule {
             final String source) {
         try {
             Class<?> targetClass = findClass(className, classLoader);
-            Class<?> dataClass = findClass(dataClassName, classLoader);
-            Method method = targetClass.getDeclaredMethod("onReceiveWearData", dataClass);
+            Method method = null;
+            String[] preferredDataClasses = source.startsWith("eco-")
+                    ? new String[]{"bjt", "defpackage.bjt", dataClassName, "defpackage." + dataClassName}
+                    : new String[]{"ajt", "defpackage.ajt", dataClassName, "defpackage." + dataClassName};
+            for (String preferredDataClass : preferredDataClasses) {
+                try {
+                    Class<?> dataClass = findClass(preferredDataClass, classLoader);
+                    method = targetClass.getDeclaredMethod("onReceiveWearData", dataClass);
+                    break;
+                } catch (Throwable ignored) {
+                    // Continue with the next known name and then the structural fallback.
+                }
+            }
+            if (method == null) {
+                // Obfuscated sport data classes are renamed between app releases.
+                method = findMethodWithParameterShape(targetClass, "onReceiveWearData", 1, -1, -1);
+            }
             method.setAccessible(true);
             hook(method).intercept(new XposedInterface.Hooker() {
                 @Override
@@ -7338,13 +7863,15 @@ public final class MiHealthHookModule extends XposedModule {
                     }
                     Integer hr = extractHrFromWearSportData(chain.getArg(0));
                     if (hr != null) {
+                        lastWearRawDecodeElapsedMs = SystemClock.elapsedRealtime();
                         onHeartRate(hr, source);
                     }
                     return result;
                 }
             });
             if (DebugBuild.ENABLED) {
-                diagLine("wear sport data hook installed: " + className + "#" + dataClassName);
+                diagLine("wear sport data hook installed: " + className
+                        + "#" + method.getParameterTypes()[0].getName());
             }
         } catch (Throwable throwable) {
             if (DebugBuild.ENABLED) {
@@ -8014,7 +8541,6 @@ public final class MiHealthHookModule extends XposedModule {
         }
         boolean startedAny = false;
         boolean attempted = false;
-        boolean exhaustiveHelperScan = shouldBypassCooldown;
         for (String helperClassName : START_HELPERS) {
             attempted = true;
             try {
@@ -8022,12 +8548,9 @@ public final class MiHealthHookModule extends XposedModule {
                 callStaticMethod(helperClass, "startDeviceHr", device, callback);
                 startedAny = true;
                 if (DebugBuild.ENABLED) {
-                    debugLine("startDeviceHr helper ok: " + helperClassName
-                            + ", exhaustive=" + exhaustiveHelperScan);
+                    debugLine("startDeviceHr helper ok: " + helperClassName);
                 }
-                if (!exhaustiveHelperScan) {
-                    break;
-                }
+                break;
             } catch (Throwable ignored) {
                 if (DebugBuild.ENABLED) {
                     debugLine("startDeviceHr helper failed: " + helperClassName + ": " + ignored.getClass().getSimpleName());
@@ -8400,6 +8923,14 @@ public final class MiHealthHookModule extends XposedModule {
                     awakeCount,
                     score));
         }
+        Collections.sort(result, new Comparator<HeartwithSleepStatus.Segment>() {
+            @Override
+            public int compare(HeartwithSleepStatus.Segment left,
+                               HeartwithSleepStatus.Segment right) {
+                int bedCompare = Long.compare(left.bedAtMs, right.bedAtMs);
+                return bedCompare != 0 ? bedCompare : Long.compare(left.wakeAtMs, right.wakeAtMs);
+            }
+        });
         return result;
     }
 
@@ -9483,26 +10014,154 @@ public final class MiHealthHookModule extends XposedModule {
     }
 
     private Integer extractHrFromWearRaw(ClassLoader classLoader, byte[] data) {
-        try {
-            Class<?> packetClass = findClass("ixs", classLoader);
-            Object packet = callStaticMethod(packetClass, "L", data);
-            Integer hr = extractHrFromIxs(packet);
-            if (hr != null) {
-                return hr;
-            }
-        } catch (Throwable ignored) {
-        }
+        Integer hr = extractHrFromPacketBytes(
+                classLoader, data, false, "L",
+                "vit", "defpackage.vit", "ixs", "defpackage.ixs");
+        if (hr != null) return hr;
         return extractHrFromWearRawBytes(data);
     }
 
     private Integer extractHrFromRaw(ClassLoader classLoader, byte[] data) {
-        try {
-            Class<?> packetClass = findClass("kxs", classLoader);
-            Object packet = callStaticMethod(packetClass, "y", data);
-            return extractHrFromKxs(packet);
-        } catch (Throwable ignored) {
+        return extractHrFromPacketBytes(
+                classLoader, data, true, "y",
+                "xit", "defpackage.xit", "kxs", "defpackage.kxs");
+    }
+
+    private Method resolvePacketParser(ClassLoader classLoader, boolean eco) {
+        if (eco && ecoPacketParserResolved) {
+            return ecoPacketParser;
+        }
+        if (!eco && wearablePacketParserResolved) {
+            return wearablePacketParser;
+        }
+        synchronized (this) {
+            if (eco && ecoPacketParserResolved) {
+                return ecoPacketParser;
+            }
+            if (!eco && wearablePacketParserResolved) {
+                return wearablePacketParser;
+            }
+
+            Class<?> registeredClass = eco ? ecoPacketClass : wearablePacketClass;
+            String[] classNames = eco
+                    ? new String[]{"xit", "defpackage.xit", "kxs", "defpackage.kxs"}
+                    : new String[]{"vit", "defpackage.vit", "ixs", "defpackage.ixs"};
+            String[] parserNames = eco ? new String[]{"y"} : new String[]{"L"};
+            Method parser = findByteArrayParser(registeredClass, parserNames);
+            Class<?> resolvedClass = registeredClass;
+            if (parser == null) {
+                for (String className : classNames) {
+                    try {
+                        Class<?> candidate = findClass(className, classLoader);
+                        parser = findByteArrayParser(candidate, parserNames);
+                        if (parser != null) {
+                            resolvedClass = candidate;
+                            break;
+                        }
+                    } catch (Throwable ignored) {
+                        // Try the next release's packet class.
+                    }
+                }
+            }
+            if (eco) {
+                ecoPacketClass = resolvedClass;
+                ecoPacketParser = parser;
+                ecoPacketParserResolved = true;
+            } else {
+                wearablePacketClass = resolvedClass;
+                wearablePacketParser = parser;
+                wearablePacketParserResolved = true;
+            }
+            if (DebugBuild.ENABLED) {
+                diagLine("heart-rate packet parser " + (eco ? "eco" : "wear")
+                        + " class=" + (resolvedClass == null ? "?" : resolvedClass.getName())
+                        + ", method=" + (parser == null ? "?" : parser.getName()));
+            }
+            return parser;
+        }
+    }
+
+    private Method findByteArrayParser(Class<?> packetClass, String... preferredNames) {
+        if (packetClass == null || packetClass == Object.class) {
             return null;
         }
+        Method best = null;
+        int bestScore = Integer.MIN_VALUE;
+        String bestKey = "";
+        Class<?> current = packetClass;
+        while (current != null) {
+            for (Method method : current.getDeclaredMethods()) {
+                if (Modifier.isAbstract(method.getModifiers())
+                        || !Modifier.isStatic(method.getModifiers())
+                        || method.isBridge()
+                        || method.isSynthetic()) {
+                    continue;
+                }
+                Class<?>[] parameterTypes = method.getParameterTypes();
+                if (parameterTypes.length != 1 || parameterTypes[0] != byte[].class
+                        || method.getReturnType() == Void.TYPE) {
+                    continue;
+                }
+                Class<?> returnType = method.getReturnType();
+                if (!packetClass.isAssignableFrom(returnType)
+                        && !returnType.isAssignableFrom(packetClass)) {
+                    continue;
+                }
+                int score = returnType == packetClass ? 40 : 10;
+                for (String preferredName : preferredNames) {
+                    if (preferredName.equals(method.getName())) {
+                        score += 100;
+                    }
+                }
+                if (method.getName().length() <= 2) {
+                    score += 5;
+                }
+                String key = method.toGenericString();
+                if (score > bestScore || (score == bestScore && key.compareTo(bestKey) < 0)) {
+                    best = method;
+                    bestScore = score;
+                    bestKey = key;
+                }
+            }
+            current = current.getSuperclass();
+        }
+        if (best != null) {
+            best.setAccessible(true);
+        }
+        return best;
+    }
+
+    private Integer extractHrFromPacketBytes(
+            ClassLoader classLoader,
+            byte[] data,
+            boolean eco,
+            String parserMethod,
+            String... packetClassNames) {
+        try {
+            Method parser = resolvePacketParser(classLoader, eco);
+            if (parser != null) {
+                return extractHrFromPacket(parser.invoke(null, (Object) data));
+            }
+            for (String packetClassName : packetClassNames) {
+                try {
+                    Class<?> packetClass = findClass(packetClassName, classLoader);
+                    return extractHrFromPacket(callStaticMethod(packetClass, parserMethod, data));
+                } catch (Throwable ignored) {
+                    // Try the packet class used by another Xiaomi Health release.
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private Integer extractHrFromPacket(Object packet) {
+        Integer hr = extractHrFromIxs(packet);
+        if (hr != null) {
+            return hr;
+        }
+        hr = extractHrFromKxs(packet);
+        return hr != null ? hr : extractHrFromDynamicPacket(packet);
     }
 
     private Integer extractHrFromKxs(Object packet) {
@@ -9565,10 +10224,150 @@ public final class MiHealthHookModule extends XposedModule {
         }
         try {
             int hr = ((Number) getFieldValue(sportData, "c")).intValue();
-            return hr >= 30 && hr <= 240 ? hr : null;
+            if (hr >= 30 && hr <= 240) {
+                return hr;
+            }
         } catch (Throwable ignored) {
+        }
+        return extractHrFromDynamicPacket(sportData);
+    }
+
+    private Integer extractHrFromDynamicPacket(Object packet) {
+        if (packet == null) {
             return null;
         }
+        Class<?> packetClass = packet.getClass();
+        HeartRateAccessor accessor = heartRateAccessorCache.get(packetClass);
+        if (accessor != null) {
+            return accessor.read(packet);
+        }
+        long elapsed = SystemClock.elapsedRealtime();
+        Long lastMiss = heartRateAccessorMissCache.get(packetClass);
+        if (lastMiss != null && elapsed - lastMiss < DYNAMIC_HEART_RATE_RETRY_MS) {
+            return null;
+        }
+        accessor = resolveDynamicHeartRateAccessor(packet);
+        if (accessor == null) {
+            heartRateAccessorMissCache.put(packetClass, elapsed);
+            return null;
+        }
+        HeartRateAccessor previous = heartRateAccessorCache.putIfAbsent(packetClass, accessor);
+        if (previous != null) {
+            accessor = previous;
+        } else {
+            heartRateAccessorMissCache.remove(packetClass);
+            if (DebugBuild.ENABLED) {
+                diagLine("dynamic heart-rate path resolved class=" + packetClass.getName());
+            }
+        }
+        return accessor.read(packet);
+    }
+
+    private HeartRateAccessor resolveDynamicHeartRateAccessor(Object sample) {
+        List<Field> path = new ArrayList<>();
+        List<HeartRateFieldCandidate> candidates = new ArrayList<>();
+        collectHeartRateFieldCandidates(
+                sample,
+                path,
+                candidates,
+                new IdentityHashMap<Object, Boolean>(),
+                0);
+        if (candidates.isEmpty()) {
+            return null;
+        }
+        Collections.sort(candidates);
+        return new FieldHeartRateAccessor(candidates.get(0).fields);
+    }
+
+    private void collectHeartRateFieldCandidates(
+            Object object,
+            List<Field> path,
+            List<HeartRateFieldCandidate> candidates,
+            IdentityHashMap<Object, Boolean> visited,
+            int depth) {
+        if (object == null || depth >= 5 || visited.put(object, Boolean.TRUE) != null) {
+            return;
+        }
+        Class<?> current = object.getClass();
+        if (isNonModelObject(current)) {
+            return;
+        }
+        while (current != null) {
+            Field[] fields;
+            try {
+                fields = current.getDeclaredFields();
+            } catch (Throwable ignored) {
+                break;
+            }
+            for (Field field : fields) {
+                int modifiers = field.getModifiers();
+                if (Modifier.isStatic(modifiers) || field.isSynthetic()) {
+                    continue;
+                }
+                boolean added = false;
+                try {
+                    field.setAccessible(true);
+                    Object value = field.get(object);
+                    path.add(field);
+                    added = true;
+                    if (value instanceof Number) {
+                        int score = scoreHeartRateField(field, value, depth);
+                        if (score > 0) {
+                            candidates.add(new HeartRateFieldCandidate(path, score));
+                        }
+                    } else if (value != null && !isNonModelObject(value.getClass())) {
+                        collectHeartRateFieldCandidates(value, path, candidates, visited, depth + 1);
+                    }
+                    path.remove(path.size() - 1);
+                } catch (Throwable ignored) {
+                    if (added && !path.isEmpty()) {
+                        path.remove(path.size() - 1);
+                    }
+                }
+            }
+            current = current.getSuperclass();
+        }
+    }
+
+    private int scoreHeartRateField(Field field, Object value, int depth) {
+        String name = field.getName().toLowerCase(Locale.ROOT);
+        String normalizedName = name.replace("_", "").replace("-", "");
+        int number = ((Number) value).intValue();
+        if (number < 30 || number > 240 || !isHeartRateFieldName(normalizedName)) {
+            return 0;
+        }
+        int score = 100;
+        if ("hr".equals(normalizedName) || "bpm".equals(normalizedName)
+                || "heartrate".equals(normalizedName)) {
+            score += 30;
+        }
+        if (name.contains("time") || name.contains("timestamp") || name.contains("count")
+                || name.contains("type") || name.contains("status") || name.contains("id")
+                || name.contains("step")) {
+            return 0;
+        }
+        score += Math.max(0, 24 - depth * 5);
+        return score;
+    }
+
+    private boolean isHeartRateFieldName(String normalizedName) {
+        return "hr".equals(normalizedName)
+                || "bpm".equals(normalizedName)
+                || "pulse".equals(normalizedName)
+                || normalizedName.contains("heartrate")
+                || normalizedName.contains("pulserate")
+                || normalizedName.contains("pulsebpm");
+    }
+
+    private boolean isNonModelObject(Class<?> type) {
+        if (type.isPrimitive() || type.isEnum() || type.isArray()) {
+            return true;
+        }
+        String name = type.getName();
+        return name.startsWith("java.")
+                || name.startsWith("javax.")
+                || name.startsWith("android.")
+                || name.startsWith("kotlin.");
     }
 
     private Integer extractHrFromWearRawBytes(byte[] data) {
@@ -9617,6 +10416,68 @@ public final class MiHealthHookModule extends XposedModule {
         VarintResult(int value, int nextIndex) {
             this.value = value;
             this.nextIndex = nextIndex;
+        }
+    }
+
+    private interface HeartRateAccessor {
+        Integer read(Object object);
+    }
+
+    private static final class FieldHeartRateAccessor implements HeartRateAccessor {
+        private final Field[] fields;
+
+        FieldHeartRateAccessor(Field[] fields) {
+            this.fields = fields.clone();
+        }
+
+        @Override
+        public Integer read(Object object) {
+            Object current = object;
+            try {
+                for (Field field : fields) {
+                    if (current == null) {
+                        return null;
+                    }
+                    current = field.get(current);
+                }
+                if (!(current instanceof Number)) {
+                    return null;
+                }
+                int value = ((Number) current).intValue();
+                return value >= 30 && value <= 240 ? value : null;
+            } catch (Throwable ignored) {
+                return null;
+            }
+        }
+    }
+
+    private static final class HeartRateFieldCandidate implements Comparable<HeartRateFieldCandidate> {
+        final Field[] fields;
+        final int score;
+
+        HeartRateFieldCandidate(List<Field> fields, int score) {
+            this.fields = fields.toArray(new Field[0]);
+            this.score = score;
+        }
+
+        @Override
+        public int compareTo(HeartRateFieldCandidate other) {
+            int scoreCompare = Integer.compare(other.score, score);
+            if (scoreCompare != 0) {
+                return scoreCompare;
+            }
+            return pathName(fields).compareTo(pathName(other.fields));
+        }
+
+        private static String pathName(Field[] fields) {
+            StringBuilder builder = new StringBuilder();
+            for (Field field : fields) {
+                if (builder.length() > 0) {
+                    builder.append('.');
+                }
+                builder.append(field.getName());
+            }
+            return builder.toString();
         }
     }
 
@@ -9988,6 +10849,9 @@ public final class MiHealthHookModule extends XposedModule {
         }
         if ("wear-raw".equals(source) || "eco-raw".equals(source) || "eco-remote-raw".equals(source)) {
             return 90;
+        }
+        if ("wear-typed".equals(source) || "eco-typed".equals(source)) {
+            return 88;
         }
         if ("sport-packet".equals(source) || "eco-packet".equals(source) || "eco-remote-packet".equals(source)) {
             return 85;
@@ -10405,6 +11269,25 @@ public final class MiHealthHookModule extends XposedModule {
         });
     }
 
+    private void hookAfter(final Method method, final String label, final AfterHook afterHook) {
+        method.setAccessible(true);
+        hook(method).intercept(new XposedInterface.Hooker() {
+            @Override
+            public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                Object result = chain.proceed();
+                try {
+                    afterHook.after(chain, result);
+                } catch (Throwable throwable) {
+                    if (DebugBuild.ENABLED) {
+                        logLine("after hook failed " + label + ": "
+                                + throwable.getClass().getSimpleName());
+                    }
+                }
+                return result;
+            }
+        });
+    }
+
     private void hookAfter(Class<?> target, String methodName, Class<?>[] parameterTypes, final AfterHook afterHook) {
         try {
             Method method = target.getDeclaredMethod(methodName, parameterTypes);
@@ -10532,6 +11415,181 @@ public final class MiHealthHookModule extends XposedModule {
             current = current.getSuperclass();
         }
         throw new NoSuchMethodException(clazz.getName() + "." + name);
+    }
+
+    private Method findByteArrayHandlerMethod(
+            Class<?> clazz,
+            String preferredName,
+            int parameterCount,
+            int stringParameterIndex,
+            int intParameterIndex,
+            int byteArrayParameterIndex) throws NoSuchMethodException {
+        Method best = null;
+        int bestScore = Integer.MIN_VALUE;
+        String bestKey = "";
+        Class<?> current = clazz;
+        while (current != null) {
+            for (Method method : current.getDeclaredMethods()) {
+                if (Modifier.isStatic(method.getModifiers())
+                        || method.isBridge()
+                        || method.isSynthetic()
+                        || method.isVarArgs()) {
+                    continue;
+                }
+                Class<?>[] parameterTypes = method.getParameterTypes();
+                if (parameterTypes.length != parameterCount
+                        || (stringParameterIndex >= 0
+                        && parameterTypes[stringParameterIndex] != String.class)
+                        || (intParameterIndex >= 0
+                        && parameterTypes[intParameterIndex] != Integer.TYPE
+                        && parameterTypes[intParameterIndex] != Integer.class)
+                        || parameterTypes[byteArrayParameterIndex] != byte[].class) {
+                    continue;
+                }
+                int score = method.getName().equals(preferredName) ? 100 : 0;
+                String methodName = method.getName().toLowerCase(Locale.ROOT);
+                if (methodName.contains("packet")) {
+                    score += 20;
+                }
+                if (methodName.contains("data")) {
+                    score += 15;
+                }
+                if (method.getReturnType() == Void.TYPE) {
+                    score += 5;
+                } else if (method.getReturnType() == Boolean.TYPE
+                        || method.getReturnType() == Boolean.class) {
+                    score += 8;
+                }
+                String key = method.toGenericString();
+                if (score > bestScore || (score == bestScore && key.compareTo(bestKey) < 0)) {
+                    best = method;
+                    bestScore = score;
+                    bestKey = key;
+                }
+            }
+            current = current.getSuperclass();
+        }
+        if (best == null) {
+            throw new NoSuchMethodException(clazz.getName() + "." + preferredName);
+        }
+        best.setAccessible(true);
+        return best;
+    }
+
+    private Method findMethodWithParameterShape(
+            Class<?> clazz,
+            String name,
+            int parameterCount,
+            int stringParameterIndex,
+            int intParameterIndex) throws NoSuchMethodException {
+        Method best = null;
+        int bestScore = Integer.MIN_VALUE;
+        String bestKey = "";
+        Class<?> current = clazz;
+        while (current != null) {
+            for (Method method : current.getDeclaredMethods()) {
+                if (!method.getName().equals(name)
+                        || Modifier.isStatic(method.getModifiers())
+                        || method.isBridge()
+                        || method.isSynthetic()
+                        || method.isVarArgs()) {
+                    continue;
+                }
+                Class<?>[] parameterTypes = method.getParameterTypes();
+                if (parameterTypes.length != parameterCount) {
+                    continue;
+                }
+                if (stringParameterIndex >= 0
+                        && (stringParameterIndex >= parameterTypes.length
+                        || parameterTypes[stringParameterIndex] != String.class)) {
+                    continue;
+                }
+                if (intParameterIndex >= 0
+                        && (intParameterIndex >= parameterTypes.length
+                        || (parameterTypes[intParameterIndex] != Integer.TYPE
+                        && parameterTypes[intParameterIndex] != Integer.class))) {
+                    continue;
+                }
+                boolean hasUnspecifiedParameter = false;
+                boolean unspecifiedParametersAreReferences = true;
+                for (int i = 0; i < parameterTypes.length; i++) {
+                    if (i == stringParameterIndex || i == intParameterIndex) {
+                        continue;
+                    }
+                    hasUnspecifiedParameter = true;
+                    if (parameterTypes[i].isPrimitive()
+                            || parameterTypes[i] == String.class
+                            || parameterTypes[i] == byte[].class) {
+                        unspecifiedParametersAreReferences = false;
+                        break;
+                    }
+                }
+                if (hasUnspecifiedParameter && !unspecifiedParametersAreReferences) {
+                    continue;
+                }
+                int score = scoreParameterShapeMethod(
+                        method,
+                        parameterTypes,
+                        stringParameterIndex,
+                        intParameterIndex);
+                String key = method.toGenericString();
+                if (score > bestScore || (score == bestScore && key.compareTo(bestKey) < 0)) {
+                    best = method;
+                    bestScore = score;
+                    bestKey = key;
+                }
+            }
+            current = current.getSuperclass();
+        }
+        if (best != null) {
+            best.setAccessible(true);
+            return best;
+        }
+        throw new NoSuchMethodException(clazz.getName() + "." + name + "(" + parameterCount + ")");
+    }
+
+    private int scoreParameterShapeMethod(
+            Method method,
+            Class<?>[] parameterTypes,
+            int stringParameterIndex,
+            int intParameterIndex) {
+        int score = 0;
+        if (stringParameterIndex >= 0) {
+            score += 25;
+        }
+        if (intParameterIndex >= 0) {
+            score += 25;
+        }
+        if (method.getReturnType() == Void.TYPE) {
+            score += 8;
+        }
+        for (int i = 0; i < parameterTypes.length; i++) {
+            if (i == stringParameterIndex || i == intParameterIndex) {
+                continue;
+            }
+            Class<?> type = parameterTypes[i];
+            String typeName = type.getName();
+            if (type == Object.class) {
+                score -= 80;
+            } else if (type.isInterface()) {
+                score -= 10;
+            } else {
+                score += 20;
+            }
+            if (typeName.startsWith("defpackage.")) {
+                score += 15;
+            } else if (typeName.startsWith("com.xiaomi.")) {
+                score += 10;
+            }
+            String simpleName = type.getSimpleName();
+            if ("vit".equals(simpleName) || "xit".equals(simpleName)
+                    || "ixs".equals(simpleName) || "kxs".equals(simpleName)
+                    || "ajt".equals(simpleName) || "bjt".equals(simpleName)
+                    || "nxs".equals(simpleName) || "oxs".equals(simpleName)) {
+                score += 35;
+            }
+        }
+        return score;
     }
 
     private boolean parametersMatch(Class<?>[] parameterTypes, Object[] args) {
