@@ -119,6 +119,8 @@ public final class MiHealthHookModule extends XposedModule {
             (DebugBuild.ENABLED ? 60L : 10L * 60L) * 1000L;
     private static final long START_HELPER_SPORT_COOLDOWN_MS =
             (DebugBuild.ENABLED ? 15L : 60L) * 1000L;
+    private static final long[] START_HELPER_BOOTSTRAP_RETRY_DELAYS_MS =
+            new long[]{9_000L, 15_000L, 30_000L};
     private static final long COLD_START_RECYCLE_MIN_UPTIME_MS = 90_000L;
     private static final long COLD_START_RECYCLE_MAX_UPTIME_MS = 10L * 60L * 1000L;
     private static final long COLD_START_RECYCLE_COOLDOWN_MS = 6L * 60L * 60L * 1000L;
@@ -212,6 +214,7 @@ public final class MiHealthHookModule extends XposedModule {
     private final AtomicBoolean npatchHooksInstalled = new AtomicBoolean(false);
     private final AtomicBoolean notificationPermissionRequested = new AtomicBoolean(false);
     private final AtomicBoolean heartRateWatchdogScheduled = new AtomicBoolean(false);
+    private final AtomicBoolean heartRateRetryScheduled = new AtomicBoolean(false);
     private final AtomicBoolean starting = new AtomicBoolean(false);
     private final AtomicBoolean configReceiverRegistered = new AtomicBoolean(false);
     private final AtomicBoolean sportModeReceiverRegistered = new AtomicBoolean(false);
@@ -266,6 +269,8 @@ public final class MiHealthHookModule extends XposedModule {
     private volatile int lastHr = -1;
     private volatile long lastHrElapsedMs;
     private volatile int noHeartStartAttempts;
+    private volatile int heartRateRetryGeneration;
+    private volatile Runnable pendingHeartRateRetry;
     private volatile int legacyKickChecks;
     private volatile boolean legacyKickRequestLogged;
     private volatile boolean legacyKickAttemptLogged;
@@ -640,6 +645,9 @@ public final class MiHealthHookModule extends XposedModule {
         miWearCallback = null;
         started = false;
         heartRateWatchdogScheduled.set(false);
+        heartRateRetryScheduled.set(false);
+        heartRateRetryGeneration++;
+        pendingHeartRateRetry = null;
         uploader.close();
         WORKER.shutdownNow();
         UPLOAD_WORKER.shutdownNow();
@@ -2993,7 +3001,9 @@ public final class MiHealthHookModule extends XposedModule {
                     String name = intent.getStringExtra(EXTRA_DEVICE_NAME);
                     String identity = did == null || did.length() == 0 ? null : "did:" + did;
                     if (identity != null && identity.equals(lastStartHelperDeviceIdentity)
-                            && hasRecentHeartRateInAnyProcess()) {
+                            && lastHr > 0
+                            && SystemClock.elapsedRealtime() - lastHrElapsedMs
+                            < HEART_RATE_WATCHDOG_MS) {
                         if (DebugBuild.ENABLED) {
                             diagLine("device change ignored: same active device did=" + maskDid(did)
                                     + ", name=" + name);
@@ -8255,6 +8265,7 @@ public final class MiHealthHookModule extends XposedModule {
             return false;
         }
         return reason.startsWith("watchdog:") || reason.startsWith("watchdog-alarm:") ||
+                reason.contains("no-heart-rate") ||
                 reason.startsWith("stop:") || reason.startsWith("device-changed:");
     }
 
@@ -8289,6 +8300,11 @@ public final class MiHealthHookModule extends XposedModule {
         if (reason.startsWith("sport:")) {
             return lastSportStartHelperScanElapsedMs <= 0L ||
                     elapsed - lastSportStartHelperScanElapsedMs >= START_HELPER_SPORT_COOLDOWN_MS;
+        }
+        if (lastHr <= 0 && reason.contains("no-heart-rate")
+                && noHeartStartAttempts > 0
+                && noHeartStartAttempts <= START_HELPER_BOOTSTRAP_RETRY_DELAYS_MS.length) {
+            return true;
         }
         if (lastStartHelperScanElapsedMs <= 0L) {
             return true;
@@ -8350,31 +8366,27 @@ public final class MiHealthHookModule extends XposedModule {
             }
             return;
         }
-        boolean hasRecent = hasRecentHeartRateInAnyProcess(HEART_RATE_WATCHDOG_MS);
-        if (!forceRetry && lastHr > 0) {
+        if (lastHr > 0) {
             if (DebugBuild.ENABLED) {
                 diagLine("retry skipped: local heart rate exists lastHr=" + lastHr
                         + ", ageMs=" + heartRateAgeForDebug());
             }
             return;
         }
-        if (!forceRetry && hasRecentHeartRateInAnyProcess()) {
-            if (DebugBuild.ENABLED) {
-                diagLine("retry skipped: cross-process heart rate recent");
-            }
+        if (noHeartStartAttempts >= START_HELPER_BOOTSTRAP_RETRY_DELAYS_MS.length) {
+            scheduleHeartRateAlarmWatchdog("bounded-retries-exhausted");
             return;
         }
-        if (forceRetry && hasRecent) {
-            if (DebugBuild.ENABLED) {
-                diagLine("retry skipped: watchdog window has recent heart rate");
-            }
+        if (!heartRateRetryScheduled.compareAndSet(false, true)) {
             return;
         }
         markLegacyKickNeeded();
         noHeartStartAttempts++;
         final String retryReason = forceRetry ? "watchdog:no-heart-rate-retry" : "timer:no-heart-rate";
         maybeScheduleColdStartRecycle();
-        final long delayMs = noHeartStartAttempts <= 2 ? 9_000L : 60_000L;
+        final long delayMs = START_HELPER_BOOTSTRAP_RETRY_DELAYS_MS[noHeartStartAttempts - 1];
+        final long scheduledAtWallMs = System.currentTimeMillis();
+        final int retryGeneration = ++heartRateRetryGeneration;
         importantLine("retry scheduled reason=" + retryReason
                 + ", delayMs=" + delayMs
                 + ", attempts=" + noHeartStartAttempts
@@ -8389,15 +8401,30 @@ public final class MiHealthHookModule extends XposedModule {
                     + ", uptime=" + SystemClock.elapsedRealtime());
         }
         try {
-            mainHandler(context).postDelayed(new Runnable() {
+            Runnable retry = new Runnable() {
                 @Override
                 public void run() {
-                    if (!hasRecentHeartRateInAnyProcess(HEART_RATE_WATCHDOG_MS)) {
-                        ensureRealtimeHrStarted(classLoader, retryReason);
+                    if (retryGeneration != heartRateRetryGeneration) {
+                        return;
                     }
+                    heartRateRetryScheduled.set(false);
+                    pendingHeartRateRetry = null;
+                    if (!lifecycleActive || lastHr > 0) {
+                        return;
+                    }
+                    long latestSeenMs = readLastHeartRateSeenMs(context);
+                    if (latestSeenMs > scheduledAtWallMs) {
+                        scheduleHeartRateAlarmWatchdog("cross-process-recent");
+                        return;
+                    }
+                    ensureRealtimeHrStarted(classLoader, retryReason);
                 }
-            }, delayMs);
+            };
+            pendingHeartRateRetry = retry;
+            mainHandler(context).postDelayed(retry, delayMs);
         } catch (Throwable ignored) {
+            heartRateRetryScheduled.set(false);
+            pendingHeartRateRetry = null;
             if (DebugBuild.ENABLED) {
                 diagLine("retry schedule failed: " + describeThrowable(ignored));
             }
@@ -10709,6 +10736,7 @@ public final class MiHealthHookModule extends XposedModule {
         lastHr = hr;
         lastHrElapsedMs = elapsed;
         noHeartStartAttempts = 0;
+        cancelPendingHeartRateRetry();
         scheduleHeartRateWatchdog();
         final Context context = appContext;
         final boolean handleHeartRate = context != null && shouldHandleAcceptedHeartRate(source);
@@ -11073,12 +11101,30 @@ public final class MiHealthHookModule extends XposedModule {
     }
 
     private boolean hasRecentHeartRateInLocalPrefs(Context context, long maxAgeMs) {
+        long seenMs = readLastHeartRateSeenMs(context);
+        return seenMs > 0L && System.currentTimeMillis() - seenMs < maxAgeMs;
+    }
+
+    private long readLastHeartRateSeenMs(Context context) {
+        if (context == null) {
+            return 0L;
+        }
         try {
-            long seenMs = context.getSharedPreferences(RUNTIME_PREFS, Context.MODE_PRIVATE)
+            return context.getSharedPreferences(RUNTIME_PREFS, Context.MODE_PRIVATE)
                     .getLong(KEY_LAST_HR_SEEN_MS, 0L);
-            return seenMs > 0L && System.currentTimeMillis() - seenMs < maxAgeMs;
         } catch (Throwable ignored) {
-            return false;
+            return 0L;
+        }
+    }
+
+    private void cancelPendingHeartRateRetry() {
+        Runnable retry = pendingHeartRateRetry;
+        pendingHeartRateRetry = null;
+        heartRateRetryGeneration++;
+        heartRateRetryScheduled.set(false);
+        Handler handler = lifecycleHandler;
+        if (handler != null && retry != null) {
+            handler.removeCallbacks(retry);
         }
     }
 
@@ -11166,6 +11212,10 @@ public final class MiHealthHookModule extends XposedModule {
         final long delayMs = reason != null && reason.startsWith("device-changed:")
                 ? 250L
                 : 1_500L;
+        if (reason != null && reason.startsWith("device-changed:")) {
+            noHeartStartAttempts = 0;
+            cancelPendingHeartRateRetry();
+        }
         try {
             mainHandler(context).postDelayed(new Runnable() {
                 @Override
