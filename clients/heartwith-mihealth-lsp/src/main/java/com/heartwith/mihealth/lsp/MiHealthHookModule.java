@@ -346,6 +346,7 @@ public final class MiHealthHookModule extends XposedModule {
     private volatile int miWearIsolatedGeneration;
     private volatile int miWearMonitorGeneration;
     private volatile boolean miWearMonitorPending;
+    private volatile boolean miWearRegistrationInProgress;
     private volatile boolean miWearMonitorStartScheduled;
     private volatile boolean miWearSubscriptionActive;
     private volatile boolean miWearMonitorRequested;
@@ -525,6 +526,9 @@ public final class MiHealthHookModule extends XposedModule {
         registerConfigReceiver(appContext);
         warmUpUploaderConfig(appContext);
         restoreActiveSource(appContext);
+        if (isWorkerProcess()) {
+            recoverMiWearClientAfterHotReload(targetClassLoader);
+        }
         scheduleStartAfterAttach(targetClassLoader);
         scheduleSleepStatusPoll(appContext, "api102-hot-reload");
         if (isWorkerProcess()) {
@@ -624,6 +628,7 @@ public final class MiHealthHookModule extends XposedModule {
         }
         miWearRemoteCore = null;
         miWearDeviceDid = null;
+        miWearRegistrationInProgress = false;
         miWearLocalDeviceId = null;
         miWearPropertyDid = null;
         miWearDataHandler = null;
@@ -1380,7 +1385,8 @@ public final class MiHealthHookModule extends XposedModule {
     }
 
     private boolean isMiWearSleepMonitorStarting() {
-        return miWearMonitorStartScheduled || miWearMonitorPending || miWearMonitorRequested;
+        return miWearMonitorStartScheduled || miWearRegistrationInProgress
+                || miWearMonitorPending || miWearMonitorRequested;
     }
 
     private void scheduleSleepStatusAlarm(Context context, long delayMs, int generation) {
@@ -1797,7 +1803,9 @@ public final class MiHealthHookModule extends XposedModule {
             scheduleSleepStatusPoll(appContext, "miwear-unavailable:" + reason);
             return;
         }
+        miWearRegistrationInProgress = true;
         if (!registerIsolatedMiWearHandler(miWearRemoteCore, miWearDeviceDid, reason)) {
+            miWearRegistrationInProgress = false;
             if (DebugBuild.ENABLED) {
                 HeartwithSleepChannelStatus.writeRemote(appContext,
                         "睡眠状态通道读取失败",
@@ -1810,6 +1818,7 @@ public final class MiHealthHookModule extends XposedModule {
         miWearMonitorRequested = true;
         final int monitorGeneration = ++miWearMonitorGeneration;
         miWearMonitorPending = true;
+        miWearRegistrationInProgress = false;
         miWearEarliestPropertyRequestElapsedMs = 0L;
         miWearReadSent.set(false);
         if (miWearLocalDeviceId != null) {
@@ -3100,6 +3109,87 @@ public final class MiHealthHookModule extends XposedModule {
             miWearSleepHooksInstalled.set(false);
             debugSleepLine("miwear-channel-hooks-failed error=" + describeThrowable(throwable));
         }
+    }
+
+    private void recoverMiWearClientAfterHotReload(ClassLoader classLoader) {
+        if (!lifecycleActive || classLoader == null || !isWorkerProcess()) {
+            return;
+        }
+        try {
+            Object client = findInitializedMiWearClient(classLoader);
+            if (client == null) {
+                debugSleepLine("miwear-hot-reload-recovery unavailable: singleton-not-initialized");
+                return;
+            }
+            String did = stringValue(getFieldValueQuietly(client, "currentDeviceID"));
+            if (did == null) {
+                Object currentDevice = safeInvokeObject(client, "getCurrentDevice");
+                did = stringValue(currentDevice == null
+                        ? null : safeInvokeObject(currentDevice, "getDid"));
+            }
+            if (did == null) {
+                Object currentDevice = getCurrentDeviceModel(classLoader);
+                String candidate = getCurrentDeviceId(currentDevice);
+                Object services = getFieldValueQuietly(client, "coreServiceMap");
+                if (candidate != null && services instanceof Map<?, ?>
+                        && ((Map<?, ?>) services).containsKey(candidate)) {
+                    did = candidate;
+                }
+            }
+            if (did == null) {
+                debugSleepLine("miwear-hot-reload-recovery unavailable: current-device=null");
+                return;
+            }
+            captureMiWearClient(client, did, "api102-hot-reload-singleton");
+            debugSleepLine("miwear-hot-reload-recovery success did=" + maskDid(did));
+        } catch (Throwable throwable) {
+            debugSleepLine("miwear-hot-reload-recovery failed error="
+                    + describeThrowable(throwable));
+        }
+    }
+
+    private Object findInitializedMiWearClient(ClassLoader classLoader) throws Exception {
+        Class<?> clientClass = findClass(
+                "com.xiaomi.wearable.core.client.MiWearCoreClient", classLoader);
+        Class<?> companionClass = findClass(
+                "com.xiaomi.wearable.core.client.IMiWearCoreClient$Companion", classLoader);
+        for (Field field : companionClass.getDeclaredFields()) {
+            if (!Modifier.isStatic(field.getModifiers())) {
+                continue;
+            }
+            field.setAccessible(true);
+            Object lazy = field.get(null);
+            if (lazy == null) {
+                continue;
+            }
+            Method isInitialized;
+            Method getValue;
+            try {
+                isInitialized = findCompatibleMethod(
+                        lazy.getClass(), "isInitialized", false, new Object[0]);
+                getValue = findCompatibleMethod(
+                        lazy.getClass(), "getValue", false, new Object[0]);
+            } catch (NoSuchMethodException ignored) {
+                continue;
+            }
+            Object initialized = isInitialized.invoke(lazy);
+            if (!Boolean.TRUE.equals(initialized)) {
+                continue;
+            }
+            Object value = getValue.invoke(lazy);
+            if (clientClass.isInstance(value)) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    private String stringValue(Object value) {
+        if (value == null) {
+            return null;
+        }
+        String text = String.valueOf(value);
+        return text.length() == 0 || "null".equals(text) ? null : text;
     }
 
     private synchronized void captureMiWearClient(Object client, String did, String reason) {
