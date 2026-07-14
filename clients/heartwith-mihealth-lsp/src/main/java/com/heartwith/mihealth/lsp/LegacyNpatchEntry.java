@@ -174,6 +174,10 @@ public final class LegacyNpatchEntry implements IXposedHookLoadPackage {
     private static void hookLocalWearCore(ClassLoader classLoader) {
         try {
             Class<?> coreExt = XposedHelpers.findClass("com.xiaomi.wearable.core.CoreExtKt", classLoader);
+            if (hasModernWearCoreApi(coreExt)) {
+                log("modern MiWear Core detected; preserve official remote/local selection");
+                return;
+            }
             hookBooleanNoArg(coreExt, "useLyra", false);
             hookBooleanNoArg(coreExt, "getSupportLyra", false);
             hookBooleanNoArg(coreExt, "getHasLyra", false);
@@ -182,6 +186,21 @@ public final class LegacyNpatchEntry implements IXposedHookLoadPackage {
             log("legacy local wear core hooks installed");
         } catch (Throwable throwable) {
             log("legacy local wear core hook failed: " + throwable.getClass().getSimpleName());
+        }
+    }
+
+    private static boolean hasModernWearCoreApi(Class<?> coreExt) {
+        return hasNoArgMethod(coreExt, "useRemoteService")
+                || hasNoArgMethod(coreExt, "getRemoteServiceSupport")
+                || hasNoArgMethod(coreExt, "getUseRemoteConnection");
+    }
+
+    private static boolean hasNoArgMethod(Class<?> target, String name) {
+        try {
+            target.getDeclaredMethod(name);
+            return true;
+        } catch (Throwable ignored) {
+            return false;
         }
     }
 
