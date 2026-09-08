@@ -44,5 +44,5 @@ jobs:
             -validity 10000 \
             -dname "CN=Android Debug,O=Android,C=US"
 
-      - name: Build
-        run: ./gradlew :heartwith-mihealth-lsp:assembleRelease --warning-mode=fail
+      - name: Test and build
+        run: ./gradlew :heartwith-mihealth-lsp:testDebugUnitTest :heartwith-mihealth-lsp:assembleRelease --warning-mode=fail

@@ -47,8 +47,8 @@ jobs:
       - name: Show uploader SDK revision
         run: git -C heartwith-android-uploader log -1 --oneline
 
-      - name: Build APKs
-        run: ./gradlew :heartwith-mihealth-lsp:assembleDebug :heartwith-mihealth-lsp:assembleRelease --warning-mode=fail
+      - name: Test and build APKs
+        run: ./gradlew :heartwith-mihealth-lsp:testDebugUnitTest :heartwith-mihealth-lsp:assembleDebug :heartwith-mihealth-lsp:assembleRelease --warning-mode=fail
 
       - name: Generate release notes
         run: |
