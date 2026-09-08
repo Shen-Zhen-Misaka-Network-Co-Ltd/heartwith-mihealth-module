@@ -3343,7 +3343,8 @@ public final class MiHealthHookModule extends XposedModule {
         if (!lifecycleActive || did == null || !did.equals(miWearDeviceDid)) {
             return;
         }
-        if (!miWearSubscriptionActive && miWearSubscribeRequestId < 0L) {
+        if (!miWearSubscriptionActive && miWearSubscribeRequestId < 0L
+                && !officialSleepStateAvailable) {
             return;
         }
         miWearSubscriptionActive = false;
