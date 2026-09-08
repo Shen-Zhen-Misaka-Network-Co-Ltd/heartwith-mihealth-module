@@ -379,6 +379,7 @@ public final class MiHealthHookModule extends XposedModule {
     private volatile boolean miWearReconnectRetryScheduled;
     private volatile int miWearReconnectRetryGeneration;
     private volatile boolean miWearSubscriptionActive;
+    private volatile boolean officialSleepStateAvailable;
     private volatile boolean miWearMonitorRequested;
     private volatile long miWearSubscribeRequestId = -1L;
     private volatile String miWearDeviceDid;
@@ -1452,10 +1453,11 @@ public final class MiHealthHookModule extends XposedModule {
 
     private boolean isMiWearSleepMonitorActive() {
         String did = miWearDeviceDid;
-        return miWearSubscriptionActive
+        return officialSleepStateAvailable
+                || (miWearSubscriptionActive
                 && did != null
                 && did.equals(miWearPropertyDid)
-                && miWearPropertySiid > 0;
+                && miWearPropertySiid > 0);
     }
 
     private boolean isMiWearSleepMonitorStarting() {
@@ -3345,6 +3347,7 @@ public final class MiHealthHookModule extends XposedModule {
             return;
         }
         miWearSubscriptionActive = false;
+        officialSleepStateAvailable = false;
         miWearSubscribeRequestId = -1L;
         miWearReadSent.set(false);
         debugSleepLine("miwear-device-disconnected did=" + maskDid(did));
@@ -4471,6 +4474,7 @@ public final class MiHealthHookModule extends XposedModule {
                 debugSleepLine("sleep status parser hook unavailable: " + describeThrowable(throwable));
             }
         }
+        hookOfficialSleepStateChannel(classLoader);
         try {
             Class<?> sleepBizClass = findClass("com.xiaomi.fitness.repo.sleep.SleepBiz", classLoader);
             hookAfter(sleepBizClass, "splitDailyReport",
@@ -4486,6 +4490,54 @@ public final class MiHealthHookModule extends XposedModule {
         } catch (Throwable throwable) {
             if (DebugBuild.ENABLED) {
                 debugSleepLine("sleep status report hook unavailable: " + describeThrowable(throwable));
+            }
+        }
+    }
+
+    /**
+     * Xiaomi's BLE layer already registers this listener for devices exposing
+     * capability 29. Hooking its decoded event avoids creating another listener
+     * or polling the property channel when the official low-cost path exists.
+     */
+    private void hookOfficialSleepStateChannel(final ClassLoader classLoader) {
+        try {
+            Class<?> openApp = findClass(
+                    "com.huami.bluetooth.profile.channel.module.openapp.OpenAppModule",
+                    classLoader);
+            hookAfter(openApp, "onSleepStateChanged", new Class<?>[]{byte[].class},
+                    new AfterHook() {
+                        @Override
+                        public void after(XposedInterface.Chain chain, Object result) {
+                            Object raw = chain.getArg(0);
+                            if (!(raw instanceof byte[]) || ((byte[]) raw).length == 0) {
+                                return;
+                            }
+                            int code = ((byte[]) raw)[0] & 255;
+                            String state;
+                            if (code == 1) {
+                                state = HeartwithSleepStatus.STATE_ASLEEP;
+                            } else if (code == 0) {
+                                state = "awake";
+                            } else {
+                                if (DebugBuild.ENABLED) {
+                                    debugSleepLine("official sleep state ignored code=" + code);
+                                }
+                                return;
+                            }
+                            officialSleepStateAvailable = true;
+                            cancelSleepStatusPoll(appContext);
+                            debugSleepStateLine("official-sleep-state", "open-app-module", null,
+                                    "code=" + code + ", state=" + state);
+                            handleMiWearState(state, true);
+                        }
+                    });
+            if (DebugBuild.ENABLED) {
+                debugSleepLine("official sleep state hook installed class=" + openApp.getName());
+            }
+        } catch (Throwable throwable) {
+            if (DebugBuild.ENABLED) {
+                debugSleepLine("official sleep state hook unavailable: "
+                        + describeThrowable(throwable));
             }
         }
     }
