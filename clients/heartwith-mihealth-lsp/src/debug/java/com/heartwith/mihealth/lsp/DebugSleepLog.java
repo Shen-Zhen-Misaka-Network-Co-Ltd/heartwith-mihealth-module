@@ -22,15 +22,19 @@ final class DebugSleepLog {
     private static File logFile;
     private static String logDay;
     private static boolean pathLogged;
+    private static BufferedWriter writer;
+    private static boolean closed;
 
     private DebugSleepLog() {
     }
 
     static synchronized void init(Context context, String processName) {
+        closed = false;
         File file = resolveLogFile(context);
         if (file == null) {
             return;
         }
+        if (!file.equals(logFile)) closeWriter();
         logFile = file;
         logDay = todayKey();
         pruneOldLogs(file.getParentFile());
@@ -42,9 +46,11 @@ final class DebugSleepLog {
     }
 
     static synchronized void line(Context context, String processName, String message) {
+        if (closed) return;
         File file = logFile;
         String today = todayKey();
         if (file == null || logDay == null || !logDay.equals(today)) {
+            closeWriter();
             file = resolveLogFile(context);
             logFile = file;
             logDay = today;
@@ -57,6 +63,21 @@ final class DebugSleepLog {
             return;
         }
         writeLine(processName, message);
+    }
+
+    static synchronized void close() {
+        closed = true;
+        closeWriter();
+    }
+
+    private static void closeWriter() {
+        if (writer == null) return;
+        try {
+            writer.close();
+        } catch (Exception ignored) {
+        } finally {
+            writer = null;
+        }
     }
 
     private static File resolveLogFile(Context context) {
@@ -91,24 +112,23 @@ final class DebugSleepLog {
             return;
         }
         try {
-            BufferedWriter writer = new BufferedWriter(new FileWriter(file, true));
-            try {
-                writer.write(FORMAT.format(new Date()));
-                writer.write(" pid=");
-                writer.write(Integer.toString(Process.myPid()));
-                writer.write(" tid=");
-                writer.write(Integer.toString(Process.myTid()));
-                writer.write(" elapsedMs=");
-                writer.write(Long.toString(SystemClock.elapsedRealtime()));
-                writer.write(" process=");
-                writer.write(processName == null || processName.length() == 0 ? "unknown" : processName);
-                writer.write(" ");
-                writer.write(message == null ? "" : message);
-                writer.newLine();
-            } finally {
-                writer.close();
-            }
+            if (writer == null) writer = new BufferedWriter(new FileWriter(file, true));
+            writer.write(FORMAT.format(new Date()));
+            writer.write(" pid=");
+            writer.write(Integer.toString(Process.myPid()));
+            writer.write(" tid=");
+            writer.write(Integer.toString(Process.myTid()));
+            writer.write(" elapsedMs=");
+            writer.write(Long.toString(SystemClock.elapsedRealtime()));
+            writer.write(" process=");
+            writer.write(processName == null || processName.length() == 0 ? "unknown" : processName);
+            writer.write(" ");
+            writer.write(message == null ? "" : message);
+            writer.newLine();
+            // Preserve per-line visibility without reopening the file for every packet.
+            writer.flush();
         } catch (Throwable throwable) {
+            closeWriter();
             Log.w(TAG, "write sleep debug log failed: "
                     + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
         }

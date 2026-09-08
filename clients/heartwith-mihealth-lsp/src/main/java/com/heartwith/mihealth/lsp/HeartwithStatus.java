@@ -8,7 +8,6 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.os.Build;
-import android.os.SystemClock;
 
 final class HeartwithStatus {
     private static final String MODULE_PACKAGE = "com.heartwith.mihealth.lsp";
@@ -29,11 +28,7 @@ final class HeartwithStatus {
     static final String EXTRA_SEEN_MS = "seen_ms";
     static final String EXTRA_PROCESS_NAME = "process_name";
     static final String HOOK_CHANNEL_ID = "heartwith_mihealth_hook_status";
-    private static final long NOTIFICATION_MIN_INTERVAL_MS = 10_000L;
     private static final long VIEWER_ACTIVE_TTL_MS = 3_000L;
-    private static final int NOTIFICATION_CHANGE_BPM = 3;
-    private static long lastNotificationElapsedMs;
-    private static int lastNotificationBpm = -1;
     private static boolean notificationChannelReady;
 
     final int bpm;
@@ -90,12 +85,6 @@ final class HeartwithStatus {
         if (bpm <= 0) {
             return;
         }
-        long elapsed = SystemClock.elapsedRealtime();
-        if (lastNotificationBpm > 0 &&
-                Math.abs(bpm - lastNotificationBpm) < NOTIFICATION_CHANGE_BPM &&
-                elapsed - lastNotificationElapsedMs < NOTIFICATION_MIN_INTERVAL_MS) {
-            return;
-        }
         NotificationManager manager = context.getSystemService(NotificationManager.class);
         if (manager == null) {
             return;
@@ -135,8 +124,6 @@ final class HeartwithStatus {
             builder.setStyle(new Notification.BigTextStyle().bigText("当前心率 " + bpm + " BPM\n" + detail));
         }
         manager.notify(NOTIFICATION_ID + 1, builder.build());
-        lastNotificationBpm = bpm;
-        lastNotificationElapsedMs = elapsed;
     }
 
     private static PendingIntent settingsIntent(Context context) {

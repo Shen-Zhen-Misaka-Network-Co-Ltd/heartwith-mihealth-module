@@ -33,6 +33,8 @@ final class HeartwithUploader {
     private long lastSettingsLogElapsedMs;
     private long lastStatusLogElapsedMs;
     private Context logContext;
+    private String lastSource;
+    private String lastUploadSource;
 
     HeartwithUploader(Executor worker) {
         delegate = new com.heartwith.uploader.HeartwithUploader(
@@ -65,6 +67,10 @@ final class HeartwithUploader {
 
     synchronized void applySettings(Context context, HeartwithSettings next, String reason) {
         if (next == null) {
+            return;
+        }
+        if (settingsLoaded && next == settings) {
+            rememberContext(context);
             return;
         }
         rememberContext(context);
@@ -113,7 +119,17 @@ final class HeartwithUploader {
                 bpm,
                 System.currentTimeMillis(),
                 null,
-                source == null || source.trim().isEmpty() ? "mi_health_hook" : "mi_health_hook:" + source.trim());
+                uploadSource(source));
+    }
+
+    private String uploadSource(String source) {
+        if (lastUploadSource != null && (source == null ? lastSource == null : source.equals(lastSource))) {
+            return lastUploadSource;
+        }
+        String trimmed = source == null ? "" : source.trim();
+        lastSource = source;
+        lastUploadSource = trimmed.isEmpty() ? "mi_health_hook" : "mi_health_hook:" + trimmed;
+        return lastUploadSource;
     }
 
     synchronized void onSleepStatus(Context context, HeartwithSleepStatus status) {

@@ -12,4 +12,7 @@ final class DebugSleepLog {
 
     static void line(Context context, String processName, String message) {
     }
+
+    static void close() {
+    }
 }
