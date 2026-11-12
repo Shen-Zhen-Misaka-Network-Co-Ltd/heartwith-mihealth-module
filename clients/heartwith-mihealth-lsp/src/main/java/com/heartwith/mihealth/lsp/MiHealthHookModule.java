@@ -22,6 +22,7 @@ import android.os.Bundle;
 import android.os.IBinder;
 import android.os.IInterface;
 import android.os.Parcel;
+import android.os.PowerManager;
 import android.os.RemoteException;
 import android.security.NetworkSecurityPolicy;
 import android.os.SystemClock;
@@ -129,7 +130,8 @@ public final class MiHealthHookModule extends XposedModule {
     private static final long COLD_START_RECYCLE_COOLDOWN_MS = 6L * 60L * 60L * 1000L;
     private static final long SPORT_MODE_GRACE_MS = 10_000L;
     private static final long STATUS_UPDATE_MIN_INTERVAL_MS = 10_000L;
-    private static final long NOTIFICATION_UPDATE_MIN_INTERVAL_MS = 30_000L;
+    private static final long NOTIFICATION_UPDATE_MIN_INTERVAL_MS = 5_000L;
+    private static final long NOTIFICATION_SCREEN_OFF_INTERVAL_MS = 30_000L;
     private static final long SYNC_MIN_TRIGGER_GAP_MS = 10L * 60L * 1000L;
     private static final long SYNC_MANUAL_MIN_TRIGGER_GAP_MS = 5_000L;
     private static final long SYNC_ALARM_WINDOW_MS = 15L * 60L * 1000L;
@@ -11443,10 +11445,16 @@ public final class MiHealthHookModule extends XposedModule {
         return true;
     }
 
-    private boolean shouldUpdateNotification(long elapsed) {
+    private synchronized boolean shouldUpdateNotification(long elapsed) {
         if (lastNotificationUpdateElapsedMs > 0L &&
                 elapsed - lastNotificationUpdateElapsedMs < NOTIFICATION_UPDATE_MIN_INTERVAL_MS) {
             return false;
+        }
+        if (lastNotificationUpdateElapsedMs > 0L
+                && elapsed - lastNotificationUpdateElapsedMs < NOTIFICATION_SCREEN_OFF_INTERVAL_MS) {
+            Context context = appContext;
+            PowerManager power = context == null ? null : context.getSystemService(PowerManager.class);
+            if (power == null || !power.isInteractive()) return false;
         }
         lastNotificationUpdateElapsedMs = elapsed;
         return true;

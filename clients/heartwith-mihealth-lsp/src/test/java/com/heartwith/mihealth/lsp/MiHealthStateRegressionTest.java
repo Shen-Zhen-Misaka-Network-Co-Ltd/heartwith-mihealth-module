@@ -59,6 +59,24 @@ public final class MiHealthStateRegressionTest {
     }
 
     @Test
+    public void notificationRefreshIsFasterOnlyWhileInteractive() throws Exception {
+        Context context = RuntimeEnvironment.getApplication();
+        set("appContext", context);
+        android.os.PowerManager power = context.getSystemService(android.os.PowerManager.class);
+        Shadows.shadowOf(power).setIsInteractive(true);
+        Class<?>[] signature = {long.class};
+        assertTrue((boolean) call("shouldUpdateNotification", signature, 1000L));
+        assertFalse((boolean) call("shouldUpdateNotification", signature, 5999L));
+        assertTrue((boolean) call("shouldUpdateNotification", signature, 6000L));
+        Shadows.shadowOf(power).setIsInteractive(false);
+        assertFalse((boolean) call("shouldUpdateNotification", signature, 11000L));
+        assertFalse((boolean) call("shouldUpdateNotification", signature, 35999L));
+        assertTrue((boolean) call("shouldUpdateNotification", signature, 36000L));
+        Shadows.shadowOf(power).setIsInteractive(true);
+        assertTrue((boolean) call("shouldUpdateNotification", signature, 41000L));
+    }
+
+    @Test
     public void provisionalAwakeRejectsActiveRawBeforeFinalizationStarts() throws Exception {
         set("miWearState", "awake");
         set("provisionalWakePublished", true);

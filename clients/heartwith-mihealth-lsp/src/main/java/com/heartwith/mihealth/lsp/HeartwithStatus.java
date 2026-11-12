@@ -7,7 +7,16 @@ import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.Rect;
+import android.graphics.Typeface;
+import android.graphics.drawable.Icon;
 import android.os.Build;
+import android.service.notification.StatusBarNotification;
+import android.util.LruCache;
 
 final class HeartwithStatus {
     private static final String MODULE_PACKAGE = "com.heartwith.mihealth.lsp";
@@ -30,6 +39,11 @@ final class HeartwithStatus {
     static final String HOOK_CHANNEL_ID = "heartwith_mihealth_hook_status";
     private static final long VIEWER_ACTIVE_TTL_MS = 3_000L;
     private static boolean notificationChannelReady;
+    private static Notification.Builder notificationBuilder;
+    private static int notifiedBpm;
+    private static String notifiedSource;
+    private static String notifiedDeviceModel;
+    private static final LruCache<Integer, Icon> HEART_RATE_ICONS = new LruCache<>(16);
 
     final int bpm;
     final String source;
@@ -81,7 +95,7 @@ final class HeartwithStatus {
     }
 
     @SuppressWarnings("deprecation")
-    static void showHookProcessNotification(Context context, int bpm, String source, long seenMs) {
+    static synchronized void showHookProcessNotification(Context context, int bpm, String source, long seenMs) {
         if (bpm <= 0) {
             return;
         }
@@ -89,41 +103,81 @@ final class HeartwithStatus {
         if (manager == null) {
             return;
         }
+        String deviceModel = readDeviceModel(context);
+        String displaySource = source == null || source.isEmpty() ? "hook" : source;
+        if (notificationBuilder != null && notifiedBpm == bpm
+                && displaySource.equals(notifiedSource) && deviceModel.equals(notifiedDeviceModel)) {
+            return;
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !notificationChannelReady) {
             NotificationChannel channel = new NotificationChannel(
                     HOOK_CHANNEL_ID,
                     "Heartwith 心率采集",
-                    NotificationManager.IMPORTANCE_DEFAULT);
+                    NotificationManager.IMPORTANCE_LOW);
             channel.setShowBadge(false);
             channel.setSound(null, null);
             channel.enableVibration(false);
+            channel.enableLights(false);
             manager.createNotificationChannel(channel);
             notificationChannelReady = true;
         }
-        Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                ? new Notification.Builder(context, HOOK_CHANNEL_ID)
-                : new Notification.Builder(context);
-        String deviceModel = readDeviceModel(context);
-        String detail = "来自" + deviceModel + " · " + (source == null || source.isEmpty() ? "hook" : source);
-        int icon = context.getApplicationInfo().icon;
-        if (icon == 0) {
-            return;
+        if (notificationBuilder == null) {
+            Context appContext = context.getApplicationContext();
+            if (appContext == null) appContext = context;
+            long postedAt = seenMs > 0L ? seenMs : System.currentTimeMillis();
+            // Preserve ranking across process restarts and API 102 hot reload as well as updates.
+            for (StatusBarNotification active : manager.getActiveNotifications()) {
+                if (active.getId() == NOTIFICATION_ID + 1 && active.getTag() == null
+                        && active.getNotification().when > 0L) {
+                    postedAt = active.getNotification().when;
+                    break;
+                }
+            }
+            notificationBuilder = (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                    ? new Notification.Builder(appContext, HOOK_CHANNEL_ID)
+                    : new Notification.Builder(appContext))
+                    .setContentIntent(settingsIntent(appContext))
+                    .setOngoing(true)
+                    .setOnlyAlertOnce(true)
+                    .setAutoCancel(false)
+                    .setCategory(Notification.CATEGORY_SERVICE)
+                    .setShowWhen(false)
+                    .setWhen(postedAt)
+                    .setVisibility(Notification.VISIBILITY_PUBLIC);
         }
-        builder.setSmallIcon(icon)
-                .setContentTitle("Heartwith · " + bpm + " BPM")
-                .setContentText(detail)
-                .setContentIntent(settingsIntent(context))
-                .setOngoing(true)
-                .setOnlyAlertOnce(true)
-                .setShowWhen(true)
-                .setWhen(seenMs);
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-            builder.setPriority(Notification.PRIORITY_DEFAULT);
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) {
-            builder.setStyle(new Notification.BigTextStyle().bigText("当前心率 " + bpm + " BPM\n" + detail));
-        }
-        manager.notify(NOTIFICATION_ID + 1, builder.build());
+        String detail = "来自" + deviceModel + " · " + displaySource;
+        String heartRate = "Heartwith · " + bpm + " BPM";
+        notificationBuilder.setSmallIcon(heartRateIcon(bpm))
+                .setContentTitle(detail)
+                .setContentText(heartRate);
+        manager.notify(NOTIFICATION_ID + 1, notificationBuilder.build());
+        notifiedBpm = bpm;
+        notifiedSource = displaySource;
+        notifiedDeviceModel = deviceModel;
+    }
+
+    private static Icon heartRateIcon(int bpm) {
+        Icon cached = HEART_RATE_ICONS.get(bpm);
+        if (cached != null) return cached;
+        Bitmap bitmap = Bitmap.createBitmap(64, 64, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(bitmap);
+        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        paint.setColor(Color.WHITE);
+        paint.setTypeface(Typeface.create("sans-serif-condensed", Typeface.BOLD));
+        paint.setTextAlign(Paint.Align.CENTER);
+        paint.setTextSize(44f);
+        String text = Integer.toString(bpm);
+        float width = paint.measureText(text);
+        if (width > 60f) paint.setTextSize(44f * 60f / width);
+        Rect bounds = new Rect();
+        paint.getTextBounds(text, 0, text.length(), bounds);
+        canvas.drawText(text, 32f, 4f - bounds.top, paint);
+        paint.setTextSize(18f);
+        paint.getTextBounds("bpm", 0, 3, bounds);
+        canvas.drawText("bpm", 32f, 60f - bounds.bottom, paint);
+        Icon icon = Icon.createWithBitmap(bitmap);
+        HEART_RATE_ICONS.put(bpm, icon);
+        return icon;
     }
 
     private static PendingIntent settingsIntent(Context context) {
