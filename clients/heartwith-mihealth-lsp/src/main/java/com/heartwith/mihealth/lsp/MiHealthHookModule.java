@@ -148,6 +148,7 @@ public final class MiHealthHookModule extends XposedModule {
     private static final long MIWEAR_MONITOR_START_TIMEOUT_MS = 20_000L;
     private static final long MIWEAR_ACTIVE_REQUEST_MIN_GAP_MS = 1_000L;
     private static final long MIWEAR_RECONNECT_MIN_GAP_MS = 2L * 60L * 1000L;
+    private static final long RECONNECT_HR_FRESH_MS = 15_000L;
     private static final long[] MIWEAR_MONITOR_RETRY_DELAYS_MS =
             new long[]{60_000L, 5L * 60_000L, 15L * 60_000L, 60L * 60_000L};
     private static final long MIWEAR_ASLEEP_STABLE_MS = 2L * 60L * 1000L;
@@ -3422,6 +3423,11 @@ public final class MiHealthHookModule extends XposedModule {
             return;
         }
         long elapsed = SystemClock.elapsedRealtime();
+        if (lastHr <= 0 || elapsed - lastHrElapsedMs >= RECONNECT_HR_FRESH_MS) {
+            // After a Bluetooth reconnect the realtime HR stream does not resume on its own;
+            // without this the watchdog alarm picks it up a minute or more later.
+            scheduleRealtimeHrResume("device-changed:reconnect");
+        }
         if (nextMiWearReconnectAttemptElapsedMs > 0L
                 && elapsed < nextMiWearReconnectAttemptElapsedMs) {
             long waitMs = nextMiWearReconnectAttemptElapsedMs - elapsed;
