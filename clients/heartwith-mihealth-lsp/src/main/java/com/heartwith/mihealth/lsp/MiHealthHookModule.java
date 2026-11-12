@@ -423,6 +423,9 @@ public final class MiHealthHookModule extends XposedModule {
 
     @Override
     public boolean onHotReloading(XposedModuleInterface.HotReloadingParam param) {
+        if (SystemUiHeartRateIcon.PACKAGE.equals(getProcessName())) {
+            return true;
+        }
         if (appContext == null || targetClassLoader == null) {
             importantLine("api102 hot reload rejected: process is not attached");
             return false;
@@ -472,6 +475,11 @@ public final class MiHealthHookModule extends XposedModule {
             return;
         }
         String currentProcess = param == null ? null : param.getProcessName();
+        if (SystemUiHeartRateIcon.PACKAGE.equals(context.getPackageName())) {
+            installed.set(true);
+            SystemUiHeartRateIcon.install(this, context.getClassLoader());
+            return;
+        }
         initializeAfterHotReload(context, currentProcess, param == null ? null : param.getSavedInstanceState());
     }
 
@@ -750,6 +758,12 @@ public final class MiHealthHookModule extends XposedModule {
             return;
         }
         String packageName = param.getPackageName();
+        if (SystemUiHeartRateIcon.PACKAGE.equals(packageName)) {
+            if (installed.compareAndSet(false, true)) {
+                SystemUiHeartRateIcon.install(this, param.getClassLoader());
+            }
+            return;
+        }
         if (!isSupportedPackage(packageName)) {
             return;
         }
