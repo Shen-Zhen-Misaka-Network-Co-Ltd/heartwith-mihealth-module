@@ -1,9 +1,26 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
 }
 
 val heartwithVersionCode = (findProperty("heartwithClientVersionCode") as String).toInt()
 val heartwithVersionName = findProperty("heartwithClientVersionName") as String
+
+val releaseSigning: Map<String, String>? = run {
+    val local = Properties()
+    val localFile = rootProject.file("local.properties")
+    if (localFile.isFile) localFile.inputStream().use { local.load(it) }
+    fun value(key: String, env: String): String? =
+        (local.getProperty(key) ?: System.getenv(env))?.takeIf { it.isNotBlank() }
+    val values = mapOf(
+        "storeFile" to value("heartwith.release.storeFile", "HEARTWITH_RELEASE_STORE_FILE"),
+        "storePassword" to value("heartwith.release.storePassword", "HEARTWITH_RELEASE_STORE_PASSWORD"),
+        "keyAlias" to value("heartwith.release.keyAlias", "HEARTWITH_RELEASE_KEY_ALIAS"),
+        "keyPassword" to value("heartwith.release.keyPassword", "HEARTWITH_RELEASE_KEY_PASSWORD"),
+    )
+    if (values.values.all { it != null }) values.mapValues { it.value!! } else null
+}
 
 android {
     namespace = "com.heartwith.mihealth.lsp"
@@ -33,11 +50,21 @@ android {
             keyAlias = "androiddebugkey"
             keyPassword = "android"
         }
+        // Dedicated release key, read from local.properties or the environment so no secret is
+        // committed. Without it, release keeps the debug key so existing installs still update.
+        if (releaseSigning != null) {
+            create("release") {
+                storeFile = file(releaseSigning.getValue("storeFile"))
+                storePassword = releaseSigning.getValue("storePassword")
+                keyAlias = releaseSigning.getValue("keyAlias")
+                keyPassword = releaseSigning.getValue("keyPassword")
+            }
+        }
     }
 
     buildTypes {
         getByName("release") {
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName(if (releaseSigning != null) "release" else "debug")
             // R8 runs as an optimizer only. Rules keep Xposed/NPatch entry points and names intact
             // while removing debug-only call sites and their eager string construction.
             isMinifyEnabled = true
