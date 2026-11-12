@@ -185,6 +185,44 @@ public final class MiHealthStateRegressionTest {
     }
 
     @Test
+    public void mergedFinalReportRejectsItsLateRawSegmentWithoutChangingState() throws Exception {
+        long now = testWallTimeMs();
+        String mergedKey = "1|" + (now - 10_800_000L) + "|"
+                + (now - 10_800_000L) + "|" + (now - 3_600_000L);
+        set("sleepFinalUploadedKey", mergedKey);
+        set("sleepFinalConfirmedKey", mergedKey);
+        set("sleepTrackingState", "awake");
+        for (boolean complete : new boolean[]{true, false}) {
+            call("publishSleepStatusFromAllDay", new Class<?>[]{String.class, Object.class, Object.class},
+                    "all-day-parser", null, new RawSleep(now / 1000L, complete));
+            assertEquals("awake", get("sleepTrackingState"));
+            assertFalse((Boolean) get("sleepCandidateSeenToday"));
+            assertFalse((Boolean) get("sleepFinalReportRequested"));
+            assertNull(get("lastSleepStatusKey"));
+        }
+    }
+
+    @Test
+    public void rawCoverageDoesNotSuppressExtendedOrNewSleepOrUnconfirmedReport() throws Exception {
+        String key = "1|500|1000|100000";
+        set("sleepFinalUploadedKey", key);
+        set("sleepFinalConfirmedKey", key);
+        assertTrue((Boolean) call("isRawCoveredByConfirmedSleepReport",
+                new Class<?>[]{snapshotClass()}, snapshot()));
+        for (String other : new String[]{"1|500|1000|90000", "1|500|3000|100000",
+                "malformed", "1|0|invalid|100000"}) {
+            set("sleepFinalUploadedKey", other);
+            set("sleepFinalConfirmedKey", other);
+            assertFalse((Boolean) call("isRawCoveredByConfirmedSleepReport",
+                    new Class<?>[]{snapshotClass()}, snapshot()));
+        }
+        set("sleepFinalUploadedKey", key);
+        set("sleepFinalConfirmedKey", "1|500|1000|99000");
+        assertFalse((Boolean) call("isRawCoveredByConfirmedSleepReport",
+                new Class<?>[]{snapshotClass()}, snapshot()));
+    }
+
+    @Test
     public void hotReloadRestoresStateButDoesNotPretendOldTimersStillExist() throws Exception {
         Bundle saved = new Bundle();
         saved.putString("sleep_tracking_state", "finalizing");

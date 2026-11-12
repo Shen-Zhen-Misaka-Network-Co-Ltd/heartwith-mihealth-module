@@ -4618,6 +4618,10 @@ public final class MiHealthHookModule extends XposedModule {
             debugSleepStateLine("raw-parse-empty", source, null, "object=" + shortObject(sleep));
             return;
         }
+        if (isRawCoveredByConfirmedSleepReport(snapshot)) {
+            debugSleepStateLine("raw-covered-skip", source, snapshot, "confirmedReportCoversRaw");
+            return;
+        }
         if (HeartwithSleepStatus.STATE_AWAKE.equals(snapshot.state)
                 && shouldKeepMiWearAsleepState()) {
             debugSleepStateLine("raw-wake-skip", source, snapshot, "currentMiWearState=asleep");
@@ -5303,6 +5307,28 @@ public final class MiHealthHookModule extends XposedModule {
             return true;
         }
         return false;
+    }
+
+    private boolean isRawCoveredByConfirmedSleepReport(SleepSnapshot snapshot) {
+        if (snapshot == null) return false;
+        String confirmed = currentFinalConfirmedKey();
+        if (confirmed.isEmpty() || !confirmed.equals(currentFinalUploadedKey())) return false;
+        // A Xiaomi report can merge multiple segments, so its start differs from
+        // a later raw segment. Compare coverage, not exact window-key equality.
+        String[] fields = confirmed.split("\\|", -1);
+        if (fields.length != 4) return false;
+        try {
+            long reportStart = Long.parseLong(fields[2]);
+            long reportEnd = Long.parseLong(fields[3]);
+            long rawStart = firstPositiveMillis(snapshot.sleepAtMs,
+                    snapshot.deviceBedAtMs, snapshot.bedAtMs);
+            long rawEnd = firstPositiveMillis(snapshot.wakeAtMs,
+                    snapshot.deviceWakeAtMs, snapshot.leaveBedAtMs);
+            return reportStart > 0L && reportEnd > reportStart
+                    && rawStart >= reportStart && rawEnd > rawStart && rawEnd <= reportEnd;
+        } catch (NumberFormatException ignored) {
+            return false;
+        }
     }
 
     private boolean isFinalSleepUploadedForWindow(SleepSnapshot snapshot) {
