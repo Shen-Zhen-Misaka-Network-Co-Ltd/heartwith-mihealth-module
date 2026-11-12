@@ -786,13 +786,6 @@ public final class MiHealthHookModule extends XposedModule {
                 + ", main=" + isMainProcess()
                 + ", worker=" + isWorkerProcess()
                 + ", uptime=" + SystemClock.elapsedRealtime());
-        if (DebugBuild.ENABLED) {
-            diagLine("package ready package=" + packageName
-                    + ", process=" + processName
-                    + ", main=" + isMainProcess()
-                    + ", worker=" + isWorkerProcess()
-                    + ", uptime=" + SystemClock.elapsedRealtime());
-        }
         if (!isMainProcess() && !isWorkerProcess()) {
             if (DebugBuild.ENABLED) {
                 diagLine("ignore process=" + processName);
@@ -9144,11 +9137,6 @@ public final class MiHealthHookModule extends XposedModule {
         importantLine("cold-start recycle scheduled delayMs=" + delayMs
                 + ", uptime=" + uptime
                 + ", attempts=" + noHeartStartAttempts);
-        if (DebugBuild.ENABLED) {
-            diagLine("cold-start recycle scheduled delayMs=" + delayMs
-                    + ", uptime=" + uptime
-                    + ", attempts=" + noHeartStartAttempts);
-        }
         try {
             mainHandler(context).postDelayed(new Runnable() {
                 @Override
@@ -11616,9 +11604,6 @@ public final class MiHealthHookModule extends XposedModule {
             firstHeartRateLogged = false;
             persistActiveSource(null);
         }
-        if (DebugBuild.ENABLED) {
-            diagLine("heart-rate source reset: " + reason);
-        }
         importantLine("heart-rate source reset: " + reason);
     }
 
@@ -11654,9 +11639,6 @@ public final class MiHealthHookModule extends XposedModule {
                     activeSourceRestored = false;
                     maybePersistActiveSource(source);
                     importantLine("heart-rate source switched: " + selected + " -> " + source);
-                    if (DebugBuild.ENABLED) {
-                        diagLine("heart-rate source switched: " + selected + " -> " + source);
-                    }
                 }
                 return true;
             }
@@ -11680,9 +11662,6 @@ public final class MiHealthHookModule extends XposedModule {
                 activeSourceRestored = false;
                 maybePersistActiveSource(source);
                 importantLine("heart-rate source locked: " + source);
-                if (DebugBuild.ENABLED) {
-                    diagLine("heart-rate source locked: " + source);
-                }
                 return true;
             }
             return activeSource.equals(source);
