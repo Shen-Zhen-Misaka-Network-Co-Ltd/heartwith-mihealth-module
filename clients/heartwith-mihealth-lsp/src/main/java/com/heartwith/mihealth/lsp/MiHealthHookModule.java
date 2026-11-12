@@ -106,7 +106,8 @@ public final class MiHealthHookModule extends XposedModule {
     private static final long RESTORED_SOURCE_TTL_MS = 24L * 60L * 60L * 1000L;
     private static final long CROSS_PROCESS_HR_RECENT_MS = 60_000L;
     private static final long LEGACY_KICK_REQUEST_TTL_MS = 60_000L;
-    private static final long LAST_HR_SEEN_PERSIST_MS = 20_000L;
+    // Must stay below CROSS_PROCESS_HR_RECENT_MS so a restarted process still sees a fresh value.
+    private static final long LAST_HR_SEEN_PERSIST_MS = 30_000L;
     private static final long DEVICE_MODEL_REFRESH_MS = 30_000L;
     private static final long DEVICE_MODEL_UNRESOLVED_RETRY_MS = 180_000L;
     private static final long RUNTIME_SETTINGS_REFRESH_MS = 5L * 60L * 1000L;
@@ -127,6 +128,11 @@ public final class MiHealthHookModule extends XposedModule {
     private static final long COLD_START_RECYCLE_COOLDOWN_MS = 6L * 60L * 60L * 1000L;
     private static final long SPORT_MODE_GRACE_MS = 10_000L;
     private static final long STATUS_UPDATE_MIN_INTERVAL_MS = 10_000L;
+    // The live status reaches viewers through the broadcast; the on-disk copy only has to
+    // survive restarts, so rewriting the whole prefs XML every 10 s is wasted flash I/O.
+    private static final long STATUS_PERSIST_MIN_INTERVAL_MS = 60_000L;
+    // Receivers extend the grace window themselves; one broadcast per few seconds suffices.
+    private static final long SPORT_MODE_BROADCAST_MIN_GAP_MS = 4_000L;
     private static final long NOTIFICATION_UPDATE_MIN_INTERVAL_MS = 5_000L;
     private static final long NOTIFICATION_SCREEN_OFF_INTERVAL_MS = 30_000L;
     private static final long SYNC_MIN_TRIGGER_GAP_MS = 10L * 60L * 1000L;
@@ -304,6 +310,8 @@ public final class MiHealthHookModule extends XposedModule {
     private volatile long lastDeviceModelResolveElapsedMs;
     private volatile long lastHeartRateSeenPersistElapsedMs;
     private volatile long lastStatusUpdateElapsedMs;
+    private volatile long lastStatusPersistElapsedMs;
+    private volatile long lastSportModeBroadcastUntilMs;
     private volatile long lastNotificationUpdateElapsedMs;
     private volatile long sportModeActiveUntilMs;
     private volatile String currentDeviceIdentity;
@@ -11480,6 +11488,7 @@ public final class MiHealthHookModule extends XposedModule {
             maybeFetchSleepStatusAfterHeartRate(context, elapsed, source);
         }
         final boolean updateStatus = shouldUpdateStatus(elapsed);
+        final boolean persistStatus = updateStatus && shouldPersistStatus(elapsed);
         final boolean updateNotification = shouldUpdateNotification(elapsed);
         final boolean uploadHeartRate = shouldUploadAcceptedHeartRate(source);
         WORKER.execute(new Runnable() {
@@ -11491,7 +11500,9 @@ public final class MiHealthHookModule extends XposedModule {
                 long seenMs = System.currentTimeMillis();
                 if (updateStatus) {
                     try {
-                        HeartwithStatus.writeLocal(context, hr, source, seenMs);
+                        if (persistStatus) {
+                            HeartwithStatus.writeLocal(context, hr, source, seenMs);
+                        }
                         HeartwithStatus.sendRegisteredStatus(context, hr, source, seenMs);
                     } catch (Throwable throwable) {
                         if (DebugBuild.ENABLED) {
@@ -11567,6 +11578,15 @@ public final class MiHealthHookModule extends XposedModule {
         return true;
     }
 
+    private boolean shouldPersistStatus(long elapsed) {
+        if (lastStatusPersistElapsedMs > 0L &&
+                elapsed - lastStatusPersistElapsedMs < STATUS_PERSIST_MIN_INTERVAL_MS) {
+            return false;
+        }
+        lastStatusPersistElapsedMs = elapsed;
+        return true;
+    }
+
     private synchronized boolean shouldUpdateNotification(long elapsed) {
         if (lastNotificationUpdateElapsedMs > 0L &&
                 elapsed - lastNotificationUpdateElapsedMs < NOTIFICATION_UPDATE_MIN_INTERVAL_MS) {
@@ -11591,6 +11611,7 @@ public final class MiHealthHookModule extends XposedModule {
             lastHr = -1;
             started = false;
             lastStatusUpdateElapsedMs = 0L;
+            lastStatusPersistElapsedMs = 0L;
             lastNotificationUpdateElapsedMs = 0L;
             firstHeartRateLogged = false;
             persistActiveSource(null);
@@ -11778,6 +11799,10 @@ public final class MiHealthHookModule extends XposedModule {
         }
         long untilMs = System.currentTimeMillis() + SPORT_MODE_GRACE_MS;
         sportModeActiveUntilMs = Math.max(sportModeActiveUntilMs, untilMs);
+        if (untilMs - lastSportModeBroadcastUntilMs < SPORT_MODE_BROADCAST_MIN_GAP_MS) {
+            return;
+        }
+        lastSportModeBroadcastUntilMs = untilMs;
         try {
             Intent intent = new Intent(ACTION_SPORT_MODE_CHANGED);
             intent.setPackage(targetPackage);
