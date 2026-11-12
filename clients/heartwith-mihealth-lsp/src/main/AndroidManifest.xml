@@ -2,6 +2,12 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Lets the module app, and nothing else, change Heartwith settings inside Xiaomi Health. -->
+    <permission
+        android:name="com.heartwith.mihealth.lsp.permission.CONTROL"
+        android:protectionLevel="signature" />
+    <uses-permission android:name="com.heartwith.mihealth.lsp.permission.CONTROL" />
+
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"

@@ -15,6 +15,8 @@ final class HeartwithSettings {
     static final String KEY_DISPLAY_NAME = "display_name";
     static final String ACTION_CONFIG_CHANGED = "com.heartwith.mihealth.lsp.CONFIG_CHANGED";
     static final String ACTION_SYNC_NOW = "com.heartwith.mihealth.lsp.SYNC_NOW";
+    /** Signature permission held only by the module app; required to send it settings. */
+    static final String PERMISSION_CONTROL = "com.heartwith.mihealth.lsp.permission.CONTROL";
     static final String EXTRA_ENABLED = "enabled";
     static final String EXTRA_HOOK_ENABLED = "hook_enabled";
     static final String EXTRA_SYNC_ENABLED = "sync_enabled";

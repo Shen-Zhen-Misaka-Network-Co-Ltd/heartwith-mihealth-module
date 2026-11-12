@@ -264,6 +264,7 @@ public final class MiHealthHookModule extends XposedModule {
     private volatile Application.ActivityLifecycleCallbacks debugActivityCallbacks;
     private volatile Application.ActivityLifecycleCallbacks notificationActivityCallbacks;
     private volatile BroadcastReceiver configReceiver;
+    private volatile BroadcastReceiver configInternalReceiver;
     private volatile BroadcastReceiver sportModeReceiver;
     private volatile BroadcastReceiver deviceChangeReceiver;
     private volatile ContentObserver sleepChannelRequestObserver;
@@ -646,6 +647,9 @@ public final class MiHealthHookModule extends XposedModule {
         BroadcastReceiver config = configReceiver;
         configReceiver = null;
         unregisterReceiver(context, config);
+        BroadcastReceiver configInternal = configInternalReceiver;
+        configInternalReceiver = null;
+        unregisterReceiver(context, configInternal);
         BroadcastReceiver sport = sportModeReceiver;
         sportModeReceiver = null;
         unregisterReceiver(context, sport);
@@ -2930,26 +2934,55 @@ public final class MiHealthHookModule extends XposedModule {
                     });
                 }
             };
-            IntentFilter filter = new IntentFilter(HeartwithSettings.ACTION_CONFIG_CHANGED);
-            filter.addAction(HeartwithSettings.ACTION_SYNC_NOW);
+            // Settings from the module app: exported, but only senders holding the module's
+            // signature permission (i.e. the module app itself) can deliver them.
+            IntentFilter external = new IntentFilter(HeartwithSettings.ACTION_CONFIG_CHANGED);
+            external.addAction(HeartwithSettings.ACTION_SYNC_NOW);
             if (DebugBuild.ENABLED) {
-                filter.addAction(HeartwithSleepDebugStatus.ACTION_REQUEST);
-                filter.addAction(HeartwithSleepChannelStatus.ACTION_REQUEST);
-                filter.addAction(HeartwithSleepDebugStatus.ACTION_PROBE);
+                external.addAction(HeartwithSleepDebugStatus.ACTION_REQUEST);
+                external.addAction(HeartwithSleepChannelStatus.ACTION_REQUEST);
+                external.addAction(HeartwithSleepDebugStatus.ACTION_PROBE);
             }
-            filter.addAction(ACTION_HEART_RATE_WATCHDOG);
-            filter.addAction(ACTION_SLEEP_STATUS_POLL);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
+                context.registerReceiver(receiver, external,
+                        HeartwithSettings.PERMISSION_CONTROL, null, Context.RECEIVER_EXPORTED);
             } else {
-                context.registerReceiver(receiver, filter);
+                context.registerReceiver(receiver, external, HeartwithSettings.PERMISSION_CONTROL, null);
             }
             configReceiver = receiver;
+            // Alarms and the in-host settings panel run under the host's own uid.
+            BroadcastReceiver internalReceiver = new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context receiverContext, Intent intent) {
+                    receiver.onReceive(receiverContext, intent);
+                }
+            };
+            IntentFilter internal = new IntentFilter(ACTION_HEART_RATE_WATCHDOG);
+            internal.addAction(ACTION_SLEEP_STATUS_POLL);
+            internal.addAction(HeartwithSettings.ACTION_SYNC_NOW);
+            if (DebugBuild.ENABLED) {
+                internal.addAction(HeartwithSleepDebugStatus.ACTION_PROBE);
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                internal.addAction(HeartwithSettings.ACTION_CONFIG_CHANGED);
+                if (DebugBuild.ENABLED) {
+                    internal.addAction(HeartwithSleepDebugStatus.ACTION_REQUEST);
+                    internal.addAction(HeartwithSleepChannelStatus.ACTION_REQUEST);
+                }
+                context.registerReceiver(internalReceiver, internal, Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                // Before Android 13 a dynamic receiver cannot be private; keep settings
+                // changes off this exported filter and accept only alarm-style triggers.
+                context.registerReceiver(internalReceiver, internal);
+            }
+            configInternalReceiver = internalReceiver;
             if (DebugBuild.ENABLED) {
                 diagLine("config receiver registered process=" + processName);
             }
         } catch (Throwable throwable) {
+            unregisterReceiver(context, configReceiver);
             configReceiver = null;
+            configInternalReceiver = null;
             configReceiverRegistered.set(false);
             if (DebugBuild.ENABLED) {
                 diagLine("config receiver failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
