@@ -2817,7 +2817,7 @@ public final class MiHealthHookModule extends XposedModule {
                     return;
                 }
                 try {
-                    uploader.warmUp(context);
+                    uploader.warmUp(context, processName);
                     applyRuntimeSettings(
                             context,
                             uploader.currentSettings(),

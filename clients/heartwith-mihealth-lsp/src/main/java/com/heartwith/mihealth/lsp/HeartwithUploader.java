@@ -29,6 +29,7 @@ final class HeartwithUploader {
     private String deviceModel = DEFAULT_DEVICE_MODEL;
     private boolean settingsLoaded;
     private boolean runtimeCacheLoaded;
+    private boolean storeAttached;
     private long lastFailureLogElapsedMs;
     private long lastSettingsLogElapsedMs;
     private long lastStatusLogElapsedMs;
@@ -58,8 +59,9 @@ final class HeartwithUploader {
         });
     }
 
-    synchronized void warmUp(Context context) {
+    synchronized void warmUp(Context context, String processName) {
         rememberContext(context);
+        attachBacklogStore(context, processName);
         refreshSettingsIfNeeded(context, true);
         configureDelegate();
         logSettings("warmup");
@@ -80,6 +82,21 @@ final class HeartwithUploader {
         persistRuntimeCache(context, next);
         configureDelegate();
         logSettings(reason);
+    }
+
+    private void attachBacklogStore(Context context, String processName) {
+        if (storeAttached || context == null) {
+            return;
+        }
+        try {
+            java.io.File dir = context.getFilesDir();
+            if (dir == null) {
+                return;
+            }
+            delegate.setStore(new HeartwithFileUploadStore(dir, processName));
+            storeAttached = true;
+        } catch (Throwable ignored) {
+        }
     }
 
     synchronized HeartwithSettings currentSettings() {
