@@ -6642,6 +6642,7 @@ public final class MiHealthHookModule extends XposedModule {
         try {
             Class<?> serviceClass = findFirstClass(classLoader, "defpackage.gjt", "gjt");
             Class<?> dataItemClass = findClass("com.xiaomi.xms.wearable.node.DataItem", classLoader);
+            requireMethodTaking(serviceClass, dataItemClass);
             Class<?> queryCallbackClass = findFirstClass(classLoader, "defpackage.ywd", "ywd");
             Class<?> listenerClass = findFirstClass(classLoader, "defpackage.zwd", "zwd");
 
@@ -6755,6 +6756,7 @@ public final class MiHealthHookModule extends XposedModule {
             Class<?> txsClass = findFirstClass(classLoader, "defpackage.txs", "txs");
             Class<?> basicStatusClass = findFirstClass(classLoader, "defpackage.xhq", "xhq");
             Class<?> dataItemClass = findClass("com.xiaomi.xms.wearable.node.DataItem", classLoader);
+            requireMethodTaking(txsClass, dataItemClass);
             Class<?> queryCallbackClass = findFirstClass(classLoader, "defpackage.ild", "ild");
             Class<?> listenerClass = findFirstClass(classLoader, "defpackage.jld", "jld");
             hookAfter(txsClass, "K5", new Class<?>[]{String.class, basicStatusClass},
@@ -12158,12 +12160,13 @@ public final class MiHealthHookModule extends XposedModule {
 
     private void hookAround(Class<?> target, String methodName, Class<?>[] parameterTypes, final AroundHook aroundHook) {
         try {
-            Method method = target.getDeclaredMethod(methodName, parameterTypes);
+            Method method = resolveHookTarget(target, methodName, parameterTypes);
             method.setAccessible(true);
             hookAround(method, aroundHook);
         } catch (Throwable throwable) {
             if (DebugBuild.ENABLED) {
-                logLine("hook failed " + target.getName() + "." + methodName + ": " + throwable.getClass().getSimpleName());
+                logLine("hook failed " + target.getName() + "." + methodName + ": "
+                        + describeThrowable(throwable));
             }
         }
     }
@@ -12172,7 +12175,9 @@ public final class MiHealthHookModule extends XposedModule {
         int count = 0;
         Method[] methods = target.getDeclaredMethods();
         for (Method method : methods) {
-            if (!method.getName().equals(methodName)) {
+            if (!method.getName().equals(methodName)
+                    || Modifier.isAbstract(method.getModifiers())) {
+                // Abstract declarations cannot be hooked; their overrides carry the behaviour.
                 continue;
             }
             method.setAccessible(true);
@@ -12223,7 +12228,7 @@ public final class MiHealthHookModule extends XposedModule {
 
     private void hookAfter(Class<?> target, String methodName, Class<?>[] parameterTypes, final AfterHook afterHook) {
         try {
-            Method method = target.getDeclaredMethod(methodName, parameterTypes);
+            Method method = resolveHookTarget(target, methodName, parameterTypes);
             method.setAccessible(true);
             hook(method).intercept(new XposedInterface.Hooker() {
                 @Override
@@ -12242,9 +12247,119 @@ public final class MiHealthHookModule extends XposedModule {
             });
         } catch (Throwable throwable) {
             if (DebugBuild.ENABLED) {
-                logLine("hook failed " + target.getName() + "." + methodName + ": " + throwable.getClass().getSimpleName());
+                logLine("hook failed " + target.getName() + "." + methodName + ": "
+                        + describeThrowable(throwable));
             }
         }
+    }
+
+    /**
+     * Finds a hook target by exact signature first. Xiaomi Health renames obfuscated parameter
+     * types between releases, so when that fails, falls back to the single same-name method with
+     * the same arity whose framework-typed parameters (String, int, Bundle, ...) still match.
+     * Ambiguous or missing matches throw with the real signatures so the next update is easy.
+     */
+    private Method resolveHookTarget(Class<?> target, String methodName, Class<?>[] parameterTypes)
+            throws NoSuchMethodException {
+        try {
+            return target.getDeclaredMethod(methodName, parameterTypes);
+        } catch (NoSuchMethodException exact) {
+            Method match = null;
+            int matches = 0;
+            StringBuilder candidates = new StringBuilder();
+            for (Method method : target.getDeclaredMethods()) {
+                if (!method.getName().equals(methodName)) {
+                    continue;
+                }
+                if (candidates.length() > 0) {
+                    candidates.append("; ");
+                }
+                candidates.append(describeParameterTypes(method.getParameterTypes()));
+                if (Modifier.isAbstract(method.getModifiers()) || method.isBridge()
+                        || method.isSynthetic()
+                        || !parameterShapeMatches(method.getParameterTypes(), parameterTypes)) {
+                    continue;
+                }
+                match = method;
+                matches++;
+            }
+            if (matches == 0) {
+                // A release may append trailing parameters (e.g. sendFile gained an int); keep
+                // the hook when the expected signature is still an unambiguous prefix.
+                for (Method method : target.getDeclaredMethods()) {
+                    if (!method.getName().equals(methodName)
+                            || Modifier.isAbstract(method.getModifiers()) || method.isBridge()
+                            || method.isSynthetic()
+                            || method.getParameterTypes().length <= parameterTypes.length
+                            || !parameterShapeMatches(Arrays.copyOf(method.getParameterTypes(),
+                                    parameterTypes.length), parameterTypes)) {
+                        continue;
+                    }
+                    match = method;
+                    matches++;
+                }
+            }
+            if (matches == 1) {
+                if (DebugBuild.ENABLED) {
+                    logLine("hook adapted " + target.getName() + "." + methodName
+                            + describeParameterTypes(match.getParameterTypes()));
+                }
+                return match;
+            }
+            throw new NoSuchMethodException(methodName + describeParameterTypes(parameterTypes)
+                    + " matches=" + matches + " candidates=[" + candidates + "]");
+        }
+    }
+
+    /**
+     * Obfuscated class names get reassigned to unrelated classes between releases. Fail the
+     * whole diagnostic group fast (one log line) when the class no longer looks like the target.
+     */
+    private static void requireMethodTaking(Class<?> target, Class<?> parameterType)
+            throws NoSuchMethodException {
+        for (Method method : target.getDeclaredMethods()) {
+            for (Class<?> type : method.getParameterTypes()) {
+                if (type == parameterType) {
+                    return;
+                }
+            }
+        }
+        throw new NoSuchMethodException(target.getName() + " has no method taking "
+                + parameterType.getSimpleName() + "; obfuscated name was reassigned");
+    }
+
+    private static boolean parameterShapeMatches(Class<?>[] actual, Class<?>[] expected) {
+        if (actual.length != expected.length) {
+            return false;
+        }
+        for (int i = 0; i < actual.length; i++) {
+            if (isStableFrameworkType(expected[i]) && actual[i] != expected[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean isStableFrameworkType(Class<?> type) {
+        while (type.isArray()) {
+            type = type.getComponentType();
+        }
+        if (type.isPrimitive()) {
+            return true;
+        }
+        String name = type.getName();
+        return name.startsWith("java.") || name.startsWith("android.");
+    }
+
+    private static String describeParameterTypes(Class<?>[] types) {
+        StringBuilder builder = new StringBuilder("(");
+        for (int i = 0; i < types.length; i++) {
+            if (i > 0) {
+                builder.append(", ");
+            }
+            builder.append(types[i].getSimpleName());
+        }
+        return builder.append(')').toString();
     }
 
     private Class<?> findClass(String name, ClassLoader classLoader) throws ClassNotFoundException {
