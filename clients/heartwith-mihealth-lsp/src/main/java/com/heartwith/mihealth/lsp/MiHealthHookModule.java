@@ -384,6 +384,10 @@ public final class MiHealthHookModule extends XposedModule {
     private volatile boolean miWearRegistrationInProgress;
     private volatile boolean miWearMonitorStartScheduled;
     private volatile int miWearMonitorFailureCount;
+    private volatile int miWearMonitorRetryGeneration;
+    // Set when the device (re)connects while an earlier subscribe is still pending. That
+    // request usually went out before the link was up, so its timeout is not a real failure.
+    private volatile boolean miWearReconnectedDuringPending;
     private volatile long nextMiWearMonitorAttemptElapsedMs;
     private volatile long nextMiWearReconnectAttemptElapsedMs;
     private volatile boolean miWearReconnectRetryScheduled;
@@ -1891,7 +1895,11 @@ public final class MiHealthHookModule extends XposedModule {
             return;
         }
         if (miWearMonitorPending) {
-            debugSleepLine("miwear monitor start skipped reason=" + reason + ", pending=true");
+            if (reason != null && reason.contains("reconnect")) {
+                miWearReconnectedDuringPending = true;
+            }
+            debugSleepLine("miwear monitor start skipped reason=" + reason + ", pending=true"
+                    + ", reconnected=" + miWearReconnectedDuringPending);
             return;
         }
         if (SystemClock.elapsedRealtime() < nextMiWearMonitorAttemptElapsedMs) {
@@ -1920,6 +1928,7 @@ public final class MiHealthHookModule extends XposedModule {
         miWearMonitorRequested = true;
         final int monitorGeneration = ++miWearMonitorGeneration;
         miWearMonitorPending = true;
+        miWearReconnectedDuringPending = false;
         miWearRegistrationInProgress = false;
         miWearEarliestPropertyRequestElapsedMs = 0L;
         miWearReadSent.set(false);
@@ -3706,10 +3715,19 @@ public final class MiHealthHookModule extends XposedModule {
                     "属性请求已发送，但 20 秒内没有收到有效的订阅确认；将继续使用低频睡眠同步兜底。",
                     System.currentTimeMillis());
         }
-        debugSleepLine("miwear monitor start timeout generation=" + generation);
+        boolean reconnected = miWearReconnectedDuringPending;
+        miWearReconnectedDuringPending = false;
+        debugSleepLine("miwear monitor start timeout generation=" + generation
+                + ", reconnectedDuringPending=" + reconnected);
         cleanupIsolatedMiWearHandler("monitor-timeout", miWearIsolatedGeneration);
         cancelMiWearNetworkingLookup();
-        recordMiWearMonitorFailure("subscribe-timeout");
+        if (reconnected) {
+            // The device came up after this request was sent; retry right away instead of
+            // treating the stale request as a failure.
+            scheduleMiWearMonitorRetry("reconnected-during-pending", MIWEAR_MONITOR_START_DELAY_MS);
+        } else {
+            recordMiWearMonitorFailure("subscribe-timeout");
+        }
         scheduleSleepStatusPoll(appContext, "miwear-subscription-timeout");
     }
 
@@ -3725,6 +3743,28 @@ public final class MiHealthHookModule extends XposedModule {
         nextMiWearMonitorAttemptElapsedMs = SystemClock.elapsedRealtime() + delayMs;
         importantLine("miwear sleep monitor retry deferred reason=" + reason
                 + ", failures=" + miWearMonitorFailureCount + ", delayMs=" + delayMs);
+        // Recording the backoff alone only blocks earlier attempts; actually schedule the
+        // retry so the subscription does not wait for an unrelated trigger.
+        scheduleMiWearMonitorRetry(reason, delayMs);
+    }
+
+    private synchronized void scheduleMiWearMonitorRetry(final String reason, long delayMs) {
+        Context context = appContext;
+        if (!lifecycleActive || context == null) {
+            return;
+        }
+        // A newer retry replaces any older one, so the attempt always follows the latest backoff.
+        final int generation = ++miWearMonitorRetryGeneration;
+        // Small margin so the attempt lands after the backoff deadline, not on it.
+        long postDelayMs = Math.max(0L, delayMs) + 500L;
+        mainHandler(context).postDelayed(() -> {
+            synchronized (MiHealthHookModule.this) {
+                if (generation != miWearMonitorRetryGeneration) {
+                    return;
+                }
+            }
+            startMiWearSleepMonitor("retry:" + reason);
+        }, postDelayMs);
     }
 
     private synchronized void cancelMiWearNetworkingLookup() {
