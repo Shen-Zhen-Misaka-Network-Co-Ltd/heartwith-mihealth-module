@@ -77,6 +77,36 @@ public final class MiHealthStateRegressionTest {
     }
 
     @Test
+    public void firstAwakeReadingReconcilesCloudWithoutInventingSleepTimes() throws Exception {
+        set("appContext", RuntimeEnvironment.getApplication());
+        call("handleMiWearState", new Class<?>[]{String.class, boolean.class}, "awake", false);
+        Shadows.shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(59));
+        assertNull(get("lastSleepStatusKey"));
+        Shadows.shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(1));
+        assertTrue(((String) get("lastSleepStatusKey")).startsWith("awake|0|0|0|"));
+        assertEquals("awake", get("sleepTrackingState"));
+        assertFalse((Boolean) get("sleepFinalReportRequested"));
+        assertFalse((Boolean) get("provisionalWakePublished"));
+        String key = (String) get("lastSleepStatusKey");
+        call("handleMiWearState", new Class<?>[]{String.class, boolean.class}, "awake", true);
+        Shadows.shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMinutes(6));
+        assertEquals(key, get("lastSleepStatusKey"));
+        assertFalse((Boolean) get("sleepFinalReportRequested"));
+    }
+
+    @Test
+    public void initialAwakeReconciliationIsCancelledByNewSleepOrShutdown() throws Exception {
+        set("appContext", RuntimeEnvironment.getApplication());
+        call("handleMiWearState", new Class<?>[]{String.class, boolean.class}, "awake", false);
+        call("handleMiWearState", new Class<?>[]{String.class, boolean.class}, "asleep", true);
+        Shadows.shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(60));
+        assertNull(get("lastSleepStatusKey"));
+        set("lifecycleActive", false);
+        Shadows.shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMinutes(6));
+        assertNull(get("lastSleepStatusKey"));
+    }
+
+    @Test
     public void provisionalAwakeRejectsActiveRawBeforeFinalizationStarts() throws Exception {
         set("miWearState", "awake");
         set("provisionalWakePublished", true);

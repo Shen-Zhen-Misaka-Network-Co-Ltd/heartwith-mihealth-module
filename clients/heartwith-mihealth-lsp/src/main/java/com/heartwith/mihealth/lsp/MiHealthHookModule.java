@@ -3954,6 +3954,7 @@ public final class MiHealthHookModule extends XposedModule {
         long delay = HeartwithSleepStatus.STATE_ASLEEP.equals(state)
                 ? MIWEAR_ASLEEP_STABLE_MS : MIWEAR_AWAKE_STABLE_MS;
         if ("awake".equals(state)
+                && previous != null
                 && !HeartwithSleepStatus.STATE_ASLEEP.equals(previous)
                 && SLEEP_TRACK_AWAKE.equals(sleepTrackingState)) {
             return;
@@ -4059,13 +4060,23 @@ public final class MiHealthHookModule extends XposedModule {
 
     private synchronized void publishProvisionalWakeStatus(String reason) {
         if (!lifecycleActive
-                || !heartRateHookEnabled
-                || SLEEP_TRACK_AWAKE.equals(sleepTrackingState)) {
+                || !heartRateHookEnabled) {
             debugSleepStateLine("provisional-wake-skip", reason, null,
                     "lifecycle=" + lifecycleActive
                             + ", hookEnabled=" + heartRateHookEnabled
                             + ", candidate=" + sleepCandidateSeenToday
                             + ", trackState=" + sleepTrackingState);
+            return;
+        }
+        if (SLEEP_TRACK_AWAKE.equals(sleepTrackingState)) {
+            // Local defaults after a restart do not establish the cloud state.
+            // Reconcile the first stable reading without inventing a wake time
+            // or requesting a report for a sleep episode we did not observe.
+            publishSleepSnapshot(new SleepSnapshot(
+                    HeartwithSleepStatus.STATE_AWAKE, System.currentTimeMillis(),
+                    0L, 0L, 0L, 0L, 0L, 0L, 0L,
+                    "miwear-property-reconcile", false, 0L,
+                    Collections.<HeartwithSleepStatus.Segment>emptyList()));
             return;
         }
         SleepSnapshot active = latestActiveSleepSnapshot;
