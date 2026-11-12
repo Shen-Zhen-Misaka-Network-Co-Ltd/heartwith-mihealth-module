@@ -379,6 +379,7 @@ public final class MiHealthHookModule extends XposedModule {
     private volatile int miWearReconnectRetryGeneration;
     private volatile boolean miWearSubscriptionActive;
     private volatile boolean officialSleepStateAvailable;
+    private volatile String officialSleepStateDid;
     private volatile boolean miWearMonitorRequested;
     private volatile long miWearSubscribeRequestId = -1L;
     private volatile String miWearDeviceDid;
@@ -631,6 +632,7 @@ public final class MiHealthHookModule extends XposedModule {
 
     private void releaseHotReloadResources() {
         lifecycleActive = false;
+        clearOfficialSleepState("hot-reload");
         Handler handler = lifecycleHandler;
         if (handler != null) {
             handler.removeCallbacksAndMessages(null);
@@ -1466,11 +1468,10 @@ public final class MiHealthHookModule extends XposedModule {
 
     private boolean isMiWearSleepMonitorActive() {
         String did = miWearDeviceDid;
-        return officialSleepStateAvailable
-                || (miWearSubscriptionActive
+        return miWearSubscriptionActive
                 && did != null
                 && did.equals(miWearPropertyDid)
-                && miWearPropertySiid > 0);
+                && miWearPropertySiid > 0;
     }
 
     private boolean isMiWearSleepMonitorStarting() {
@@ -3092,6 +3093,7 @@ public final class MiHealthHookModule extends XposedModule {
                         return;
                     }
                     String did = intent.getStringExtra(EXTRA_DEVICE_DID);
+                    invalidateOfficialSleepDevice(did);
                     String name = intent.getStringExtra(EXTRA_DEVICE_NAME);
                     String identity = did == null || did.length() == 0 ? null : "did:" + did;
                     if (identity != null && identity.equals(lastStartHelperDeviceIdentity)
@@ -3361,7 +3363,10 @@ public final class MiHealthHookModule extends XposedModule {
             return;
         }
         miWearSubscriptionActive = false;
-        officialSleepStateAvailable = false;
+        clearOfficialSleepState("device-disconnected");
+        miWearState = null;
+        ++miWearStateGeneration;
+        ++miWearWakeConfirmationGeneration;
         miWearSubscribeRequestId = -1L;
         miWearReadSent.set(false);
         debugSleepLine("miwear-device-disconnected did=" + maskDid(did));
@@ -3773,6 +3778,7 @@ public final class MiHealthHookModule extends XposedModule {
     }
 
     private synchronized void resetMiWearProperty(String did) {
+        clearOfficialSleepState("property-reset");
         miWearPropertyDid = did;
         miWearPropertySiid = -1;
         miWearLastPropertyEventKey = null;
@@ -4510,10 +4516,11 @@ public final class MiHealthHookModule extends XposedModule {
 
     /**
      * Xiaomi's BLE layer already registers this listener for devices exposing
-     * capability 29. Hooking its decoded event avoids creating another listener
-     * or polling the property channel when the official low-cost path exists.
+     * capability 29. Observe it without replacing the official listener. A single
+     * event is not a subscription acknowledgement, so it cannot disable fallback.
      */
     private void hookOfficialSleepStateChannel(final ClassLoader classLoader) {
+        if (!isWorkerProcess()) return;
         try {
             Class<?> openApp = findClass(
                     "com.huami.bluetooth.profile.channel.module.openapp.OpenAppModule",
@@ -4522,27 +4529,11 @@ public final class MiHealthHookModule extends XposedModule {
                     new AfterHook() {
                         @Override
                         public void after(XposedInterface.Chain chain, Object result) {
+                            if (!lifecycleActive || !heartRateHookEnabled || !isWorkerProcess()) return;
                             Object raw = chain.getArg(0);
-                            if (!(raw instanceof byte[]) || ((byte[]) raw).length == 0) {
-                                return;
-                            }
-                            int code = ((byte[]) raw)[0] & 255;
-                            String state;
-                            if (code == 1) {
-                                state = HeartwithSleepStatus.STATE_ASLEEP;
-                            } else if (code == 0) {
-                                state = "awake";
-                            } else {
-                                if (DebugBuild.ENABLED) {
-                                    debugSleepLine("official sleep state ignored code=" + code);
-                                }
-                                return;
-                            }
-                            officialSleepStateAvailable = true;
-                            cancelSleepStatusPoll(appContext);
-                            debugSleepStateLine("official-sleep-state", "open-app-module", null,
-                                    "code=" + code + ", state=" + state);
-                            handleMiWearState(state, true);
+                            if (!(raw instanceof byte[])) return;
+                            handleOfficialSleepState(chain.getThisObject(),
+                                    getCurrentDeviceModel(classLoader), (byte[]) raw);
                         }
                     });
             if (DebugBuild.ENABLED) {
@@ -4554,6 +4545,55 @@ public final class MiHealthHookModule extends XposedModule {
                         + describeThrowable(throwable));
             }
         }
+    }
+
+    private synchronized void clearOfficialSleepState(String reason) {
+        if (officialSleepStateAvailable && DebugBuild.ENABLED) {
+            debugSleepStateLine("official-sleep-reset", reason, null,
+                    "did=" + maskDid(officialSleepStateDid));
+        }
+        if (officialSleepStateAvailable) {
+            miWearState = null;
+            lastMiWearPushElapsedMs = 0L;
+            ++miWearStateGeneration;
+            ++miWearWakeConfirmationGeneration;
+        }
+        officialSleepStateAvailable = false;
+        officialSleepStateDid = null;
+    }
+
+    private synchronized void invalidateOfficialSleepDevice(String did) {
+        if (officialSleepStateDid != null && !officialSleepStateDid.equals(did)) {
+            clearOfficialSleepState("current-device-changed");
+        }
+    }
+
+    private synchronized void handleOfficialSleepState(Object sourceModule, Object device, byte[] raw) {
+        if (!lifecycleActive || !heartRateHookEnabled || !isWorkerProcess()) return;
+        if (raw == null || raw.length == 0 || (raw[0] != 0 && raw[0] != 1)) {
+            debugSleepStateLine("official-sleep-rejected", "invalid-payload", null,
+                    "length=" + (raw == null ? -1 : raw.length));
+            return;
+        }
+        String did = getCurrentDeviceId(device);
+        String address = safeString(callNoArgMethod(sourceModule, "getAddress"));
+        Object info = callNoArgMethod(device, "getDeviceInfo");
+        String currentAddress = safeString(callNoArgMethod(info, "getMac"));
+        if (did == null || did.length() == 0 || address == null || address.length() == 0
+                || currentAddress == null || !address.equalsIgnoreCase(currentAddress)
+                || (miWearDeviceDid != null && !miWearDeviceDid.equals(did))) {
+            debugSleepStateLine("official-sleep-rejected", "device-mismatch-or-unresolved", null,
+                    "did=" + maskDid(did) + ", sourceAddress=" + maskDid(address)
+                            + ", currentAddress=" + maskDid(currentAddress));
+            return;
+        }
+        officialSleepStateDid = did;
+        officialSleepStateAvailable = true;
+        String state = raw[0] == 1 ? HeartwithSleepStatus.STATE_ASLEEP : "awake";
+        debugSleepStateLine("official-sleep-state", "open-app-module", null,
+                "did=" + maskDid(did) + ", code=" + raw[0] + ", state=" + state
+                        + ", passiveEvent=true, subscriptionConfirmed=" + miWearSubscriptionActive);
+        handleMiWearState(state, true);
     }
 
     private synchronized void publishSleepStatusFromAllDay(String source, Object dataId, Object sleep) {
@@ -9269,6 +9309,7 @@ public final class MiHealthHookModule extends XposedModule {
     }
 
     private void updateDeviceModel(Object device) {
+        invalidateOfficialSleepDevice(getCurrentDeviceId(device));
         long elapsed = SystemClock.elapsedRealtime();
         String identity = describeDeviceIdentity(device);
         boolean sameDevice = identity != null && identity.equals(currentDeviceIdentity);

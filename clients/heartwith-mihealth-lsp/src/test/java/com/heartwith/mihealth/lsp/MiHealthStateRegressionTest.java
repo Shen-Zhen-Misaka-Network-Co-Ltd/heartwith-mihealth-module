@@ -548,6 +548,108 @@ public final class MiHealthStateRegressionTest {
                 new Class<?>[]{snapshotClass(), String.class}, snapshot(), "all-day-parser");
     }
 
+    @Test
+    public void officialEventRequiresEnabledWorkerAndActiveGeneration() throws Exception {
+        set("heartRateHookEnabled", false);
+        officialEvent(new byte[]{1}, "AA:BB", "watch", "aa:bb");
+        assertNull(get("miWearState"));
+        set("heartRateHookEnabled", true);
+        set("processName", "com.mi.health");
+        officialEvent(new byte[]{1}, "AA:BB", "watch", "aa:bb");
+        assertNull(get("miWearState"));
+        set("processName", "com.mi.health:device");
+        set("lifecycleActive", false);
+        officialEvent(new byte[]{1}, "AA:BB", "watch", "aa:bb");
+        assertFalse((Boolean) get("officialSleepStateAvailable"));
+    }
+
+    @Test
+    public void officialEventRejectsMissingOrDifferentDeviceIdentity() throws Exception {
+        officialEvent(new byte[]{1}, "AA:BB", "watch", "CC:DD");
+        officialEvent(new byte[]{1}, null, "watch", "AA:BB");
+        officialEvent(new byte[]{1}, "AA:BB", null, "AA:BB");
+        officialEvent(new byte[]{1}, "AA:BB", "watch", null);
+        set("miWearDeviceDid", "other-watch");
+        officialEvent(new byte[]{1}, "AA:BB", "watch", "AA:BB");
+        assertNull(get("miWearState"));
+        assertFalse((Boolean) get("officialSleepStateAvailable"));
+    }
+
+    @Test
+    public void officialEventDoesNotTreatOnePacketAsPersistentSubscription() throws Exception {
+        officialEvent(new byte[]{1}, "AA:BB", "watch", "aa:bb");
+        assertEquals("asleep", get("miWearState"));
+        assertEquals("watch", get("officialSleepStateDid"));
+        assertFalse((Boolean) call("isMiWearSleepMonitorActive"));
+        int generation = (Integer) get("miWearStateGeneration");
+        officialEvent(new byte[]{1}, "AA:BB", "watch", "aa:bb");
+        assertEquals(generation, get("miWearStateGeneration"));
+        officialEvent(new byte[]{0}, "AA:BB", "watch", "aa:bb");
+        assertEquals("awake", get("miWearState"));
+        assertEquals(generation + 1, get("miWearStateGeneration"));
+    }
+
+    @Test
+    public void officialEventRejectsUnknownOrEmptyPayload() throws Exception {
+        officialEvent(null, "AA:BB", "watch", "AA:BB");
+        officialEvent(new byte[0], "AA:BB", "watch", "AA:BB");
+        officialEvent(new byte[]{2}, "AA:BB", "watch", "AA:BB");
+        assertNull(get("miWearState"));
+        assertFalse((Boolean) get("officialSleepStateAvailable"));
+    }
+
+    @Test
+    public void changingOfficialDeviceInvalidatesPendingStateConfirmation() throws Exception {
+        officialEvent(new byte[]{1}, "AA:BB", "watch", "AA:BB");
+        int generation = (Integer) get("miWearStateGeneration");
+        call("invalidateOfficialSleepDevice", new Class<?>[]{String.class}, "watch");
+        assertEquals(generation, get("miWearStateGeneration"));
+        call("invalidateOfficialSleepDevice", new Class<?>[]{String.class}, "other-watch");
+        assertNull(get("miWearState"));
+        assertNull(get("officialSleepStateDid"));
+        assertFalse((Boolean) get("officialSleepStateAvailable"));
+        assertTrue((Integer) get("miWearStateGeneration") > generation);
+    }
+
+    @Test
+    public void coreCleanupClearsOfficialEventEvenWithoutType112Adapter() throws Exception {
+        officialEvent(new byte[]{1}, "AA:BB", "watch", "AA:BB");
+        call("cleanupIsolatedMiWearHandler", new Class<?>[]{String.class, int.class},
+                "core-disconnected", get("miWearIsolatedGeneration"));
+        assertFalse((Boolean) get("officialSleepStateAvailable"));
+        assertNull(get("officialSleepStateDid"));
+        assertNull(get("miWearState"));
+    }
+
+    @Test
+    public void deviceDisconnectClearsOfficialOnlyChannel() throws Exception {
+        set("miWearDeviceDid", "watch");
+        officialEvent(new byte[]{1}, "AA:BB", "watch", "AA:BB");
+        call("handleMiWearDeviceDisconnected", new Class<?>[]{String.class}, "watch");
+        assertFalse((Boolean) get("officialSleepStateAvailable"));
+        assertNull(get("miWearState"));
+    }
+
+    private void officialEvent(byte[] raw, String address, String did, String mac) throws Exception {
+        call("handleOfficialSleepState", new Class<?>[]{Object.class, Object.class, byte[].class},
+                new OfficialModule(address), new OfficialDevice(did, mac), raw);
+    }
+
+    public static final class OfficialModule {
+        private final String address;
+        OfficialModule(String address) { this.address = address; }
+        public String getAddress() { return address; }
+    }
+
+    public static final class OfficialDevice {
+        private final String did;
+        private final String mac;
+        OfficialDevice(String did, String mac) { this.did = did; this.mac = mac; }
+        public String getDid() { return did; }
+        public OfficialDevice getDeviceInfo() { return this; }
+        public String getMac() { return mac; }
+    }
+
     private Class<?> snapshotClass() throws Exception {
         return Class.forName(MiHealthHookModule.class.getName() + "$SleepSnapshot");
     }
