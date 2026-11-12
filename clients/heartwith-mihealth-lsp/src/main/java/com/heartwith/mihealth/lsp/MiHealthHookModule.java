@@ -109,6 +109,7 @@ public final class MiHealthHookModule extends XposedModule {
     private static final long LAST_HR_SEEN_PERSIST_MS = 20_000L;
     private static final long DEVICE_MODEL_REFRESH_MS = 30_000L;
     private static final long DEVICE_MODEL_UNRESOLVED_RETRY_MS = 180_000L;
+    private static final long RUNTIME_SETTINGS_REFRESH_MS = 5L * 60L * 1000L;
     private static final long TYPED_HEART_RATE_FALLBACK_STALE_MS = 30_000L;
     // Debug logging must not change idle wakeups or recovery timing.
     private static final long HEART_RATE_WATCHDOG_MS = 60L * 1000L;
@@ -3034,7 +3035,7 @@ public final class MiHealthHookModule extends XposedModule {
         }
         long elapsed = SystemClock.elapsedRealtime();
         if (!force && lastRuntimeSettingsRefreshElapsedMs > 0L &&
-                elapsed - lastRuntimeSettingsRefreshElapsedMs < 30_000L) {
+                elapsed - lastRuntimeSettingsRefreshElapsedMs < RUNTIME_SETTINGS_REFRESH_MS) {
             return;
         }
         applyRuntimeSettings(context, uploader.currentSettings(), "runtime settings refresh");

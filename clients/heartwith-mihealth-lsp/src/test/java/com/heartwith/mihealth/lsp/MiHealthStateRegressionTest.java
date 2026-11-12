@@ -327,6 +327,17 @@ public final class MiHealthStateRegressionTest {
     }
 
     @Test
+    public void runtimeSettingsRefreshIsRateLimitedForIdleEfficiency() throws Exception {
+        long lastRefresh = SystemClock.elapsedRealtime();
+        set("lastRuntimeSettingsRefreshElapsedMs", lastRefresh);
+        assertEquals(300_000L, get("RUNTIME_SETTINGS_REFRESH_MS"));
+        Context context = RuntimeEnvironment.getApplication();
+        set("appContext", context);
+        call("refreshRuntimeSettingsIfNeeded", new Class<?>[]{Context.class, boolean.class}, context, false);
+        assertEquals(lastRefresh, get("lastRuntimeSettingsRefreshElapsedMs"));
+    }
+
+    @Test
     public void recoveredHeartRateShortensBackoffAndCancellationAllowsRearming() throws Exception {
         Context context = RuntimeEnvironment.getApplication();
         set("appContext", context);
