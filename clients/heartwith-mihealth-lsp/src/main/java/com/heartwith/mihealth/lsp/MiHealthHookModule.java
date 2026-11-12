@@ -255,6 +255,8 @@ public final class MiHealthHookModule extends XposedModule {
     private final AtomicBoolean miWearReadSent = new AtomicBoolean(false);
     private final AtomicBoolean miWearNetworkingBound = new AtomicBoolean(false);
     private final List<Long> miWearDiscoveryRequestIds = new ArrayList<>();
+    private final ConcurrentHashMap<MethodKey, Method> compatibleMethodCache =
+            new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Class<?>, HeartRateAccessor> heartRateAccessorCache =
             new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Class<?>, Long> heartRateAccessorMissCache =
@@ -12281,6 +12283,20 @@ public final class MiHealthHookModule extends XposedModule {
 
     private Method findCompatibleMethod(Class<?> clazz, String name, boolean requireStatic, Object[] args)
             throws NoSuchMethodException {
+        // Resolved methods are cached by receiver class, name and runtime argument classes:
+        // scanning getDeclaredMethods() up the hierarchy on every call was the dominant cost.
+        MethodKey key = new MethodKey(clazz, name, requireStatic, args);
+        Method cached = compatibleMethodCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        Method resolved = resolveCompatibleMethod(clazz, name, requireStatic, args);
+        compatibleMethodCache.put(key, resolved);
+        return resolved;
+    }
+
+    private Method resolveCompatibleMethod(Class<?> clazz, String name, boolean requireStatic, Object[] args)
+            throws NoSuchMethodException {
         Class<?> current = clazz;
         while (current != null) {
             Method[] methods = current.getDeclaredMethods();
@@ -12578,6 +12594,43 @@ public final class MiHealthHookModule extends XposedModule {
         log(Log.INFO, TAG, message);
         if (DebugBuild.ENABLED) {
             DebugSleepLog.line(appContext, processName, message);
+        }
+    }
+
+    private static final class MethodKey {
+        private final Class<?> owner;
+        private final String name;
+        private final boolean requireStatic;
+        private final Class<?>[] argTypes;
+        private final int hash;
+
+        MethodKey(Class<?> owner, String name, boolean requireStatic, Object[] args) {
+            this.owner = owner;
+            this.name = name;
+            this.requireStatic = requireStatic;
+            this.argTypes = new Class<?>[args.length];
+            for (int i = 0; i < args.length; i++) {
+                argTypes[i] = args[i] == null ? null : args[i].getClass();
+            }
+            this.hash = 31 * (31 * (31 * System.identityHashCode(owner) + name.hashCode())
+                    + (requireStatic ? 1 : 0)) + Arrays.hashCode(argTypes);
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            if (!(other instanceof MethodKey)) {
+                return false;
+            }
+            MethodKey that = (MethodKey) other;
+            return owner == that.owner
+                    && requireStatic == that.requireStatic
+                    && name.equals(that.name)
+                    && Arrays.equals(argTypes, that.argTypes);
+        }
+
+        @Override
+        public int hashCode() {
+            return hash;
         }
     }
 
