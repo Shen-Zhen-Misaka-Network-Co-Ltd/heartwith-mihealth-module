@@ -278,7 +278,7 @@ public final class MiHealthStateRegressionTest {
                     context, 60_000L * generation, generation);
             call("scheduleSleepStatusAlarm", new Class<?>[]{Context.class, long.class, int.class},
                     context, 60_000L * generation, generation);
-            set("lastHeartRateWatchdogAlarmElapsedMs", 0L);
+            set("heartRateWatchdogAlarmTriggerElapsedMs", 0L);
             call("scheduleHeartRateAlarmWatchdog", new Class<?>[]{String.class}, "test");
             assertEquals(3, alarms.getScheduledAlarms().size());
         }
@@ -286,6 +286,70 @@ public final class MiHealthStateRegressionTest {
         assertEquals(2, alarms.getScheduledAlarms().size());
         call("cancelHeartRateAlarmWatchdog", new Class<?>[]{Context.class}, context);
         assertEquals(1, alarms.getScheduledAlarms().size());
+    }
+
+    @Test
+    public void watchdogUsesNonWakingAlarmAndReusesPendingDeadline() throws Exception {
+        Context context = RuntimeEnvironment.getApplication();
+        set("appContext", context);
+        org.robolectric.shadows.ShadowAlarmManager alarms = Shadows.shadowOf(
+                (AlarmManager) context.getSystemService(Context.ALARM_SERVICE));
+        call("scheduleHeartRateAlarmWatchdog", new Class<?>[]{String.class}, "heart-rate");
+        Object pending = alarms.peekNextScheduledAlarm();
+        assertEquals(AlarmManager.ELAPSED_REALTIME, alarms.peekNextScheduledAlarm().type);
+        assertEquals(300_000L, (long) get("heartRateWatchdogAlarmTriggerElapsedMs")
+                - SystemClock.elapsedRealtime());
+        int generation = (int) get("heartRateWatchdogGeneration");
+        // Even a late, not-yet-delivered alarm must not be postponed by a sample.
+        for (int i = 0; i < 100; i++) {
+            org.robolectric.shadows.ShadowSystemClock.advanceBy(java.time.Duration.ofSeconds(5));
+            call("scheduleHeartRateAlarmWatchdog", new Class<?>[]{String.class}, "heart-rate");
+            assertSame(pending, alarms.peekNextScheduledAlarm());
+            assertEquals(generation, get("heartRateWatchdogGeneration"));
+        }
+    }
+
+    @Test
+    public void deliveredWatchdogRearmsWithoutRestartingRecentHeartRate() throws Exception {
+        Context context = RuntimeEnvironment.getApplication();
+        set("appContext", context);
+        set("targetClassLoader", getClass().getClassLoader());
+        set("lastHr", 80);
+        set("lastHrElapsedMs", SystemClock.elapsedRealtime());
+        call("persistLastHeartRateSeen", new Class<?>[]{long.class}, SystemClock.elapsedRealtime());
+        call("scheduleHeartRateAlarmWatchdog", new Class<?>[]{String.class}, "heart-rate");
+        int generation = (int) get("heartRateWatchdogGeneration");
+        call("handleHeartRateAlarmWatchdog", new Class<?>[]{});
+        assertEquals(generation + 1, get("heartRateWatchdogGeneration"));
+        assertEquals(80, get("lastHr"));
+        assertEquals(0, get("heartRateWatchdogStaleStreak"));
+        assertEquals(60_000L, get("HEART_RATE_WATCHDOG_MS"));
+    }
+
+    @Test
+    public void recoveredHeartRateShortensBackoffAndCancellationAllowsRearming() throws Exception {
+        Context context = RuntimeEnvironment.getApplication();
+        set("appContext", context);
+        set("heartRateWatchdogStaleStreak", 3);
+        call("scheduleHeartRateAlarmWatchdog", new Class<?>[]{String.class}, "alarm:stale");
+        assertEquals(1_200_000L, (long) get("heartRateWatchdogAlarmTriggerElapsedMs")
+                - SystemClock.elapsedRealtime());
+        set("heartRateWatchdogStaleStreak", 0);
+        call("scheduleHeartRateAlarmWatchdog", new Class<?>[]{String.class}, "heart-rate");
+        assertEquals(300_000L, (long) get("heartRateWatchdogAlarmTriggerElapsedMs")
+                - SystemClock.elapsedRealtime());
+        org.robolectric.shadows.ShadowAlarmManager alarms = Shadows.shadowOf(
+                (AlarmManager) context.getSystemService(Context.ALARM_SERVICE));
+        assertEquals(1, alarms.getScheduledAlarms().size());
+        call("cancelHeartRateAlarmWatchdog", new Class<?>[]{Context.class}, context);
+        assertEquals(0L, get("heartRateWatchdogAlarmTriggerElapsedMs"));
+        assertTrue(alarms.getScheduledAlarms().isEmpty());
+        call("scheduleHeartRateAlarmWatchdog", new Class<?>[]{String.class}, "restart");
+        assertEquals(1, alarms.getScheduledAlarms().size());
+        call("cancelHeartRateAlarmWatchdog", new Class<?>[]{Context.class}, context);
+        set("lifecycleActive", false);
+        call("scheduleHeartRateAlarmWatchdog", new Class<?>[]{String.class}, "old-generation");
+        assertTrue(alarms.getScheduledAlarms().isEmpty());
     }
 
     @Test

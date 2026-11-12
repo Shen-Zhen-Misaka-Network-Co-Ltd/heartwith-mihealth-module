@@ -110,19 +110,15 @@ public final class MiHealthHookModule extends XposedModule {
     private static final long DEVICE_MODEL_REFRESH_MS = 30_000L;
     private static final long DEVICE_MODEL_UNRESOLVED_RETRY_MS = 180_000L;
     private static final long TYPED_HEART_RATE_FALLBACK_STALE_MS = 30_000L;
-    private static final long HEART_RATE_WATCHDOG_MS =
-            (DebugBuild.ENABLED ? 12L : 60L) * 1000L;
-    private static final long HEART_RATE_ALARM_WATCHDOG_MS =
-            (DebugBuild.ENABLED ? 2L : 5L) * 60L * 1000L;
-    private static final long HEART_RATE_ALARM_WATCHDOG_MAX_MS =
-            (DebugBuild.ENABLED ? 8L : 20L) * 60L * 1000L;
+    // Debug logging must not change idle wakeups or recovery timing.
+    private static final long HEART_RATE_WATCHDOG_MS = 60L * 1000L;
+    private static final long HEART_RATE_ALARM_WATCHDOG_MS = 5L * 60L * 1000L;
+    private static final long HEART_RATE_ALARM_WATCHDOG_MAX_MS = 20L * 60L * 1000L;
     private static final long HEART_RATE_ALARM_WINDOW_MS = 2L * 60L * 1000L;
-    private static final long HEART_RATE_ALARM_RESCHEDULE_MIN_MS =
-            (DebugBuild.ENABLED ? 1L : 2L) * 60L * 1000L;
     private static final long START_HELPER_WATCHDOG_COOLDOWN_MS =
-            (DebugBuild.ENABLED ? 60L : 10L * 60L) * 1000L;
+            10L * 60L * 1000L;
     private static final long START_HELPER_SPORT_COOLDOWN_MS =
-            (DebugBuild.ENABLED ? 15L : 60L) * 1000L;
+            60L * 1000L;
     private static final long[] START_HELPER_BOOTSTRAP_RETRY_DELAYS_MS =
             new long[]{9_000L, 15_000L, 30_000L};
     private static final long COLD_START_RECYCLE_MIN_UPTIME_MS = 90_000L;
@@ -345,7 +341,7 @@ public final class MiHealthHookModule extends XposedModule {
     private volatile String pendingRawWakeWindowKey;
     private volatile long pendingRawWakeAtMs;
     private volatile SleepSnapshot latestActiveSleepSnapshot;
-    private volatile long lastHeartRateWatchdogAlarmElapsedMs;
+    private volatile long heartRateWatchdogAlarmTriggerElapsedMs;
     private volatile int heartRateWatchdogStaleStreak;
     private volatile long lastSyncTriggerElapsedMs;
     private volatile long lastSyncSuccessElapsedMs;
@@ -11883,17 +11879,19 @@ public final class MiHealthHookModule extends XposedModule {
         }
     }
 
-    private void scheduleHeartRateAlarmWatchdog(String reason) {
+    private synchronized void scheduleHeartRateAlarmWatchdog(String reason) {
         Context context = appContext;
-        if (context == null || !isWorkerProcess() || !heartRateHookEnabled) {
+        if (!lifecycleActive || context == null || !isWorkerProcess() || !heartRateHookEnabled) {
             return;
         }
         long elapsed = SystemClock.elapsedRealtime();
-        if (lastHeartRateWatchdogAlarmElapsedMs > 0L &&
-                elapsed - lastHeartRateWatchdogAlarmElapsedMs < HEART_RATE_ALARM_RESCHEDULE_MIN_MS) {
+        long triggerAtMs = elapsed + heartRateAlarmWatchdogIntervalMs();
+        // Keep an earlier pending alarm, even when Doze delays its delivery.
+        // Recovery from a long backoff can still replace it with an earlier one.
+        if (heartRateWatchdogAlarmTriggerElapsedMs > 0L
+                && heartRateWatchdogAlarmTriggerElapsedMs <= triggerAtMs) {
             return;
         }
-        lastHeartRateWatchdogAlarmElapsedMs = elapsed;
         int generation = ++heartRateWatchdogGeneration;
         try {
             AlarmManager alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
@@ -11901,13 +11899,7 @@ public final class MiHealthHookModule extends XposedModule {
                 return;
             }
             PendingIntent pendingIntent = heartRateWatchdogPendingIntent(context, generation);
-            long triggerAtMs = elapsed + heartRateAlarmWatchdogIntervalMs();
-            if (DebugBuild.ENABLED && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                alarmManager.setAndAllowWhileIdle(
-                        AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                        triggerAtMs,
-                        pendingIntent);
-            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
                 alarmManager.setWindow(
                         AlarmManager.ELAPSED_REALTIME,
                         triggerAtMs,
@@ -11916,10 +11908,12 @@ public final class MiHealthHookModule extends XposedModule {
             } else {
                 alarmManager.set(AlarmManager.ELAPSED_REALTIME, triggerAtMs, pendingIntent);
             }
+            heartRateWatchdogAlarmTriggerElapsedMs = triggerAtMs;
             if (DebugBuild.ENABLED) {
                 diagLine("hr alarm watchdog scheduled reason=" + reason + ", generation=" + generation);
             }
         } catch (Throwable throwable) {
+            heartRateWatchdogAlarmTriggerElapsedMs = 0L;
             if (DebugBuild.ENABLED) {
                 diagLine("hr alarm watchdog schedule failed: " + throwable.getClass().getSimpleName());
             }
@@ -11934,9 +11928,9 @@ public final class MiHealthHookModule extends XposedModule {
         return Math.min(interval, HEART_RATE_ALARM_WATCHDOG_MAX_MS);
     }
 
-    private void cancelHeartRateAlarmWatchdog(Context context) {
+    private synchronized void cancelHeartRateAlarmWatchdog(Context context) {
         heartRateWatchdogGeneration++;
-        lastHeartRateWatchdogAlarmElapsedMs = 0L;
+        heartRateWatchdogAlarmTriggerElapsedMs = 0L;
         heartRateWatchdogStaleStreak = 0;
         if (context == null || !isWorkerProcess()) {
             return;
@@ -11962,7 +11956,10 @@ public final class MiHealthHookModule extends XposedModule {
     }
 
     private void handleHeartRateAlarmWatchdog() {
-        if (!isWorkerProcess() || !heartRateHookEnabled) {
+        synchronized (this) {
+            heartRateWatchdogAlarmTriggerElapsedMs = 0L;
+        }
+        if (!lifecycleActive || !isWorkerProcess() || !heartRateHookEnabled) {
             return;
         }
         ClassLoader classLoader = targetClassLoader;
@@ -11970,7 +11967,6 @@ public final class MiHealthHookModule extends XposedModule {
             return;
         }
         if (hasRecentHeartRateInAnyProcess(HEART_RATE_ALARM_WATCHDOG_MS)) {
-            lastHeartRateWatchdogAlarmElapsedMs = 0L;
             heartRateWatchdogStaleStreak = 0;
             scheduleHeartRateAlarmWatchdog("alarm:recent");
             return;
@@ -11983,7 +11979,6 @@ public final class MiHealthHookModule extends XposedModule {
                 + ", ageMs=" + heartRateAgeForDebug());
         resetHeartRateSource("watchdog-alarm:no-heart-rate");
         ensureRealtimeHrStarted(classLoader, "watchdog-alarm:no-heart-rate");
-        lastHeartRateWatchdogAlarmElapsedMs = 0L;
         heartRateWatchdogStaleStreak++;
         scheduleHeartRateAlarmWatchdog("alarm:stale");
     }
