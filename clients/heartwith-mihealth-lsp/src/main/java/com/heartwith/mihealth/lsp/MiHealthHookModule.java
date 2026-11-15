@@ -5051,6 +5051,11 @@ public final class MiHealthHookModule extends XposedModule {
                     "uploadedWithoutConfirmedKey key=" + finalSleepKey(snapshot));
             return true;
         }
+        if (endsBeforeUploadedFinalSleep(snapshot)) {
+            debugSleepStateLine("report-final-skip", source, snapshot,
+                    "olderThanUploadedFinal key=" + currentFinalUploadedKey());
+            return false;
+        }
         long dayStartMs = sleepDayStartMillis(snapshot);
         boolean sameSleepDay = sleepTrackingDayStartMs == 0L || sleepTrackingDayStartMs == dayStartMs;
         boolean allowed = sleepFinalReportRequested
@@ -5408,6 +5413,24 @@ public final class MiHealthHookModule extends XposedModule {
                     snapshot.deviceWakeAtMs, snapshot.leaveBedAtMs);
             return reportStart > 0L && reportEnd > reportStart
                     && rawStart >= reportStart && rawEnd > rawStart && rawEnd <= reportEnd;
+        } catch (NumberFormatException ignored) {
+            return false;
+        }
+    }
+
+    /**
+     * Xiaomi may re-query an earlier day's report (e.g. yesterday's nap) right after the
+     * current night's final report. Such a session ends before the uploaded final sleep
+     * starts and must not replace it; a corrected report of the same session overlaps it.
+     */
+    private boolean endsBeforeUploadedFinalSleep(SleepSnapshot snapshot) {
+        if (snapshot == null || snapshot.wakeAtMs <= 0L) return false;
+        String[] fields = currentFinalUploadedKey().split("\\|", -1);
+        if (fields.length != 4) return false;
+        try {
+            long uploadedStart = firstPositiveMillis(
+                    Long.parseLong(fields[2]), Long.parseLong(fields[1]));
+            return uploadedStart > 0L && snapshot.wakeAtMs <= uploadedStart;
         } catch (NumberFormatException ignored) {
             return false;
         }

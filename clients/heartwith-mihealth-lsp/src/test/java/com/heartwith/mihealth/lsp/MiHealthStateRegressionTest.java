@@ -223,6 +223,24 @@ public final class MiHealthStateRegressionTest {
     }
 
     @Test
+    public void earlierSessionReportCannotReplaceUploadedFinalSleep() throws Exception {
+        set("appContext", RuntimeEnvironment.getApplication());
+        long now = testWallTimeMs();
+        Object night = finalReport(now - 60_000L);
+        String nightKey = (String) call("finalSleepKey", new Class<?>[]{snapshotClass()}, night);
+        set("sleepFinalUploadedKey", nightKey);
+        set("sleepFinalConfirmedKey", nightKey);
+        Class<?>[] signature = {snapshotClass(), String.class};
+        // Yesterday's nap, re-queried right after tonight's final report.
+        Object nap = finalReport(now - 60_000L - 3_600_000L - 600_000L);
+        assertFalse((Boolean) call("shouldPublishFinalSleepReport", signature, nap, "sleep-biz"));
+        // A corrected report of the same session overlaps it and is still accepted.
+        Object corrected = finalReport(now - 120_000L);
+        assertTrue((Boolean) call("shouldPublishFinalSleepReport", signature, corrected, "sleep-biz"));
+        assertFalse((Boolean) call("shouldPublishFinalSleepReport", signature, night, "sleep-biz"));
+    }
+
+    @Test
     public void hotReloadRestoresStateButDoesNotPretendOldTimersStillExist() throws Exception {
         Bundle saved = new Bundle();
         saved.putString("sleep_tracking_state", "finalizing");
